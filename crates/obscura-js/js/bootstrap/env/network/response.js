@@ -18,7 +18,7 @@ function _decodeBodyWithCharset(bytes, headers) {
 const _responseState = new WeakMap();
 function _responseData(value) {
   const state = _responseState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/network/response.js:21');
   return state;
 }
 const _Response = class Response {

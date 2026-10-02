@@ -175,7 +175,7 @@ function _idbKeyRange(lower, upper, lowerOpen, upperOpen) {
 }
 function _idbKeyRangeData(value) {
   const state = _idbKeyRangeState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/storage/indexeddb-cache.js:178');
   return state;
 }
 Object.defineProperties(IDBKeyRange.prototype, {

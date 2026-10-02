@@ -83,7 +83,7 @@ globalThis.performance = globalThis.performance || {
   // Method shorthand: owns no `prototype`, like the reference's native
   // performance.now (measured: hasOwnProperty('prototype') === false).
   now() {
-    if (!_performanceBrand.has(this)) throw new TypeError('Illegal invocation');
+    if (!_performanceBrand.has(this)) throw new TypeError('Illegal invocation @env/performance/support/clock.js:86');
     return _performanceNowImpl();
   },
   // A worker never runs __obscura_init, so this default has to be usable as

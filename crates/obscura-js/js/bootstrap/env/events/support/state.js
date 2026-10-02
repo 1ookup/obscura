@@ -78,7 +78,7 @@ function _eventTimeStamp() {
 
 function _eventData(value) {
   const state = _eventState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/events/support/state.js:81');
   return state;
 }
 

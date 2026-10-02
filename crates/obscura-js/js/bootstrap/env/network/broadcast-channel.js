@@ -7,7 +7,7 @@ if (typeof BroadcastChannel === 'undefined') {
   const channelState = new WeakMap();
   const stateFor = (channel) => {
     const state = channelState.get(channel);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @env/network/broadcast-channel.js:10');
     return state;
   };
   const installHandler = (channel, type, callback) => {

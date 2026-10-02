@@ -51,7 +51,7 @@
     });
     const read = function (self) {
       const held = _brandRegistry().values.get(self);
-      if (held === undefined) throw new TypeError('Illegal invocation');
+      if (held === undefined) throw new TypeError('Illegal invocation @env/security/trusted-types.js:54');
       return held;
     };
     _defineHidden(ctor.prototype, 'toString', _markNative(function toString() {

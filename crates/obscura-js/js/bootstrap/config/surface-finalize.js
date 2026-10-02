@@ -1747,7 +1747,7 @@ const _chromeInterfaceShells = new Set();
   };
   const getter = (proto, name) => {
     const get = _markNativeAs(
-      function() { throw new TypeError('Illegal invocation'); },
+      function() { throw new TypeError('Illegal invocation @config/surface-finalize.js:1750'); },
       'function get ' + name + '() { [native code] }',
     );
     Object.defineProperty(proto, name, {
@@ -1790,7 +1790,7 @@ const _chromeInterfaceShells = new Set();
 
   const status = value => {
     const state = statusState.get(value);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @config/surface-finalize.js:1793');
     return state;
   };
   const nameGetter = _markNative(function name() { return status(this).name; });
@@ -1859,16 +1859,16 @@ const _chromeInterfaceShells = new Set();
   storageState.add(manager);
 
   const requireStorage = value => {
-    if (!storageState.has(value)) throw new TypeError('Illegal invocation');
+    if (!storageState.has(value)) throw new TypeError('Illegal invocation @config/surface-finalize.js:1862');
   };
   const requireHandle = value => {
     const state = handleState.get(value);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @config/surface-finalize.js:1866');
     return state;
   };
   const requireDirectory = value => {
     const state = requireHandle(value);
-    if (state.node.kind !== 'directory') throw new TypeError('Illegal invocation');
+    if (state.node.kind !== 'directory') throw new TypeError('Illegal invocation @config/surface-finalize.js:1871');
     return state;
   };
   const validName = value => {
@@ -2031,7 +2031,7 @@ const _chromeInterfaceShells = new Set();
 
   method(FileSystemFileHandle.prototype, 'getFile', async function getFile() {
     const node = requireHandle(this).node;
-    if (node.kind !== 'file') throw new TypeError('Illegal invocation');
+    if (node.kind !== 'file') throw new TypeError('Illegal invocation @config/surface-finalize.js:2034');
     return new File([node.bytes], node.name, {
       type: node.name.toLowerCase().endsWith('.txt') ? 'text/plain' : '',
       lastModified: node.lastModified,
@@ -2039,14 +2039,14 @@ const _chromeInterfaceShells = new Set();
   }, 0);
   method(FileSystemFileHandle.prototype, 'createWritable', async function createWritable() {
     const node = requireHandle(this).node;
-    if (node.kind !== 'file') throw new TypeError('Illegal invocation');
+    if (node.kind !== 'file') throw new TypeError('Illegal invocation @config/surface-finalize.js:2042');
     const stream = Object.create(FileSystemWritableFileStream.prototype);
     writableState.set(stream, { node, position: 0, closed: false });
     return stream;
   }, 0);
   method(FileSystemFileHandle.prototype, 'move', async function move(name) {
     const node = requireHandle(this).node;
-    if (node.kind !== 'file') throw new TypeError('Illegal invocation');
+    if (node.kind !== 'file') throw new TypeError('Illegal invocation @config/surface-finalize.js:2049');
     name = validName(name);
     if (node.parent) { node.parent.children.delete(node.name); node.name = name; node.parent.children.set(name, node); }
   }, 1);
@@ -2055,7 +2055,7 @@ const _chromeInterfaceShells = new Set();
   if (typeof FileSystemWritableFileStream === 'function') {
     const writable = value => {
       const state = writableState.get(value);
-      if (!state || state.closed) throw new TypeError('Illegal invocation');
+      if (!state || state.closed) throw new TypeError('Illegal invocation @config/surface-finalize.js:2058');
       return state;
     };
     method(FileSystemWritableFileStream.prototype, 'write', async function write(data) {

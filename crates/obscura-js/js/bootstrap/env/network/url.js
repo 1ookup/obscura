@@ -30,7 +30,7 @@ let _urlSearchParamsBind = null;
 let _urlSearchParamsSetFromString = null;
 function _urlData(value) {
   const state = _urlState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/network/url.js:33');
   return state;
 }
 function _urlSetPart(value, part, nextValue) {

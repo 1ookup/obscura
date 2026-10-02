@@ -10,7 +10,7 @@ const _memoryInfoBacking = {
 const _memoryInfoInstances = new WeakSet();
 const _memoryInfoPrototype = {};
 function _memoryInfoValue(receiver, name) {
-  if (!_memoryInfoInstances.has(receiver)) throw new TypeError('Illegal invocation');
+  if (!_memoryInfoInstances.has(receiver)) throw new TypeError('Illegal invocation @env/performance/memory-info.js:13');
   return _memoryInfoBacking[name];
 }
 const _memoryInfoGetterHolders = {

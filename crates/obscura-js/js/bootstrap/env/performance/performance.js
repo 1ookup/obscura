@@ -33,7 +33,7 @@ class PerformanceTiming {
   constructor() { throw new TypeError("Failed to construct 'PerformanceTiming': Illegal constructor"); }
   toJSON() {
     const state = _performanceTimingState.get(this);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @env/performance/performance.js:36');
     return Object.fromEntries(_performanceTimingNames.map(name => [name, state[name]]));
   }
 }
@@ -41,14 +41,14 @@ for (const name of _performanceTimingNames) {
   Object.defineProperty(PerformanceTiming.prototype, name, {
     get() {
       const state = _performanceTimingState.get(this);
-      if (!state) throw new TypeError('Illegal invocation');
+      if (!state) throw new TypeError('Illegal invocation @env/performance/performance.js:44');
       return state[name];
     },
     // The host lifecycle mutates these legacy values; author-facing reads
     // still observe the same numeric timeline through the getter.
     set(value) {
       const state = _performanceTimingState.get(this);
-      if (!state) throw new TypeError('Illegal invocation');
+      if (!state) throw new TypeError('Illegal invocation @env/performance/performance.js:51');
       state[name] = Number(value) || 0;
     },
     enumerable: true,

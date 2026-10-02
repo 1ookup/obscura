@@ -39,7 +39,7 @@ if (!globalThis.crypto.subtle) {
     Object.defineProperty(CryptoKey.prototype, attribute, {
       get: function () {
         const slots = keyAttributes.get(this);
-        if (!slots) throw new TypeError("Illegal invocation");
+        if (!slots) throw new TypeError('Illegal invocation @env/crypto/subtle.js:42');
         if (attribute === "algorithm") return algorithmCopy(slots.algorithm);
         if (attribute === "usages") return slots.usages.slice();
         return slots[attribute];

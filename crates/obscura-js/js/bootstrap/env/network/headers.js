@@ -4,7 +4,7 @@
 const _headersState = new WeakMap();
 function _headersData(value) {
   const state = _headersState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/network/headers.js:7');
   return state;
 }
 function _headerName(value) {

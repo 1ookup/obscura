@@ -7,12 +7,12 @@ const _nodeIteratorState = new WeakMap();
 
 function _treeWalkerData(value) {
   const state = _treeWalkerState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/dom/support/traversal.js:10');
   return state;
 }
 function _nodeIteratorData(value) {
   const state = _nodeIteratorState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/dom/support/traversal.js:15');
   return state;
 }
 function _traversalFilter(state, node) {

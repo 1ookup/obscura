@@ -18,7 +18,7 @@ function _isValidCustomElementName(name) {
 const _customElementRegistryState = new WeakMap();
 function _customElementRegistryData(value) {
   const state = _customElementRegistryState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/dom/shadow-custom-elements.js:21');
   return state;
 }
 function _customElementUpgrade(registry, el, cls) {

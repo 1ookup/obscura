@@ -10,7 +10,7 @@ if (typeof URLSearchParams === "undefined") {
   const state = new WeakMap();
   const data = value => {
     const stored = state.get(value);
-    if (!stored) throw new TypeError('Illegal invocation');
+    if (!stored) throw new TypeError('Illegal invocation @env/network/form-data.js:13');
     return stored;
   };
   const decode = value => {

@@ -96,12 +96,12 @@ class FeaturePolicy {
     _featurePolicyDocuments.set(this, document);
   }
   allowedFeatures() {
-    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation @env/security/permissions-policy-objects.js:99');
     const policy = _documentPermissionsPolicy(_featurePolicyDocuments.get(this));
     return _featurePolicyFeatures.filter(policy.allows);
   }
   allowsFeature(feature, _origin = undefined) {
-    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation @env/security/permissions-policy-objects.js:104');
     if (arguments.length < 1) {
       throw new TypeError(
         "Failed to execute 'allowsFeature' on 'FeaturePolicy': 1 argument required, but only 0 present.");
@@ -111,11 +111,11 @@ class FeaturePolicy {
   features() {
     // The full feature enumeration, not the allowed subset: Chrome lists
     // `unload` here and omits it from allowedFeatures().
-    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation @env/security/permissions-policy-objects.js:114');
     return _featurePolicyFeatures.slice();
   }
   getAllowlistForFeature(feature) {
-    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation @env/security/permissions-policy-objects.js:118');
     if (arguments.length < 1) {
       throw new TypeError(
         "Failed to execute 'getAllowlistForFeature' on 'FeaturePolicy': 1 argument required, but only 0 present.");
@@ -149,12 +149,12 @@ class PermissionsPolicy {
     _permissionsPolicyDocuments.set(this, document);
   }
   allowedFeatures() {
-    if (!_permissionsPolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    if (!_permissionsPolicyDocuments.has(this)) throw new TypeError('Illegal invocation @env/security/permissions-policy-objects.js:152');
     const policy = _documentPermissionsPolicy(_permissionsPolicyDocuments.get(this));
     return _featurePolicyFeatures.filter(policy.allows);
   }
   allowsFeature(feature, _origin = undefined) {
-    if (!_permissionsPolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    if (!_permissionsPolicyDocuments.has(this)) throw new TypeError('Illegal invocation @env/security/permissions-policy-objects.js:157');
     if (arguments.length < 1) {
       throw new TypeError(
         "Failed to execute 'allowsFeature' on 'PermissionsPolicy': 1 argument required, but only 0 present.");
@@ -162,11 +162,11 @@ class PermissionsPolicy {
     return _documentPermissionsPolicy(_permissionsPolicyDocuments.get(this)).allows(feature, _origin);
   }
   features() {
-    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    if (!_featurePolicyDocuments.has(this)) throw new TypeError('Illegal invocation @env/security/permissions-policy-objects.js:165');
     return _featurePolicyFeatures.slice();
   }
   getAllowlistForFeature(feature) {
-    if (!_permissionsPolicyDocuments.has(this)) throw new TypeError('Illegal invocation');
+    if (!_permissionsPolicyDocuments.has(this)) throw new TypeError('Illegal invocation @env/security/permissions-policy-objects.js:169');
     if (arguments.length < 1) {
       throw new TypeError(
         "Failed to execute 'getAllowlistForFeature' on 'PermissionsPolicy': 1 argument required, but only 0 present.");

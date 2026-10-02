@@ -656,7 +656,7 @@ class XPathExpression {
   }
   evaluate(contextNode, type = 0, result = null) {
     const state = _xpathExpressionState.get(this);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @tools/interaction.js:659');
     if (arguments.length < 1) {
       throw new TypeError(
         "Failed to execute 'evaluate' on 'XPathExpression': 1 argument required, but only 0 present.");
@@ -679,17 +679,17 @@ class CaretPosition {
   }
   get offsetNode() {
     const state = _caretPositionState.get(this);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @tools/interaction.js:682');
     return state.node;
   }
   get offset() {
     const state = _caretPositionState.get(this);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @tools/interaction.js:687');
     return state.offset;
   }
   getClientRect() {
     const state = _caretPositionState.get(this);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @tools/interaction.js:692');
     const range = new Range();
     range.setStart(state.node, state.offset);
     range.setEnd(state.node, state.offset);

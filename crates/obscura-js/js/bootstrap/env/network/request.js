@@ -1,7 +1,7 @@
 const _requestState = new WeakMap();
 function _requestData(value) {
   const state = _requestState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/network/request.js:4');
   return state;
 }
 function _requestBodyBytes(body) {

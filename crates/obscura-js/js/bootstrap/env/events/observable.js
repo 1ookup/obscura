@@ -7,12 +7,12 @@ const _subscriberState = new WeakMap();
 const _subscriberKey = Symbol('Subscriber');
 function _observableData(value) {
   const state = _observableState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/events/observable.js:10');
   return state;
 }
 function _subscriberData(value) {
   const state = _subscriberState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/events/observable.js:15');
   return state;
 }
 function _subscriberClose(subscriber, kind, value) {

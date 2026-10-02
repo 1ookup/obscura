@@ -4,7 +4,7 @@ const _readableStreamState = new WeakMap();
 
 function _readableSlots(stream) {
   const slots = _readableStreamState.get(stream);
-  if (!slots) throw new TypeError('Illegal invocation');
+  if (!slots) throw new TypeError('Illegal invocation @env/streams/support/readable-behavior.js:7');
   return slots;
 }
 

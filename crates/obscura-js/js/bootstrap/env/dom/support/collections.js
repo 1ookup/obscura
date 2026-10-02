@@ -5,7 +5,7 @@ const _htmlCollectionKey = Symbol('HTMLCollection');
 const _htmlCollectionValues = new WeakMap();
 function _htmlCollectionData(value) {
   const held = _htmlCollectionValues.get(value);
-  if (!held) throw new TypeError('Illegal invocation');
+  if (!held) throw new TypeError('Illegal invocation @env/dom/support/collections.js:8');
   const values = typeof held === 'function' ? held() : held;
   return Array.from(values || []).filter(Boolean);
 }
@@ -96,7 +96,7 @@ const _nodeListKey = Symbol('NodeList');
 const _nodeListValues = new WeakMap();
 function _nodeListData(value) {
   const held = _nodeListValues.get(value);
-  if (!held) throw new TypeError('Illegal invocation');
+  if (!held) throw new TypeError('Illegal invocation @env/dom/support/collections.js:99');
   return held;
 }
 const _nodeListProxy = {

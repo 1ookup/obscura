@@ -11,6 +11,6 @@ function _makeTextMetrics(values) {
 
 function _textMetricValue(instance, name) {
   const held = _textMetricsValues.get(instance);
-  if (held === undefined) throw new TypeError('Illegal invocation');
+  if (held === undefined) throw new TypeError('Illegal invocation @env/media/support/text-metrics-state.js:14');
   return held[name];
 }

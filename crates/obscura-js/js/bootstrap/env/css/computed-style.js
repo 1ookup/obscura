@@ -61,6 +61,16 @@ globalThis.getComputedStyle = (el) => {
   const chromeLengthPx = (v) => {
     if (!Number.isFinite(v)) return _sciPx(_LAYOUT_UNIT_MAX);
     const clamped = Math.abs(v) > _LAYOUT_UNIT_MAX ? _LAYOUT_UNIT_MAX : v;
+    // Diagnostic: the overflow probe element resolves computed lengths beyond
+    // LayoutUnit's range; record the incoming magnitude and the reader so the
+    // payload's 2^25-family values can be traced to their read site.
+    // stderr only; ordinary pages never reach this branch.
+    if (Math.abs(v) > _LAYOUT_UNIT_MAX) {
+      try {
+        Deno.core.print("[prop-probe] gcs-clamp in=" + v +
+          " stack=" + String(new Error().stack).replace(/\s+/g, " ").slice(0, 500) + "\n", true);
+      } catch (_e) {}
+    }
     return Math.abs(clamped) >= 1e6 ? _sciPx(clamped) : `${clamped}px`;
   };
   const _DIMENSION_PROPS = new Set(['width', 'height', 'inline-size', 'block-size',

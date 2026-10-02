@@ -101,7 +101,7 @@ function _makeImageData(data, width, height, colorSpace, pixelFormat) {
 }
 function _imageData(value) {
   const state = _imageDataState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/media/canvas.js:104');
   return state;
 }
 
@@ -205,7 +205,7 @@ function _prepareCanvasText(value) {
 const _canvas2dState = new WeakMap();
 function _canvasStateOf(ctx) {
   const state = _canvas2dState.get(ctx);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/media/canvas.js:208');
   return state;
 }
 // The rewrite that moved the implementation here routes `_hset(this, '_x', v)`

@@ -165,7 +165,7 @@ globalThis.Scheduler = class Scheduler {
 
   postTask(callback, options = {}) {
     return new Promise((resolve, reject) => {
-      if (!_schedulerInstances.has(this)) throw new TypeError("Illegal invocation");
+      if (!_schedulerInstances.has(this)) throw new TypeError('Illegal invocation @tools/scheduler.js:168');
       if (typeof callback !== "function") {
         throw new TypeError("Failed to execute 'postTask' on 'Scheduler': parameter 1 is not of type 'Function'.");
       }
@@ -189,7 +189,7 @@ globalThis.Scheduler = class Scheduler {
 
   yield() {
     return new Promise((resolve, reject) => {
-      if (!_schedulerInstances.has(this)) throw new TypeError("Illegal invocation");
+      if (!_schedulerInstances.has(this)) throw new TypeError('Illegal invocation @tools/scheduler.js:192');
       const inherited = _schedulerCurrentState;
       const state = inherited
         ? { priority: inherited.priority, signal: inherited.signal }

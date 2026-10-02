@@ -3,12 +3,12 @@ const _xhrUploadState = new WeakMap();
 const _xhrEventTargetKey = {};
 function _xhrData(value) {
   const state = _xhrState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/network/xhr.js:6');
   return state;
 }
 function _xhrTargetData(value) {
   const state = _xhrState.get(value) || _xhrUploadState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/network/xhr.js:11');
   return state;
 }
 function _xhrHandlerStore(target) {

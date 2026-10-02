@@ -23,7 +23,7 @@
   };
   const ownerOf = receiver => {
     const owner = owners.get(receiver);
-    if (!owner) throw new TypeError('Illegal invocation');
+    if (!owner) throw new TypeError('Illegal invocation @env/dom/dom-implementation.js:26');
     return owner;
   };
 

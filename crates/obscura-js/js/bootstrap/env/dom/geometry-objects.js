@@ -438,7 +438,7 @@ if (typeof DOMMatrixReadOnly === 'undefined') {
     // Function.prototype.toString.
     const fn = { [name](...args) {
       const slot = _obscuraMatrixSlotOf(this);
-      if (!slot) throw new TypeError('Illegal invocation');
+      if (!slot) throw new TypeError('Illegal invocation @env/dom/geometry-objects.js:441');
       return new DOMMatrixReadOnly(apply(slot, ...args));
     } }[name];
     Object.defineProperty(readOnlyProto, name, {
@@ -452,7 +452,7 @@ if (typeof DOMMatrixReadOnly === 'undefined') {
   Object.defineProperty(readOnlyProto, 'toString', {
     value: _markNative({ toString() {
       const slot = _obscuraMatrixSlotOf(this);
-      if (!slot) throw new TypeError('Illegal invocation');
+      if (!slot) throw new TypeError('Illegal invocation @env/dom/geometry-objects.js:455');
       return 'matrix(' + [slot.a, slot.b, slot.c, slot.d, slot.e, slot.f].join(', ') + ')';
     } }.toString),
     writable: true, enumerable: true, configurable: true,
@@ -528,7 +528,7 @@ if (typeof DOMMatrix === 'undefined') {
     // sequence. Same computed-key literal trick as the read-only side.
     const fn = { [name](...args) {
       const slot = _obscuraMatrixSlotOf(this);
-      if (!slot) throw new TypeError('Illegal invocation');
+      if (!slot) throw new TypeError('Illegal invocation @env/dom/geometry-objects.js:531');
       Object.assign(slot, apply(slot, ...args));
       return this;
     } }[name];
@@ -571,7 +571,7 @@ if (typeof DOMMatrix === 'undefined') {
   Object.defineProperty(matrixProto, 'setMatrixValue', {
     value: _markNative(function setMatrixValue(transformList) {
       const slot = _obscuraMatrixSlotOf(this);
-      if (!slot) throw new TypeError('Illegal invocation');
+      if (!slot) throw new TypeError('Illegal invocation @env/dom/geometry-objects.js:574');
       void transformList;
       Object.assign(slot, { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 });
       return this;

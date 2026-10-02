@@ -7,7 +7,7 @@ const _messagePortConstructionKey = {};
 const _messagePortState = new WeakMap();
 function _messagePortStateFor(port) {
   const state = _messagePortState.get(port);
-  if (!state) throw new TypeError("Illegal invocation");
+  if (!state) throw new TypeError('Illegal invocation @env/events/message-channel.js:10');
   return state;
 }
 function _messagePortInstallEventHandler(port, type, callback) {

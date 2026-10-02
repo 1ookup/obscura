@@ -1,6 +1,6 @@
 function _mouseEventData(value) {
   const state = _mouseEventState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/events/mouse-event.js:3');
   return state;
 }
 function _mouseEventSetRelatedTarget(value, relatedTarget) {

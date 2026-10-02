@@ -360,7 +360,7 @@ function _serializeCss(props) {
 const _cssStyleState = new WeakMap();
 function _cssStyleFor(value) {
   const state = _cssStyleState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/css/style-declaration.js:363');
   return state;
 }
 function _cssStylePull(value) {

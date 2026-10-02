@@ -2,12 +2,12 @@ const _blobState = new WeakMap();
 const _fileState = new WeakMap();
 const _blobData = value => {
   const state = _blobState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/file/blob.js:5');
   return state;
 };
 const _fileData = value => {
   const state = _fileState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/file/blob.js:10');
   return state;
 };
 const _blobBytes = value => {

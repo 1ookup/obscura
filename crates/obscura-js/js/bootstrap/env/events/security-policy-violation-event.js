@@ -35,7 +35,7 @@ for (const name of [
     enumerable: true,
     get() {
       const state = _securityPolicyViolationState.get(this);
-      if (!state) throw new TypeError('Illegal invocation');
+      if (!state) throw new TypeError('Illegal invocation @env/events/security-policy-violation-event.js:38');
       return state[name];
     },
   });

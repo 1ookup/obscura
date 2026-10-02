@@ -50,7 +50,7 @@ const _networkInformationKey = {};
 const _networkInformationState = new WeakMap();
 const _networkInformation = value => {
   const state = _networkInformationState.get(value);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/window/plugins.js:53');
   return state;
 };
 class NetworkInformation {

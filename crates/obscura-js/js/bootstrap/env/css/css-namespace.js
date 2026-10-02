@@ -78,7 +78,7 @@
       { value: 'CSSUnitValue', configurable: true });
     const requireUnit = receiver => {
       const state = unitState.get(receiver);
-      if (!state) throw new TypeError('Illegal invocation');
+      if (!state) throw new TypeError('Illegal invocation @env/css/css-namespace.js:81');
       return state;
     };
     Object.defineProperty(UnitValue.prototype, 'value', {
@@ -130,7 +130,7 @@
     }
     const entriesOf = receiver => {
       const map = registryEntries.get(receiver);
-      if (!map) throw new TypeError('Illegal invocation');
+      if (!map) throw new TypeError('Illegal invocation @env/css/css-namespace.js:133');
       return map;
     };
     const registryMethod = (name, length, body) =>

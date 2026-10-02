@@ -59,20 +59,20 @@ class ViewTransition {
       }
     });
   }
-  get finished() { const state = _viewTransitionState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state.finished; }
-  get ready() { const state = _viewTransitionState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state.ready; }
-  get updateCallbackDone() { const state = _viewTransitionState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state.updateCallbackDone; }
-  get types() { const state = _viewTransitionState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state.types; }
-  get transitionRoot() { const state = _viewTransitionState.get(this); if (!state) throw new TypeError('Illegal invocation'); return state.document.documentElement; }
+  get finished() { const state = _viewTransitionState.get(this); if (!state) throw new TypeError('Illegal invocation @env/security/view-transition.js:62'); return state.finished; }
+  get ready() { const state = _viewTransitionState.get(this); if (!state) throw new TypeError('Illegal invocation @env/security/view-transition.js:63'); return state.ready; }
+  get updateCallbackDone() { const state = _viewTransitionState.get(this); if (!state) throw new TypeError('Illegal invocation @env/security/view-transition.js:64'); return state.updateCallbackDone; }
+  get types() { const state = _viewTransitionState.get(this); if (!state) throw new TypeError('Illegal invocation @env/security/view-transition.js:65'); return state.types; }
+  get transitionRoot() { const state = _viewTransitionState.get(this); if (!state) throw new TypeError('Illegal invocation @env/security/view-transition.js:66'); return state.document.documentElement; }
   skipTransition() {
     const state = _viewTransitionState.get(this);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @env/security/view-transition.js:69');
     if (state.skipped) return;
     state.skipped = true; state.resolveReady(); state.resolveFinished();
   }
   waitUntil(value) {
     const state = _viewTransitionState.get(this);
-    if (!state) throw new TypeError('Illegal invocation');
+    if (!state) throw new TypeError('Illegal invocation @env/security/view-transition.js:75');
     if (arguments.length < 1) {
       throw new TypeError(
         "Failed to execute 'waitUntil' on 'ViewTransition': 1 argument required, but only 0 present.");

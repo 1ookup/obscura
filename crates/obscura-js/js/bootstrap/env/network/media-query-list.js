@@ -6,7 +6,7 @@ const _mediaQueryListState = new WeakMap();
 
 function _mediaQueryListSlots(instance) {
   const state = _mediaQueryListState.get(instance);
-  if (!state) throw new TypeError('Illegal invocation');
+  if (!state) throw new TypeError('Illegal invocation @env/network/media-query-list.js:9');
   return state;
 }
 

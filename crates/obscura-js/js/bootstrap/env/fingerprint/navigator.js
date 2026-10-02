@@ -17,7 +17,7 @@ if (typeof BatteryManager === 'undefined') {
 }
 const _batteryManagerInstances = new WeakSet();
 const _batteryManagerAssert = instance => {
-  if (!_batteryManagerInstances.has(instance)) throw new TypeError('Illegal invocation');
+  if (!_batteryManagerInstances.has(instance)) throw new TypeError('Illegal invocation @env/fingerprint/navigator.js:20');
 };
 _markNative(BatteryManager);
 for (const _batteryGetter of ['charging', 'chargingTime', 'dischargingTime', 'level']) {
@@ -76,7 +76,7 @@ const _virtualKeyboardState = new WeakMap();
 function _virtualKeyboardData(instance) {
   let state = _virtualKeyboardState.get(instance);
   if (!state) {
-    if (!(instance instanceof VirtualKeyboard)) throw new TypeError('Illegal invocation');
+    if (!(instance instanceof VirtualKeyboard)) throw new TypeError('Illegal invocation @env/fingerprint/navigator.js:79');
     state = { overlaysContent: false, ongeometrychange: null };
     _virtualKeyboardState.set(instance, state);
   }

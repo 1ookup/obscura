@@ -13,7 +13,7 @@ function _mediaDevicesInitialize(instance, token) {
   _mediaDevicesHandlers.set(instance, null);
 }
 function _mediaDevicesAssert(instance) {
-  if (!_mediaDevicesInstances.has(instance)) throw new TypeError('Illegal invocation');
+  if (!_mediaDevicesInstances.has(instance)) throw new TypeError('Illegal invocation @env/media/support/media-devices-behavior.js:16');
 }
 function _mediaDevicesEnumerate(instance) {
   _mediaDevicesAssert(instance);
