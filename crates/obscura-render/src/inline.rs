@@ -3871,59 +3871,58 @@ impl TextEngine {
                                     true,
                                     true,
                                 ) {
-                                    let mut min_r = i32::MAX;
+                                    // Two regimes: CJK glyphs blit from the CT
+                                    // mask as-is (its own grid, no rescale -- the
+                                    // old stretch-to-the-swash-box mapping shrank
+                                    // CJK ink by ~34% against the reference,
+                                    // validator scan2 system-ui CJK 0.57-0.62),
+                                    // while Latin keeps that mapping, which the
+                                    // original probe anchors measured.
                                     let mut min_c = i32::MAX;
+                                    let mut min_r = i32::MAX;
                                     for (index, alpha) in mask.iter().enumerate() {
                                         if *alpha > 0 {
-                                            min_r = min_r.min((index / w) as i32);
                                             min_c = min_c.min((index % w) as i32);
+                                            min_r = min_r.min((index / w) as i32);
                                         }
                                     }
-                                    let mut max_r = i32::MIN;
-                                    let mut max_c = i32::MIN;
-                                    for (index, alpha) in mask.iter().enumerate() {
-                                        if *alpha > 0 {
-                                            max_r = max_r.max((index / w) as i32);
-                                            max_c = max_c.max((index % w) as i32);
-                                        }
-                                    }
-                                    // The CG unhinted outline runs a different width
-                                    // than the hinted swash box (a tenth of a column
-                                    // at 10px, growing with size), so the ink maps
-                                    // linearly onto the placement box instead of
-                                    // translating: the shape stretches to the box
-                                    // the reference frame expects.
-                                    let cg_cols = (max_c - min_c).max(1);
-                                    let cg_rows = (max_r - min_r).max(1);
+                                    let wide = identity_wide_rune(ch);
+                                    let c_origin = x + sw_left - PAD as i32 - left;
+                                    let r_origin = base_row - baseline as i32;
+                                    let cg_cols = (sw_w as i32 - 1).max(1);
+                                    let cg_rows = (sw_h as i32 - 1).max(1);
                                     let sw_cols = (sw_w as i32 - 1).max(1);
                                     let sw_rows = (sw_h as i32 - 1).max(1);
-                                    if min_r != i32::MAX {
-                                        for (index, alpha) in mask.iter().enumerate() {
-                                            if *alpha == 0 {
-                                                continue;
-                                            }
-                                            let mapped = crate::coretext::coverage_lut(*alpha);
+                                    for (index, alpha) in mask.iter().enumerate() {
+                                        if *alpha == 0 {
+                                            continue;
+                                        }
+                                        let mapped = crate::coretext::coverage_lut(*alpha);
+                                        let col_cov;
+                                        let row_cov;
+                                        if wide {
+                                            col_cov = c_origin + (index % w) as i32;
+                                            row_cov = r_origin + (index / w) as i32;
+                                        } else {
                                             let c_rel = (index % w) as i32 - min_c;
                                             let r_rel = (index / w) as i32 - min_r;
-                                            let col_scaled = (c_rel * sw_cols + cg_cols / 2) / cg_cols;
-                                            let row_scaled = (r_rel * sw_rows + cg_rows / 2) / cg_rows;
-                                            let col_cov = x + sw_left + col_scaled - left;
-                                            let row_cov = base_row - sw_top as i32 + row_scaled;
-                                            if col_cov < 0
-                                                || row_cov < 0
-                                                || col_cov >= width as i32
-                                                || row_cov >= height as i32
-                                            {
-                                                continue;
-                                            }
-                                            let cell_i =
-                                                row_cov as usize * width as usize + col_cov as usize;
-                                            composite_glyph_pixel(
-                                                &mut coverage[cell_i],
-                                                Color::rgba(0, 0, 0, mapped),
-                                            );
+                                            col_cov = x + sw_left + c_rel - left;
+                                            row_cov = base_row - sw_top as i32
+                                                + (r_rel * sw_rows + cg_rows / 2) / cg_rows;
                                         }
-                                        continue;
+                                        if col_cov < 0
+                                            || row_cov < 0
+                                            || col_cov >= width as i32
+                                            || row_cov >= height as i32
+                                        {
+                                            continue;
+                                        }
+                                        let cell_i =
+                                            row_cov as usize * width as usize + col_cov as usize;
+                                        composite_glyph_pixel(
+                                            &mut coverage[cell_i],
+                                            Color::rgba(0, 0, 0, mapped),
+                                        );
                                     }
                                 }
                             }
