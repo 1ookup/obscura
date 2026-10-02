@@ -127,7 +127,7 @@ const BUNDLED_MONO_ADVANCE: f32 = 1229.0;
 /// Which table answers is decided by the family the item resolved to, not by
 /// the stand-in that shapes it: `sans-serif` is PingFang SC and `serif` is
 /// Songti SC on macOS, and their stands-in are both Liberation faces.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum IdentityFace {
     Sans,
     Serif,
@@ -610,6 +610,9 @@ fn identity_line(item: &InlineItem, run: &cosmic_text::LayoutRun, line_w: f32) -
     let face = item.identity_face;
     let table = item.identity_table;
     let bold = item.identity_bold;
+    if std::env::var_os("OBSCURA_DEBUG_CSP").is_some() && run.line_w > 10.0 {
+        eprintln!("[csp-debug] identity_line face={face:?} bold={bold} line_w={line_w}");
+    }
     // A family table answers for the clusters of the family's own file, its
     // ligatures included -- the reference's own measured pairs carry those
     // ('ff' in Arial measures 37 units under the plain sum). The identity
@@ -637,6 +640,12 @@ fn identity_line(item: &InlineItem, run: &cosmic_text::LayoutRun, line_w: f32) -
         let cluster = run.text.get(span.0..span.1);
         let cluster_units = cluster
             .and_then(|cluster| identity_measured_cluster(face, table, previous, cluster, bold));
+        if std::env::var_os("OBSCURA_DEBUG_CSP").is_some() {
+            eprintln!(
+                "[csp-debug] cluster ch={:?} cluster={cluster:?} face={face:?} bold={bold} -> units={cluster_units:?}",
+                cluster.map(|c| c.chars().take(10).collect::<String>())
+            );
+        }
         if let Some(cluster) = cluster {
             if let Some(last) = cluster.chars().last() {
                 previous = Some(last);
@@ -3503,24 +3512,27 @@ impl TextEngine {
     /// and merges words at width 0) while reusing the item's own font and
     /// attribute state, so the answer stays on the same face the layout used.
     pub(crate) fn measure_min_content_words(&mut self, idx: usize) -> f32 {
+        let mut font_system = &mut self.font_system;
+        let item = &self.items[idx];
+        // Full-width probe with identity advance replacement.
         let full = {
-            let item = &self.items[idx];
             let mut probe = item.buffer.clone();
-            probe.set_wrap(&mut self.font_system, Wrap::None);
-            probe.set_size(&mut self.font_system, None, None);
-            probe.shape_until_scroll(&mut self.font_system, false);
+            probe.set_wrap(&mut font_system, Wrap::None);
+            probe.set_size(&mut font_system, None, None);
+            probe.shape_until_scroll(&mut font_system, false);
             let mut w = 0.0f32;
             for run in probe.layout_runs() {
-                w = w.max(run.line_w.max(0.0));
+                let (line, _units, _size) =
+                    identity_line(item, &run, run.line_w.max(0.0));
+                w = w.max(line.max(0.0));
             }
             w
         };
         if full <= 0.0 {
             return 0.0;
         }
-        // Word count from the full-width shaping of the same text: cosmic
-        // exposes the text through its lines, so walk those.
-        let full_probe = self.items[idx].buffer.clone();
+        // Word count from the full-width shaping of the same text.
+        let full_probe = item.buffer.clone();
         let word_count = {
             let mut count = 0usize;
             let mut in_word = false;
@@ -3539,23 +3551,16 @@ impl TextEngine {
             }
             count.max(1)
         };
-        let line_count_at = |font_system: &mut FontSystem,
-                             buffer: &mut Buffer,
-                             width: f32|
-         -> usize {
-            buffer.set_size(font_system, Some(width.max(0.0)), None);
-            buffer.shape_until_scroll(font_system, false);
-            buffer.layout_runs().count()
-        };
+        // Bisect the wrap width: the narrowest width whose line count still
+        // equals the word count is the widest word (min-content width).
         let mut lo = 0.0f32;
         let mut hi = full;
-        let mut scratch = self.items[idx].buffer.clone();
-        // The wrap width is monotone in the line count: wider fits more words
-        // per line. Bisect to the narrowest width whose line count still
-        // equals the word count -- that width is the widest word.
+        let mut scratch = item.buffer.clone();
         for _ in 0..24 {
             let mid = (lo + hi) / 2.0;
-            let lines = line_count_at(&mut self.font_system, &mut scratch, mid);
+            scratch.set_size(&mut font_system, Some(mid.max(0.0)), None);
+            scratch.shape_until_scroll(&mut font_system, false);
+            let lines = scratch.layout_runs().count();
             if lines <= word_count {
                 hi = mid;
             } else {
