@@ -844,11 +844,20 @@ impl Affine2 {
             .iter()
             .map(|point| point.1)
             .fold(f64::NEG_INFINITY, f64::max);
+        // Live-measured on the reference build (Chrome 149, gBCR on
+        // `transform: scale(1.0000..e38, 1.89)`): the transformed rect's
+        // components saturate at exactly +/-3.4028232737618185e32 and the
+        // width reads 6.805646547523637e32 = 2x that bound -- the clamp runs
+        // per component on the f64 corners, not at the f32 range. NaN stays
+        // zero as before.
+        const CHROME_RECT_SATURATION: f64 = 3.402_823_273_761_818_5e32;
         let saturate = |value: f64| -> f32 {
             if value.is_nan() {
                 0.0
             } else {
-                value.clamp(f32::MIN as f64, f32::MAX as f64) as f32
+                value
+                    .clamp(-CHROME_RECT_SATURATION, CHROME_RECT_SATURATION)
+                    as f32
             }
         };
         Rect {
