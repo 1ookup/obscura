@@ -91,8 +91,24 @@ globalThis.__obscura_core_init = function() {
       if (name === 'default-src' && defaultSources === null) defaultSources = tokens;
     }
     const sources = scriptSources || defaultSources;
+    // A `require-trusted-types-for 'script'` document that declares a
+    // `default` policy converts eval strings through createScript; that
+    // conversion, not the realm's unsafe-eval flag, is the gate the
+    // reference applies (the turnstile srcdoc frame's policy is
+    // `script-src 'nonce-…'` with no 'unsafe-eval', yet the reference runs
+    // its evals because the widget registered the default policy).
+    let trustedTypesConvertsEval = false;
+    for (const directive of header.split(';')) {
+      const tokens = directive.trim().split(/\s+/).filter(Boolean);
+      if (!tokens.length) continue;
+      const name = tokens.shift().toLowerCase();
+      if (name === 'trusted-types' && tokens.indexOf('default') !== -1) {
+        trustedTypesConvertsEval = true;
+      }
+    }
     globalThis.__obscura_csp_allows_unsafe_eval =
-      !sources || sources.some(token => token.toLowerCase() === "'unsafe-eval'");
+      !sources || sources.some(token => token.toLowerCase() === "'unsafe-eval'")
+      || trustedTypesConvertsEval;
     try {
       window.external && window.external.tracelog && window.external.tracelog(
         'csp.gate',
@@ -231,8 +247,24 @@ globalThis.__obscura_init = function() {
       if (name === 'default-src' && defaultSources === null) defaultSources = tokens;
     }
     const sources = scriptSources || defaultSources;
+    // A `require-trusted-types-for 'script'` document that declares a
+    // `default` policy converts eval strings through createScript; that
+    // conversion, not the realm's unsafe-eval flag, is the gate the
+    // reference applies (the turnstile srcdoc frame's policy is
+    // `script-src 'nonce-…'` with no 'unsafe-eval', yet the reference runs
+    // its evals because the widget registered the default policy).
+    let trustedTypesConvertsEval = false;
+    for (const directive of header.split(';')) {
+      const tokens = directive.trim().split(/\s+/).filter(Boolean);
+      if (!tokens.length) continue;
+      const name = tokens.shift().toLowerCase();
+      if (name === 'trusted-types' && tokens.indexOf('default') !== -1) {
+        trustedTypesConvertsEval = true;
+      }
+    }
     globalThis.__obscura_csp_allows_unsafe_eval =
-      !sources || sources.some(token => token.toLowerCase() === "'unsafe-eval'");
+      !sources || sources.some(token => token.toLowerCase() === "'unsafe-eval'")
+      || trustedTypesConvertsEval;
     try {
       window.external && window.external.tracelog && window.external.tracelog(
         'csp.gate',
