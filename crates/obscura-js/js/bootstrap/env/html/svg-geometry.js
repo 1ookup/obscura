@@ -911,10 +911,13 @@
 // owns the viewport-fixed marker transfer.
 (function _brandGeometryResults() {
   if (typeof DOMRect !== 'function' || typeof _markNative !== 'function') return;
-  // Chrome's layout engine clamps every box at LayoutUnit's maximum; a
-  // magnitude no browser can produce (an overflowing authored width that
-  // reached layout) is a renderer fingerprint.
-  const clampBox = (v) => (!Number.isFinite(v) || Math.abs(v) > 33554430) ? 33554430 : v;
+  // Finite values pass through untouched: Chrome's transformed gBCR reads
+  // +/-3.4028232737618185e32 on a scale(1e37) probe element, and clamping
+  // that here produced +33554430 rects no browser emits (live-measured
+  // against the reference build). Layout-range clamping belongs to the
+  // layout layer; only non-finite leakage needs a numeric stand-in, and
+  // Chrome's saturated box measures ~33554430 CSS px.
+  const clampBox = (v) => Number.isFinite(v) ? v : 33554430;
   const brandRect = (result) => {
     if (result == null || typeof result.x !== 'number'
         || typeof result.width !== 'number') return result;
