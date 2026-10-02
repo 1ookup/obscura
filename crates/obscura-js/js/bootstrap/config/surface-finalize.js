@@ -2569,7 +2569,7 @@ const _chromeNavigatorKeyOrder = [
   'webkitPersistentStorage', 'windowControlsOverlay', 'hardwareConcurrency',
   'cookieEnabled', 'appCodeName', 'appName', 'appVersion', 'platform',
   'product', 'userAgent', 'language', 'languages', 'onLine', 'webdriver',
-  'plugins', 'mimeTypes', 'pdfViewerEnabled', 'connection',
+  'plugins', 'mimeTypes', 'pdfViewerEnabled', 'connection', 'modelContext',
   'getGamepads',
   'javaEnabled', 'sendBeacon', 'vibrate', 'constructor',
   'deprecatedRunAdAuctionEnforcesKAnonymity', 'protectedAudience', 'bluetooth',
