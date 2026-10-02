@@ -2198,6 +2198,13 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 root,
                 "<html><head></head><body></body></html>",
             );
+            if std::env::var_os("OBSCURA_DEBUG_CSP").is_some() {
+                eprintln!(
+                    "[csp-debug] site=iframe-initial root={} csp={:?}",
+                    root.index(),
+                    csp.as_deref().map(|c| c.chars().take(120).collect::<String>())
+                );
+            }
             dom.set_document_scope(
                 root,
                 obscura_dom::DocumentScope {
@@ -2254,6 +2261,13 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             let quirks = obscura_dom::parse_into_subtree(dom, root, &arg2);
             if let Some(mut scope) = dom.document_scope(root) {
                 scope.quirks = quirks;
+                if std::env::var_os("OBSCURA_DEBUG_CSP").is_some() {
+                    eprintln!(
+                        "[csp-debug] site=parse-subtree root={} csp={:?}",
+                        root.index(),
+                        scope.csp.as_deref().map(|c| c.chars().take(120).collect::<String>())
+                    );
+                }
                 dom.set_document_scope(root, scope);
             }
             quirks.to_string()
@@ -2622,6 +2636,13 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                 .and_then(|value| value.as_str())
                 .map(str::to_string)
                 .or(existing_last_modified);
+            if std::env::var_os("OBSCURA_DEBUG_CSP").is_some() {
+                eprintln!(
+                    "[csp-debug] site=set-scope-op root={} csp={:?}",
+                    root.index(),
+                    csp.as_deref().map(|c| c.chars().take(120).collect::<String>())
+                );
+            }
             dom.set_document_scope(
                 root,
                 obscura_dom::DocumentScope {
