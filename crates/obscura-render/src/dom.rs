@@ -9543,6 +9543,21 @@ fn layout_dom_once(
                             let mut measured: Vec<(usize, usize, f32, f32)> =
                                 Vec::with_capacity(cells.len());
                             for (cell, col, span) in &cells {
+                                // A caption spans all columns but never
+                                // negotiates a track: its content must not
+                                // widen any column (Chromium sizes captions
+                                // against the final table width instead).
+                                let is_caption = id_map
+                                    .get(cell)
+                                    .and_then(|nid| tree.get_node(*nid))
+                                    .is_some_and(|node| {
+                                        node.as_element().is_some_and(|element| {
+                                            element.local.as_ref() == "caption"
+                                        })
+                                    });
+                                if is_caption {
+                                    continue;
+                                }
                                 let _ = taffy_tree.compute_layout_with_measure(
                                     *cell,
                                     taffy::Size {
@@ -9567,6 +9582,13 @@ fn layout_dom_once(
                                     .layout(*cell)
                                     .map(|l| l.size.width)
                                     .unwrap_or(0.0);
+                                // Chromium's max-content column contribution
+                                // rounds up onto the 1/64 grid before the
+                                // track is sized, so a cell whose shaped text
+                                // is 65.552px lands a 65.5625px track and the
+                                // reflow inside it stays one line instead of
+                                // wrapping on a 0.002px shortfall.
+                                let cmax = (cmax * 64.0).ceil() / 64.0;
                                 measured.push((*col, *span, cmin, cmax.max(cmin)));
                             }
                             let mut col_min = vec![0.0f32; ncols];
@@ -14524,27 +14546,27 @@ fn build_table(
     };
     let mut rows: Vec<(NodeId, usize)> = Vec::new();
     let mut synthetic_caption_row = false;
+    let mut caption_nodes: Vec<NodeId> = Vec::new();
     if native_html_table {
         collect_table_rows(tree, id, &mut rows);
-        if rows.is_empty() {
-            // Chromium still renders a caption-only table: the caption sits
-            // in its own box and the table shrink-wraps to it. Bailing here
-            // dropped the dedicated path entirely and stretched the table
-            // across the container (the challenge's sub-pixel probe reads a
-            // 4px-wide caption where Chromium reads 39.5px). Route the
-            // caption children through one synthetic row so the grid
-            // measurement includes them.
-            let has_caption = tree.children(id).into_iter().any(|cid| {
-                tree.get_node(cid).is_some_and(|n| {
-                    n.as_element()
-                        .is_some_and(|e| e.local.as_ref() == "caption")
-                })
-            });
-            if !has_caption {
-                return None;
+        for cid in tree.children(id) {
+            if tree.get_node(cid).is_some_and(|n| {
+                n.as_element().is_some_and(|e| e.local.as_ref() == "caption")
+            }) {
+                caption_nodes.push(cid);
             }
-            rows.push((id, 1));
+        }
+        if !caption_nodes.is_empty() {
+            // Chromium places every caption in a full-span box above the data
+            // rows: it adds its own height plus the two row-group spacings to
+            // the table, and the table shrink-wraps around rows and caption
+            // together. Dropping the caption when data rows exist (the old
+            // behavior) lost that whole band, and a caption-only table used
+            // the same synthetic row already.
+            rows.insert(0, (id, 0));
             synthetic_caption_row = true;
+        } else if rows.is_empty() {
+            return None;
         }
     } else {
         // CSS table fixup inserts an anonymous row around table-cell children
@@ -14648,6 +14670,17 @@ fn build_table(
     }
     if placed.is_empty() || ncols == 0 {
         return None;
+    }
+    // A caption row spans every column: its box is the full grid width, and
+    // it stays out of the per-column min/max negotiation below (Chromium does
+    // not let a caption widen a column).
+    if synthetic_caption_row {
+        for entry in &mut placed {
+            if caption_nodes.contains(&entry.0) {
+                entry.3 = 1;
+                entry.4 = ncols;
+            }
+        }
     }
 
     // Build each cell and pin it to its grid area.

@@ -169,9 +169,13 @@ impl IdentityFace {
         }
     }
 
-    /// The face's hmtx advance for U+0020..=U+007E, in font units.
-    fn ascii(self) -> &'static [f32; 95] {
+    /// The face's hmtx advance for U+0020..=U+007E, in font units. The sans
+    /// face carries a measured bold table (see `MACOS_SANS_BOLD_ASCII`); the
+    /// serif bold keeps the regular numbers, which no probe has disagreed
+    /// with yet.
+    fn ascii(self, bold: bool) -> &'static [f32; 95] {
         match self {
+            IdentityFace::Sans if bold => &MACOS_SANS_BOLD_ASCII,
             IdentityFace::Sans => &MACOS_SANS_ASCII,
             IdentityFace::Serif => &MACOS_SERIF_ASCII,
         }
@@ -280,6 +284,25 @@ const MACOS_SANS_ASCII: [f32; 95] = [
     333.0, 195.0, 333.0, 500.0,
 ];
 
+/// PingFang SC's bold advances for U+0020..=U+007E, in font units. Measured
+/// off the reference browser's `measureText` at `bold 16px sans-serif`: the
+/// face's Semibold is not a synthetic widening of the regular (h answers 577
+/// against 556, t 362 against 355), so a weight-scaled copy of the regular
+/// table cannot stand in for it. Latin-1 keeps the regular numbers; only the
+/// ASCII block has a measured bold table.
+const MACOS_SANS_BOLD_ASCII: [f32; 95] = [
+    333.0, 333.0, 488.0, 600.0, 600.0, 996.0, 751.0, 281.0, 333.0, 333.0,
+    516.0, 605.0, 275.0, 605.0, 275.0, 500.0, 600.0, 410.0, 600.0, 600.0,
+    600.0, 600.0, 600.0, 553.0, 600.0, 600.0, 275.0, 275.0, 605.0, 605.0,
+    605.0, 558.0, 866.0, 679.0, 690.0, 732.0, 720.0, 642.0, 582.0, 756.0,
+    736.0, 257.0, 538.0, 714.0, 592.0, 903.0, 732.0, 775.0, 655.0, 775.0,
+    697.0, 651.0, 615.0, 734.0, 659.0, 953.0, 664.0, 691.0, 639.0, 333.0,
+    500.0, 333.0, 545.0, 500.0, 333.0, 572.0, 602.0, 561.0, 602.0, 567.0,
+    378.0, 602.0, 577.0, 275.0, 276.0, 553.0, 254.0, 884.0, 581.0, 600.0,
+    602.0, 602.0, 374.0, 525.0, 362.0, 582.0, 506.0, 777.0, 537.0, 526.0,
+    506.0, 333.0, 214.0, 333.0, 500.0,
+];
+
 /// Songti SC's hmtx advance for U+0020..=U+007E, in font units. Songti's Latin
 /// design is narrower than PingFang's: a digit is 469 units where PingFang's is
 /// 600, which is the difference a 64-character hex string reads as 4400px
@@ -378,10 +401,10 @@ fn identity_last_resort_rune(ch: char) -> bool {
 
 /// One character's advance in the identity face's own em, or `None` when the
 /// face has no glyph for it.
-fn identity_glyph(ch: char, face: IdentityFace) -> Option<f32> {
+fn identity_glyph(ch: char, face: IdentityFace, bold: bool) -> Option<f32> {
     let code = ch as u32;
     if (0x20..=0x7E).contains(&code) {
-        return Some(face.ascii()[(code - 0x20) as usize]);
+        return Some(face.ascii(bold)[(code - 0x20) as usize]);
     }
     if (0x80..=0xFF).contains(&code) {
         return Some(face.latin1()[(code - 0x80) as usize]);
@@ -411,7 +434,7 @@ fn identity_glyph(ch: char, face: IdentityFace) -> Option<f32> {
 /// every rune a last-resort fallback would stand in for makes the whole cluster
 /// one glyph: `😀` and `👨‍👩‍👧‍👦` both measure a single 999-unit advance
 /// instead of one advance per code point.
-fn identity_cluster_units(cluster: &str, face: IdentityFace) -> Option<f32> {
+fn identity_cluster_units(cluster: &str, face: IdentityFace, bold: bool) -> Option<f32> {
     if cluster.is_empty() {
         return None;
     }
@@ -423,7 +446,7 @@ fn identity_cluster_units(cluster: &str, face: IdentityFace) -> Option<f32> {
     }
     let mut units = 0.0f32;
     for ch in cluster.chars() {
-        units += identity_glyph(ch, face)?;
+        units += identity_glyph(ch, face, bold)?;
     }
     Some(units)
 }
@@ -440,6 +463,7 @@ fn identity_measured_cluster(
     table: Option<&'static crate::font_tables::FontTable>,
     previous: Option<char>,
     cluster: &str,
+    bold: bool,
 ) -> Option<f32> {
     if cluster.is_empty() {
         return None;
@@ -456,7 +480,7 @@ fn identity_measured_cluster(
         }
     }
     if let Some(face) = face {
-        return identity_cluster_units(cluster, face);
+        return identity_cluster_units(cluster, face, bold);
     }
     if font_platform() == FontPlatform::MacOs {
         if cluster.chars().any(identity_last_resort_rune) {
@@ -469,7 +493,7 @@ fn identity_measured_cluster(
         // 'Ａ' and '、' answer 16px at 16px for Arial, Times, monospace and
         // PingFang SC alike, where the shaped stand-in answered 5.8 to 9.6.
         if cluster.chars().any(identity_wide_rune) {
-            return identity_cluster_units(cluster, IdentityFace::Sans);
+            return identity_cluster_units(cluster, IdentityFace::Sans, bold);
         }
     }
     None
@@ -585,6 +609,7 @@ fn ink_union(
 fn identity_line(item: &InlineItem, run: &cosmic_text::LayoutRun, line_w: f32) -> (f32, f32, f32) {
     let face = item.identity_face;
     let table = item.identity_table;
+    let bold = item.identity_bold;
     // A family table answers for the clusters of the family's own file, its
     // ligatures included -- the reference's own measured pairs carry those
     // ('ff' in Arial measures 37 units under the plain sum). The identity
@@ -611,7 +636,7 @@ fn identity_line(item: &InlineItem, run: &cosmic_text::LayoutRun, line_w: f32) -
             .any(|(start, end)| *start <= span.0 && span.1 <= *end);
         let cluster = run.text.get(span.0..span.1);
         let cluster_units = cluster
-            .and_then(|cluster| identity_measured_cluster(face, table, previous, cluster));
+            .and_then(|cluster| identity_measured_cluster(face, table, previous, cluster, bold));
         if let Some(cluster) = cluster {
             if let Some(last) = cluster.chars().last() {
                 previous = Some(last);
@@ -1454,6 +1479,11 @@ pub struct InlineItem {
     /// requested family names one. `None` keeps the shaped stand-in's metrics
     /// (or the identity face's, for the generics).
     identity_table: Option<&'static crate::font_tables::FontTable>,
+    /// Whether this run's weight selects the identity sans face's measured
+    /// bold advances. Only the ASCII block has a bold table, and only the
+    /// face-level generics use it: a family table answers with its own file's
+    /// numbers at every weight.
+    identity_bold: bool,
     /// Alignment is applied against the original content width. Cosmic-text
     /// uses its buffer width for both wrapping and alignment, so a balanced
     /// (narrower) buffer needs a corresponding origin inset.
@@ -3485,7 +3515,13 @@ impl TextEngine {
                     .any(|(start, end)| *start <= span.0 && span.1 <= *end);
                 let cluster = run.text.get(span.0..span.1);
                 let cluster_units = cluster.and_then(|cluster| {
-                    identity_measured_cluster(identity_face, identity_table, previous, cluster)
+                    identity_measured_cluster(
+                        identity_face,
+                        identity_table,
+                        previous,
+                        cluster,
+                        item.identity_bold,
+                    )
                 });
                 if let Some(cluster) = cluster {
                     if let Some(last) = cluster.chars().last() {
@@ -3885,7 +3921,13 @@ Some((width, height, left, top, coverage))
                     .any(|(start, end)| *start <= span.0 && span.1 <= *end);
                 let cluster = run.text.get(span.0..span.1);
                 let cluster_units = cluster.and_then(|cluster| {
-                    identity_measured_cluster(identity_face, identity_table, previous, cluster)
+                    identity_measured_cluster(
+                        identity_face,
+                        identity_table,
+                        previous,
+                        cluster,
+                        item.identity_bold,
+                    )
                 });
                 if let Some(cluster) = cluster {
                     if let Some(last) = cluster.chars().last() {
@@ -4330,6 +4372,8 @@ Some((width, height, left, top, coverage))
         let advance_scale = identity_advance_scale(&identity_font.family);
         let identity_face = identity_font.identity_face;
         let identity_table = identity_font.identity_table;
+        let identity_bold = identity_face.is_some()
+            && crate::style::used_font_weight(base) >= 550;
         self.items.push(InlineItem {
             buffer,
             layout_wrap,
@@ -4341,6 +4385,7 @@ Some((width, height, left, top, coverage))
             advance_scale,
             identity_face,
             identity_table,
+            identity_bold,
             align,
             forced_min_height,
             origin: (0.0, 0.0),
