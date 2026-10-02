@@ -2243,6 +2243,15 @@ impl IdentityGlyphFaces {
     /// elsewhere. The face inside a collection is picked by family name and
     /// regular weight, so a release that reshuffles collection order still
     /// lands on the right cut.
+    fn identity_has_glyph(&mut self, family: &'static str, ch: char) -> bool {
+        let Some(file) = self.face(family).cloned() else { return false };
+        let Some(font) = swash::FontRef::from_index(&file.bytes, file.index as usize)
+        else {
+            return false;
+        };
+        font.charmap().map(ch as u32) != 0
+    }
+
     fn face(&mut self, family: &'static str) -> Option<&IdentityFaceFile> {
         if !self.faces.contains_key(family) {
             let loaded = Self::load(family);
@@ -2347,6 +2356,15 @@ impl IdentityGlyphFaces {
     }
 
     fn load(family: &'static str) -> Option<IdentityFaceFile> {
+        // The system-ui generic resolves to the same host face the identity
+        // sans carries: its Latin glyphs are what the canvas raster needs,
+        // and without this alias the family name found no file at all --
+        // every Latin glyph drew zero coverage (the live Illegal invocation
+        // and the hash-probe's zero-alpha rows both trace here).
+        let family = match family {
+            "system-ui" | "BlinkMacSystemFont" => "PingFang SC",
+            other => other,
+        };
         let mut candidates: Vec<String> = Vec::new();
         if family == "PingFang SC" {
             if let Some(asset) = Self::pingfang_asset_path() {
@@ -3740,6 +3758,20 @@ impl TextEngine {
                 }
                                 GlyphDraw::Identity { family, ch, size, x, line_dy } => {
                     let base_row = baseline_row + line_dy;
+                    if std::env::var_os("OBSCURA_DEBUG_CANVAS").is_some() {
+                        let (has_glyph, has_ct) = {
+                            let has_glyph =
+                                identity_glyph_faces.identity_has_glyph(family, ch);
+                            let has_ct = identity_glyph_faces
+                                .coretext_face(family, f64::from(size))
+                                .is_some();
+                            (has_glyph, has_ct)
+                        };
+                        eprintln!(
+                            "[canvas-debug] identity family={} ch={:?} size={} has_glyph={} has_ct={}",
+                            family, ch, size, has_glyph, has_ct
+                        );
+                    }
                     // macOS identity glyphs rasterize through CoreText by
                     // default: the system pipeline's mask mapped onto the
                     // software sampler's placement box -- the bbox mapping
