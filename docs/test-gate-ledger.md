@@ -344,3 +344,4 @@ run covers are then removed.
 - geom probe (10-02): scoped: build ok; live capture maps HPcn5[0]
 - transform saturation (10-02): scoped: render+browser 767/767; live r40 HPcn5[2] still 33554430 (reads a clamped property, not gBCR)
 - map_rect corner saturation (10-02 eve): scoped: render 628/628 (new unit test locks corner-consistency); live r44 gBCR matches Chrome bitwise (x=-3.4e32 w=6.8e32); payload HPcn5[2] still 33554430 (VM-side normalization, under investigation)
+- clampBox passthrough (10-02 eve): scoped: render 628/628 (from corner commit); live r47 fo2 -> cf-chl-out + cf-chl-out-s + cf_clearance issued (first full pass with clampBox fix); HPcn5[2] bitwise == Chrome
