@@ -1027,7 +1027,7 @@ mod font_table_wiring_tests {
 /// `system-ui`; the other `ui-` keywords and `-apple-system` are unknown to
 /// Chrome on macOS and fall through to the default family, which is what the
 /// identity face already answers.
-fn identity_table_for_token(name: &str) -> Option<&'static crate::font_tables::FontTable> {
+fn identity_table_for_token(name: &str, bold: bool) -> Option<&'static crate::font_tables::FontTable> {
     let lowered = name.to_ascii_lowercase();
     let family = match lowered.as_str() {
         "monospace" => "Menlo",
@@ -1036,9 +1036,13 @@ fn identity_table_for_token(name: &str) -> Option<&'static crate::font_tables::F
         other => other,
     };
     crate::font_tables::table_for_family(family)
+        .map(|table| if bold { table.bold_variant() } else { table })
 }
 
-fn identity_table_for_stack(fam: Option<&str>) -> Option<&'static crate::font_tables::FontTable> {
+fn identity_table_for_stack(
+    fam: Option<&str>,
+    bold: bool,
+) -> Option<&'static crate::font_tables::FontTable> {
     // The tables are the files this host ships for the families a macOS
     // identity names; an identity that claims another platform keeps the
     // bundled stand-ins' metrics, exactly as its identity faces do.
@@ -1048,7 +1052,7 @@ fn identity_table_for_stack(fam: Option<&str>) -> Option<&'static crate::font_ta
     let stack = fam?;
     for token in stack.split(',') {
         let name = token.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-        if let Some(table) = identity_table_for_token(name) {
+        if let Some(table) = identity_table_for_token(name, bold) {
             return Some(table);
         }
     }
@@ -1111,7 +1115,7 @@ fn resolve_loaded_font(
                     resolved.identity_table = if entry.is_webfont {
                         None
                     } else {
-                        identity_table_for_stack(fam)
+                        identity_table_for_stack(fam, requested_weight >= 550)
                     };
                     if !entry.is_webfont {
                         // The identity's own CJK name rides the same verticals
@@ -1148,7 +1152,7 @@ fn resolve_loaded_font(
     // identity is resolved here (layout time), not at engine construction,
     // because set_font_platform lands after the engine exists.
     let identity_face = IdentityFace::of_family(fallback);
-    let identity_table = identity_table_for_stack(fam);
+    let identity_table = identity_table_for_stack(fam, requested_weight >= 550);
     if font_platform() == FontPlatform::MacOs {
         if let Some(family) = loaded.get("__obscura_system_pingfang") {
             if let Some(mut resolved) =
@@ -4693,6 +4697,23 @@ Some((width, height, left, top, coverage))
         } = self;
         let item = &mut items[idx];
         shape_with_text_indent(font_system, item, width, wrap);
+        if std::env::var_os("OBSCURA_DEBUG_MEASURE").is_some() {
+            let mut runs = item.buffer.layout_runs();
+            if let Some(first) = runs.next() {
+                let first_w = first.line_w;
+                let mut n = 1usize;
+                let mut max_w = first_w;
+                for r in runs {
+                    n += 1;
+                    if r.line_w > max_w {
+                        max_w = r.line_w;
+                    }
+                }
+                eprintln!(
+                    "    [shape] idx={idx} req={width:?} raw first={first_w:.4} max={max_w:.4} runs={n}"
+                );
+            }
+        }
         let (width, height, clamped) = buffer_size(item);
         (
             width,
@@ -4823,6 +4844,12 @@ Some((width, height, left, top, coverage))
             self.items[idx].layout_wrap
         };
         let (width, height) = self.measure_text_with_wrap(idx, width, wrap);
+        if std::env::var_os("OBSCURA_DEBUG_MEASURE").is_some() {
+            eprintln!(
+                "  [measure] idx={idx} minc={min_content_query} known=({:?},{:?}) avail=({:?},{:?}) -> {width:.4}x{height:.4}",
+                known.width, known.height, available.width, available.height
+            );
+        }
         taffy::Size { width, height }
     }
 
@@ -5907,8 +5934,13 @@ fn shape_with_text_indent(
 
     let Some(source) = item.source_buffer.as_ref() else {
         item.buffer.set_wrap(font_system, wrap);
-        item.buffer
-            .set_size(font_system, width.map(|value| value.max(0.0)), None);
+        // Chromium breaks lines on 1/64 LayoutUnit integers, so text that
+        // exactly fills its available width stays on one line. Our shaping
+        // advances are f32 round-trips of the same 1/64 grid, and a one-ulp
+        // overshoot at the equal boundary flips such a line to two. The
+        // quarter-sixtyfourth slack reproduces the quantized comparison.
+        let shape_width = width.map(|value| (value + 1.0 / 64.0).max(0.0));
+        item.buffer.set_size(font_system, shape_width, None);
         item.buffer.shape_until_scroll(font_system, false);
         return;
     };
