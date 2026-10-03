@@ -3573,12 +3573,31 @@ fn parse_transform_z_length(value: &str) -> Option<crate::TransformLength> {
     parse_transform_length(value)
 }
 
+/// Resolve a Z length to plain pixels; calc()/var() forms stay unresolved
+/// and simply do not contribute to the perspective fold.
+fn transform_z_px(value: &str) -> Option<f32> {
+    let length = parse_transform_z_length(value)?;
+    if length.expression.is_some() {
+        return None;
+    }
+    match length.value {
+        crate::Dimension::Px(px) => Some(px),
+        _ => None,
+    }
+}
+
 fn parse_transform_ops(value: &str) -> Option<Vec<crate::TransformOp>> {
     let functions = transform_functions(value);
     if functions.is_empty() {
         return None;
     }
     let mut operations = Vec::with_capacity(functions.len());
+    // The 2D transform pipeline cannot carry a Z coordinate. A perspective()
+    // function combined with Z translation is a uniform scale of the element
+    // plane about the transform origin, w = 1 - z_total * sum(1/d), so fold
+    // that scale into the op list instead of dropping the whole transform.
+    let mut z_total = 0.0f32;
+    let mut inv_d = 0.0f32;
     for (name, arguments) in functions {
         let values = split_top_level(&arguments, ',')
             .into_iter()
@@ -3607,6 +3626,9 @@ fn parse_transform_ops(value: &str) -> Option<Vec<crate::TransformOp>> {
                 // projection of the element's plane. Keep accepting it so the
                 // useful X/Y part of common compositor transforms is retained.
                 parse_transform_z_length(values[2])?;
+                if let Some(z) = transform_z_px(values[2]) {
+                    z_total += z;
+                }
                 crate::TransformOp::Translate(
                     parse_transform_length(values[0])?,
                     parse_transform_length(values[1])?,
@@ -3614,6 +3636,18 @@ fn parse_transform_ops(value: &str) -> Option<Vec<crate::TransformOp>> {
             }
             "translatez" if values.len() == 1 => {
                 parse_transform_z_length(values[0])?;
+                if let Some(z) = transform_z_px(values[0]) {
+                    z_total += z;
+                }
+                crate::TransformOp::Matrix(crate::Affine2::IDENTITY)
+            }
+            "perspective" if values.len() == 1 => {
+                parse_transform_z_length(values[0])?;
+                if let Some(d) = transform_z_px(values[0]) {
+                    if d > 0.0 {
+                        inv_d += 1.0 / d;
+                    }
+                }
                 crate::TransformOp::Matrix(crate::Affine2::IDENTITY)
             }
             "scale" if (1..=2).contains(&values.len()) => {
@@ -3733,6 +3767,13 @@ fn parse_transform_ops(value: &str) -> Option<Vec<crate::TransformOp>> {
             _ => return None,
         };
         operations.push(operation);
+    }
+    if inv_d != 0.0 && z_total != 0.0 {
+        let w = 1.0 - z_total * inv_d;
+        if w > 0.0 {
+            let scale = 1.0 / w;
+            operations.push(crate::TransformOp::Scale(scale, scale));
+        }
     }
     Some(operations)
 }
