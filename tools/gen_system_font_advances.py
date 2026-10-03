@@ -30,16 +30,26 @@ SIZE = 14.0
 
 def main():
     data = json.load(open(sys.argv[1]))
-    charset = data["charset"]
-    for weight, path in ASSETS.items():
-        chars = data["weights"][weight]["chars"]
+    # weight=path overrides let the same measurement shape rewrite another
+    # family's stand-in (e.g. the Liberation face behind Arial).
+    assets = dict(ASSETS)
+    for arg in sys.argv[2:]:
+        weight, path = arg.split("=", 1)
+        assets[weight] = path
+    charset = data.get("charset")
+    weights = data.get("weights") or data
+    for weight, path in assets.items():
+        if weight not in weights:
+            continue
+        chars = weights[weight].get("chars") or weights[weight]["single"]
         font = TTFont(path)
         cmap = font.getBestCmap()
         hmtx = font["hmtx"]
         upem = font["head"].unitsPerEm
         changed = 0
-        for ch in charset:
-            span_w = chars[ch]["spanW"]
+        for ch in (charset or list(chars.keys())):
+            entry = chars[ch]
+            span_w = entry["spanW"] if isinstance(entry, dict) else entry
             glyph = cmap.get(ord(ch))
             if glyph is None:
                 continue
@@ -49,7 +59,10 @@ def main():
                 hmtx[glyph] = (units, lsb)
                 changed += 1
         font.save(path)
-        print("%s: upem=%d changed=%d/%d" % (path, upem, changed, len(charset)))
+        print(
+            "%s: upem=%d changed=%d/%d"
+            % (path, upem, changed, len(charset or chars))
+        )
 
 
 if __name__ == "__main__":

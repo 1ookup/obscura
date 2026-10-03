@@ -4016,15 +4016,17 @@ fn percentage_height_inside_floated_and_inline_block_controls_uses_content_box()
 
     assert_eq!(rect("floated").height, 44.0);
     assert_eq!(rect("inline").height, 44.0);
+    // The UA's two-pixel outset border stays (the author only overrides
+    // padding), so the border-box control's content basis is 44 - 2 - 4.
     assert_eq!(
         rect("float-icon").height,
-        42.0,
+        38.0,
         "a floated containing block retains its definite content-box basis"
     );
     assert_eq!(
         rect("inline-icon").height,
-        42.0,
-        "border-box padding must not leak into the child percentage basis"
+        38.0,
+        "border-box padding and border must not leak into the child percentage basis"
     );
 }
 

@@ -1365,7 +1365,12 @@ fn bundled_face_metrics(family: &str) -> FaceMetrics {
     let (ascent, descent, line_gap) = match family {
         SERIF_FAMILY => (1825.0, 443.0, 87.0),
         MONO_FAMILY => (1705.0, 615.0, 0.0),
-        SYSTEM_FAMILY => (1901.0, 483.0, 0.0),
+        // SF's hhea (1980/-432, upem 2048). The grid-fitted ascent plus
+        // descent gives the reference's atomic-only line strut: 17px at
+        // 14px, 18 at 16px, 23 at 20px, 47 at 40px, all measured on the
+        // macOS reference; the bundled stand-in's 1901/483 answers
+        // 16/19/24/46 and left atomic-only lines one pixel short or tall.
+        SYSTEM_FAMILY => (1980.0, 432.0, 0.0),
         _ => (1854.0, 434.0, 67.0),
     };
     FaceMetrics {
@@ -5934,12 +5939,34 @@ fn shape_with_text_indent(
 
     let Some(source) = item.source_buffer.as_ref() else {
         item.buffer.set_wrap(font_system, wrap);
+        // The stand-in's shaped line can be wider than the width the layout
+        // reports for it, because the family table's pair kern is subtracted
+        // only in the corrected line. Shaping at the corrected width would
+        // fold text that exactly fills it, so hand cosmic the kern slack
+        // back: fold iff corrected width exceeds the available width.
+        let kern_slack = match item.identity_table {
+            Some(table) => {
+                let mut prev: Option<char> = None;
+                let mut units = 0.0f32;
+                for line in item.buffer.lines.iter() {
+                    for ch in line.text().chars() {
+                        if let Some(prev) = prev {
+                            units += table.kern(prev, ch);
+                        }
+                        prev = Some(ch);
+                    }
+                }
+                units * item.buffer.metrics().font_size / table.upem
+            }
+            None => 0.0,
+        };
         // Chromium breaks lines on 1/64 LayoutUnit integers, so text that
         // exactly fills its available width stays on one line. Our shaping
         // advances are f32 round-trips of the same 1/64 grid, and a one-ulp
         // overshoot at the equal boundary flips such a line to two. The
         // quarter-sixtyfourth slack reproduces the quantized comparison.
-        let shape_width = width.map(|value| (value + 1.0 / 64.0).max(0.0));
+        let shape_width =
+            width.map(|value| (value - kern_slack + 1.0 / 64.0).max(0.0));
         item.buffer.set_size(font_system, shape_width, None);
         item.buffer.shape_until_scroll(font_system, false);
         return;

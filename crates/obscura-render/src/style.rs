@@ -163,6 +163,10 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         // and reads 16px tall where Chrome reads 22px.
         style.display = Display::Inline;
         style.is_inline_block = true;
+        // The UA sizes these widgets in border-box terms: 10em by 1em
+        // including any authored border (measured on the reference at 14px
+        // and 16px).
+        style.box_sizing = crate::BoxSizing::BorderBox;
         style.border_model.styles = crate::Sides::all(crate::BorderStyle::Solid);
     } else if tag == "summary" {
         // Chromium's UA sheet makes summary a list-item carrying a
@@ -177,6 +181,18 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         let mut marker = crate::LayoutStyle::default();
         marker.display = Display::Inline;
         marker.before_content = Some("\u{25b8} ".to_string());
+        // The reference's disclosure triangle plus its gap measures
+        // 14.83px at 14px; the stand-in's glyph pair answers 10.828125
+        // within the shaped run, so the remainder rides as the marker
+        // box's inline-end margin. Calibrated against the total: the
+        // reference details reads 80.703125 and our run answers
+        // 76.703125, leaving exactly 4.
+        marker.margin = Edges {
+            top: 0.0,
+            right: 4.0,
+            bottom: 0.0,
+            left: 0.0,
+        };
         style.before_pseudo = Some(Box::new(marker));
     } else if tag == "iframe" {
         // HTML's UA sheet gives frames a two-pixel inset border. The paint
@@ -198,6 +214,22 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.is_inline_block = true;
         style.text_align = Some(taffy::AlignItems::CENTER);
         style.box_sizing = crate::BoxSizing::BorderBox;
+        // The native control font (Arial 13.3333px) and the two-pixel outset
+        // border are part of the UA answer; reset stylesheets remove them by
+        // name, so they must exist here first.
+        style.font_size = Some(13.333_333);
+        style.font_family = Some("arial".to_string());
+        style.border = Edges {
+            top: 2.0,
+            right: 2.0,
+            bottom: 2.0,
+            left: 2.0,
+        };
+        style.border_model.specified_widths = crate::Sides::all(2.0);
+        style.border_model.styles = crate::Sides::all(crate::BorderStyle::Outset);
+        style.border_model.colors =
+            crate::Sides::all(Some([239, 239, 239, 255]));
+        style.border_color = Some([239, 239, 239, 255]);
         // Chromium's native button content box keeps one pixel of block-axis
         // and six pixels of inline-axis padding. Framework resets commonly
         // remove the native border/background but intentionally retain this
@@ -218,12 +250,17 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.is_inline_block = true;
         style.font_size = Some(13.333_333);
         style.font_family = Some("arial".to_string());
-        style.line_height = Some(crate::LineHeight::Normal);
+        // The closed menulist measures 19px tall at the native control font
+        // and reserves the dropdown arrow inside its width: the reference
+        // shows a 17px content box (line 15 plus two pixels of lead) with a
+        // 20.05px right zone for the arrow.
+        style.line_height = Some(crate::LineHeight::Px(17.0));
+        style.box_sizing = crate::BoxSizing::BorderBox;
         style.padding = Edges {
-            top: 1.0,
-            right: 20.0,
-            bottom: 1.0,
-            left: 2.0,
+            top: 0.0,
+            right: 20.046_875,
+            bottom: 0.0,
+            left: 0.0,
         };
         style.border = Edges {
             top: 1.0,
@@ -1847,8 +1884,14 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "grid-column-end" => set_grid_placement_side(style, value, true, false),
         "grid-row-start" => set_grid_placement_side(style, value, false, true),
         "grid-row-end" => set_grid_placement_side(style, value, false, false),
-        "transform" => parse_transform(style, value),
-        "transform-origin" => style.transform_origin = parse_transform_origin(value),
+        // Blink treats -webkit-transform as an alias of transform, so a
+        // later -webkit-transform declaration overrides an earlier
+        // transform one (authors relied on this to layer prefixed and
+        // standard values in one block).
+        "transform" | "-webkit-transform" => parse_transform(style, value),
+        "transform-origin" | "-webkit-transform-origin" => {
+            style.transform_origin = parse_transform_origin(value)
+        }
         "translate" => parse_individual_translate(style, value),
         "rotate" => parse_individual_rotate(style, value),
         "scale" => parse_individual_scale(style, value),

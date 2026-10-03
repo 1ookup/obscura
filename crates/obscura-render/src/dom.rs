@@ -1765,6 +1765,7 @@ impl DomLayout {
                 0.0,
                 0.0,
                 &self.rects,
+                &self.cssom_rects,
                 &self.styles,
                 &mut self.clip_rects,
                 &mut self.translates,
@@ -3390,6 +3391,10 @@ fn resolve_clip_rects(
     tx: f32,
     ty: f32,
     rects: &HashMap<NodeId, Rect>,
+    // The layout-unit-snapped box. Percentages in transform-origin and
+    // translate resolve against this fractional box, like Blink; the
+    // integer-rounded rects map stays in charge of clips.
+    origin_rects: &HashMap<NodeId, Rect>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     clip_rects: &mut HashMap<NodeId, Option<OverflowClip>>,
     translates: &mut HashMap<NodeId, (f32, f32)>,
@@ -3402,7 +3407,11 @@ fn resolve_clip_rects(
     // This node's own translate joins the accumulation for its box and its
     // whole subtree (percentages resolve against its own border box).
     let (own_tx, own_ty) = styles.get(&id).map_or((0.0, 0.0), |style| {
-        let rect = rects.get(&id).copied().unwrap_or_default();
+        let rect = origin_rects
+            .get(&id)
+            .or_else(|| rects.get(&id))
+            .copied()
+            .unwrap_or_default();
         resolved_own_translate(style, &rect, root_font_size, viewport)
     });
     let (tx, ty) = (tx + own_tx, ty + own_ty);
@@ -3410,7 +3419,11 @@ fn resolve_clip_rects(
         translates.insert(id, (tx, ty));
     }
     let own_transform = styles.get(&id).map_or(crate::Affine2::IDENTITY, |style| {
-        let rect = rects.get(&id).copied().unwrap_or_default();
+        let rect = origin_rects
+            .get(&id)
+            .or_else(|| rects.get(&id))
+            .copied()
+            .unwrap_or_default();
         resolved_transform_matrix(style, &rect, root_font_size, viewport)
     });
     let transform = parent_transform.then(own_transform);
@@ -3442,6 +3455,7 @@ fn resolve_clip_rects(
             tx,
             ty,
             rects,
+            origin_rects,
             styles,
             clip_rects,
             translates,
@@ -3470,6 +3484,7 @@ fn resolve_clip_rects_reusing(
     tx: f32,
     ty: f32,
     rects: &HashMap<NodeId, Rect>,
+    origin_rects: &HashMap<NodeId, Rect>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     clip_rects: &mut HashMap<NodeId, Option<OverflowClip>>,
     translates: &mut HashMap<NodeId, (f32, f32)>,
@@ -3489,6 +3504,7 @@ fn resolve_clip_rects_reusing(
         tx,
         ty,
         rects,
+        origin_rects,
         styles,
         clip_rects,
         translates,
@@ -3517,6 +3533,7 @@ fn resolve_clip_rects_reusing_visit(
     tx: f32,
     ty: f32,
     rects: &HashMap<NodeId, Rect>,
+    origin_rects: &HashMap<NodeId, Rect>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     clip_rects: &mut HashMap<NodeId, Option<OverflowClip>>,
     translates: &mut HashMap<NodeId, (f32, f32)>,
@@ -3546,7 +3563,11 @@ fn resolve_clip_rects_reusing_visit(
     // This node's own translate joins the accumulation for its box and its
     // whole subtree (percentages resolve against its own border box).
     let (own_tx, own_ty) = styles.get(&id).map_or((0.0, 0.0), |style| {
-        let rect = rects.get(&id).copied().unwrap_or_default();
+        let rect = origin_rects
+            .get(&id)
+            .or_else(|| rects.get(&id))
+            .copied()
+            .unwrap_or_default();
         resolved_own_translate(style, &rect, root_font_size, viewport)
     });
     let (tx, ty) = (tx + own_tx, ty + own_ty);
@@ -3554,7 +3575,11 @@ fn resolve_clip_rects_reusing_visit(
         translates.insert(id, (tx, ty));
     }
     let own_transform = styles.get(&id).map_or(crate::Affine2::IDENTITY, |style| {
-        let rect = rects.get(&id).copied().unwrap_or_default();
+        let rect = origin_rects
+            .get(&id)
+            .or_else(|| rects.get(&id))
+            .copied()
+            .unwrap_or_default();
         resolved_transform_matrix(style, &rect, root_font_size, viewport)
     });
     let transform = parent_transform.then(own_transform);
@@ -3592,6 +3617,7 @@ fn resolve_clip_rects_reusing_visit(
             tx,
             ty,
             rects,
+            origin_rects,
             styles,
             clip_rects,
             translates,
@@ -8657,6 +8683,11 @@ fn layout_dom_once(
                         )
                     })
                     .fold(0.0f32, f32::max);
+                // Blink stores measured text in LayoutUnits, rounding to the
+                // nearest 1/64: the reference's label answers 45.953125 and
+                // its select reads 68 with the UA padding and border. Keep
+                // the select's intrinsic width on that same grid.
+                let label_width = (label_width * 64.0).round() / 64.0;
                 let horizontal_edges = style.padding.left
                     + style.padding.right
                     + style.border.left
@@ -10257,6 +10288,7 @@ fn layout_dom_once(
                 0.0,
                 0.0,
                 &rects,
+                &cssom_rects,
                 &styles,
                 &mut clip_rects,
                 &mut translates,
@@ -10277,6 +10309,7 @@ fn layout_dom_once(
                 0.0,
                 0.0,
                 &rects,
+                &cssom_rects,
                 &styles,
                 &mut clip_rects,
                 &mut translates,
@@ -10433,6 +10466,7 @@ fn layout_dom_once(
                     0.0,
                     0.0,
                     &rects,
+                    &cssom_rects,
                     &styles,
                     &mut clip_rects,
                     &mut translates,

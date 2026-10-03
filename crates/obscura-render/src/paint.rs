@@ -4339,7 +4339,14 @@ fn paint_laid_dom_scrolled(
             Some(name) => name,
             None => continue,
         };
-        let rect = match laid.rects.get(&nid) {
+        // Transform origins resolve against the layout-unit-snapped box, the
+        // same fractional rect the CSSOM sees; the integer map is only a
+        // fallback for nodes the snapped write-back did not visit.
+        let rect = match laid
+            .cssom_rects
+            .get(&nid)
+            .or_else(|| laid.rects.get(&nid))
+        {
             Some(r) => *r,
             None => continue,
         };
@@ -7369,7 +7376,15 @@ fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
 
 pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
     let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
-    let scale = PxScale::from(size);
+    // ab_glyph's PxScale is the pixel height of the font (ascent - descent),
+    // not the em size, so a bare PxScale::from(size) answers advances in
+    // height units and every width comes out short by units_per_em/height
+    // (0.895 for Liberation Sans, 0.883 for Mono). Size the em square, as
+    // Font::pt_to_px_scale does: px_per_em * height / units_per_em.
+    let scale = PxScale::from(match font.units_per_em() {
+        Some(units_per_em) => size * font.height_unscaled() / units_per_em,
+        None => size,
+    });
     let scaled_font = font.as_scaled(scale);
     let mut width = 0.0;
     for c in text.chars() {
