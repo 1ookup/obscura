@@ -25,6 +25,7 @@ either engine.
 import argparse
 import asyncio
 import json
+import os
 import sys
 import urllib.request
 
@@ -99,7 +100,14 @@ async def run(endpoint, url, offset, deadline, settle, require_interactive, star
         session = r["result"]["sessionId"]
         await c.call("Page.enable", session=session)
         await c.call("Runtime.enable", session=session)
-        await c.call("Page.addScriptToEvaluateOnNewDocument", {"source": PRELOAD},
+        source = PRELOAD
+        extra = os.environ.get("OBSCURA_PRELOAD_EXTRA", "")
+        if extra:
+            # Diagnostic only: concatenate an extra IIFE (e.g. a realm
+            # witness) after the click preload. Never set on recorded rounds.
+            with open(extra) as f:
+                source = PRELOAD + ";\n" + f.read()
+        await c.call("Page.addScriptToEvaluateOnNewDocument", {"source": source},
                      session=session)
         await c.call("Page.navigate", {"url": url}, session=session)
 
