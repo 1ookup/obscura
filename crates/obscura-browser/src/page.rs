@@ -7029,15 +7029,12 @@ impl Page {
                     }) {
                         sandbox = sandbox.merged_with_parent(required_flags);
                     }
-                    // A sandboxed unique-origin document is not eligible for
-                    // cross-origin isolation, even when its response carries
-                    // COOP/COEP. `allow-same-origin` keeps the tuple origin
-                    // and may therefore retain isolation.
-                    // Only a same-origin child inherits the parent's
-                    // capability. A cross-origin child keeps its own agent
-                    // cluster, so its own COOP/COEP response and an
-                    // `allow="cross-origin-isolated"` delegation alike leave
-                    // it non-isolated -- the challenge widget shape.
+                    // The isolation bit: the embedder's own isolation plus
+                    // the container's delegation; only a CSP `sandbox`
+                    // directive whose own list omits `allow-same-origin`
+                    // refuses it (measured Chrome 149). The merged sandbox
+                    // flags still drive the opaque-origin question below,
+                    // where an attribute `allow-same-origin` does count.
                     let document_cross_origin_isolated_allowed =
                         crate::frame_policy::cross_origin_isolated_allowed(
                             request.allow.as_deref(),
@@ -7050,7 +7047,6 @@ impl Page {
                         &response_origin,
                         &parent_origin,
                         parent_cross_origin_isolated,
-                        sandbox,
                         request.allow.as_deref(),
                         parent_cross_origin_isolated_allowed,
                     );
@@ -10454,7 +10450,6 @@ mod tests {
                 &widget,
                 &page,
                 parent_isolated,
-                obscura_dom::SandboxFlags::default(),
                 allow,
                 true,
             )
@@ -10482,7 +10477,6 @@ mod tests {
             &widget,
             &widget,
             true,
-            obscura_dom::SandboxFlags::default(),
             None,
             true,
         ));
@@ -10529,7 +10523,6 @@ mod tests {
                 &widget,
                 &page,
                 true,
-                obscura_dom::SandboxFlags::default(),
                 allow,
                 true,
             )
@@ -10541,6 +10534,30 @@ mod tests {
         // Delegated, the same three responses are isolated.
         assert!(isolated(&child(&[coep], "widget.example"), delegated));
         assert!(isolated(&child(&[coep, coop], "widget.example"), delegated));
+        // Only the response's own CSP `sandbox` token list can refuse it: one
+        // without `allow-same-origin` refuses the delegated, COEP-carrying
+        // child, one with it isolates as if the directive were absent
+        // (measured Chrome 149, cells v6 and v2).
+        assert!(!isolated(
+            &child(
+                &[coep, ("content-security-policy", "sandbox allow-scripts")],
+                "widget.example"
+            ),
+            delegated,
+        ));
+        assert!(isolated(
+            &child(
+                &[
+                    coep,
+                    (
+                        "content-security-policy",
+                        "sandbox allow-scripts allow-same-origin"
+                    )
+                ],
+                "widget.example"
+            ),
+            delegated,
+        ));
 
         // A non-isolated embedder contributes nothing of its own.
         assert!(!super::frame_document_isolation(
@@ -10548,7 +10565,6 @@ mod tests {
             &widget,
             &page,
             false,
-            obscura_dom::SandboxFlags::default(),
             delegated,
             true,
         ));
@@ -10577,7 +10593,6 @@ mod tests {
             &widget,
             &page,
             true,
-            obscura_dom::SandboxFlags::default(),
             delegated,
             true,
         ));
@@ -10592,10 +10607,13 @@ mod tests {
     ///
     /// The delegation decides, not the child's origin: measured on the local
     /// Chrome, the same isolated top leaves `/no-allow` reading `false` with
-    /// no `SharedArrayBuffer` and both delegated children reading `true` with
-    /// the constructor, sandbox attribute or not. The hidden same-origin
-    /// children inherit their frame's bit, and a second navigation to a
-    /// top-level document with no COOP pins the whole tree at `false`.
+    /// no `SharedArrayBuffer`, the delegated children reading `true` with the
+    /// constructor, and `/csp-refuse` reading `false` again only because its
+    /// response's own CSP `sandbox` token list omits `allow-same-origin`. An
+    /// attribute `sandbox` never refuses the bit, `allow-same-origin` in it or
+    /// not. The hidden same-origin children inherit their frame's bit, and a
+    /// second navigation to a top-level document with no COOP pins the whole
+    /// tree at `false`.
     #[tokio::test(flavor = "current_thread")]
     async fn cross_origin_frames_stay_unisolated_under_an_isolated_top() {
         let parent_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -10610,6 +10628,9 @@ mod tests {
                      allow=\"cross-origin-isolated; fullscreen; autoplay; keyboard-map; gamepad; \
                             xr-spatial-tracking\" \
                      sandbox=\"allow-same-origin allow-scripts allow-popups\"></iframe>\
+             <iframe src=\"{child_origin}/csp-refuse\" \
+                     allow=\"cross-origin-isolated\" \
+                     sandbox=\"allow-same-origin allow-scripts allow-popups\"></iframe>\
              <iframe src=\"{parent_origin}/same-child\"></iframe>"
         );
         let child_server = std::thread::spawn(move || {
@@ -10623,9 +10644,19 @@ mod tests {
             for _ in 0..12 {
                 let Ok((mut stream, _)) = child_listener.accept() else { break };
                 let mut request = [0u8; 2048];
-                let _ = stream.read(&mut request);
+                let read = stream.read(&mut request).unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..read]).to_string();
+                // `/csp-refuse` is the cell where the attribute carries
+                // `allow-same-origin` and the response's own CSP does not:
+                // only the latter refuses the bit.
+                let csp = if head.contains("/csp-refuse") {
+                    "Content-Security-Policy: sandbox allow-scripts allow-popups\r\n"
+                } else {
+                    ""
+                };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                     {csp}\
                      Cross-Origin-Opener-Policy: same-origin\r\n\
                      Cross-Origin-Embedder-Policy: require-corp\r\n\
                      Cross-Origin-Resource-Policy: cross-origin\r\n\
@@ -10703,10 +10734,13 @@ mod tests {
         rows.sort();
         let mut expected = vec![
             (format!("{child_origin}/allow"), true, true),
-            // A sandboxed widget frame never isolates (Chrome reference
-            // answers crossOriginIsolated=false in the live challenge), so
-            // only the delegation grant bit stays true here.
-            (format!("{child_origin}/live-shape"), false, true),
+            // A response CSP `sandbox` token list without `allow-same-origin`
+            // refuses the bit even though the attribute carries it: only the
+            // response's own directive is read (measured Chrome 149, cell v8).
+            (format!("{child_origin}/csp-refuse"), false, true),
+            // The attribute `sandbox` does not refuse the bit, and the
+            // delegation still grants it (measured Chrome 149, cell v3).
+            (format!("{child_origin}/live-shape"), true, true),
             (format!("{child_origin}/no-allow"), false, false),
             (format!("{parent_origin}/same-child"), true, true),
         ];
@@ -10715,8 +10749,9 @@ mod tests {
             rows, expected,
             "the container's delegation decides isolation, and the grant is a separate bit",
         );
-        // The hidden children follow their own frame: isolated under the
-        // delegated frames, not under the one whose container refused it.
+        // The hidden children follow their own frame: isolated under both
+        // delegated frames (the attribute `sandbox` does not refuse the bit),
+        // not under the one whose container refused it.
         let widget_children: Vec<bool> = page
             .with_dom(|dom| {
                 let mut rows = Vec::new();
@@ -10744,8 +10779,9 @@ mod tests {
         );
         assert_eq!(
             widget_children.iter().filter(|isolated| **isolated).count(),
-            1,
-            "only the unsandboxed delegated frame's child is isolated: {widget_children:?}",
+            2,
+            "both delegated frames' hidden children are isolated; the attribute \
+             `sandbox` does not refuse the bit: {widget_children:?}",
         );
 
         // An embedder without COOP isolates nothing anywhere in the tree.
@@ -10798,7 +10834,6 @@ mod tests {
                 &top,
                 &top,
                 parent_isolated,
-                obscura_dom::SandboxFlags::default(),
                 allow,
                 true,
             )
@@ -10833,7 +10868,6 @@ mod tests {
             &obscura_dom::Origin::from_url("https://widget.example/"),
             &top,
             true,
-            obscura_dom::SandboxFlags::default(),
             None,
             true,
         ));
@@ -10842,7 +10876,6 @@ mod tests {
             &obscura_dom::Origin::from_url("https://widget.example/"),
             &top,
             true,
-            obscura_dom::SandboxFlags::default(),
             Some("cross-origin-isolated"),
             true,
         ));
@@ -11634,7 +11667,7 @@ mod tests {
         std::thread::spawn(move || {
             use std::io::{Read as _, Write as _};
 
-            for _ in 0..3 {
+            for _ in 0..5 {
                 let Ok((mut stream, _)) = listener.accept() else { break };
                 let mut request = [0u8; 4096];
                 let length = stream.read(&mut request).unwrap_or(0);
@@ -11647,7 +11680,7 @@ mod tests {
                 let (csp, body) = match path.as_str() {
                     "/" => (
                         "",
-                        "<!doctype html><iframe id=strict src='/strict.html'></iframe><iframe id=relaxed src='/relaxed.html'></iframe>",
+                        "<!doctype html><iframe id=strict src='/strict.html'></iframe><iframe id=relaxed src='/relaxed.html' allow='cross-origin-isolated'></iframe><iframe id=allow-so src='/allow-so.html' allow='cross-origin-isolated'></iframe>",
                     ),
                     "/strict.html" => (
                         "sandbox",
@@ -11657,6 +11690,10 @@ mod tests {
                         "sandbox allow-scripts",
                         "<!doctype html><script>globalThis.relaxedRan=1</script>",
                     ),
+                    "/allow-so.html" => (
+                        "sandbox allow-scripts allow-same-origin",
+                        "<!doctype html><script>globalThis.allowSoRan=1</script>",
+                    ),
                     _ => ("", "missing"),
                 };
                 let csp_header = if csp.is_empty() {
@@ -11664,7 +11701,14 @@ mod tests {
                 } else {
                     format!("Content-Security-Policy: {csp}\r\n")
                 };
-                let isolation_headers = if path == "/relaxed.html" {
+                // The embedder is isolated and both CSP children are delegated,
+                // so only the directive's own token list decides their bit: the
+                // one without `allow-same-origin` refuses, the one with it
+                // isolates (measured Chrome 149, cells v6 and v2).
+                let isolation_headers = if path == "/"
+                    || path == "/relaxed.html"
+                    || path == "/allow-so.html"
+                {
                     "Cross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\n"
                 } else {
                     ""
@@ -11688,16 +11732,23 @@ mod tests {
         ));
         let mut page = super::Page::new("frame-response-csp-sandbox".to_string(), context);
         page.navigate(&origin).await.unwrap();
+        assert!(
+            page.cross_origin_isolated,
+            "the embedder must itself be isolated for the frame bit to matter",
+        );
 
-        let (strict, relaxed) = page
+        let (strict, relaxed, allow_so) = page
             .with_dom(|dom| {
                 let strict_host = dom.query_selector("#strict").unwrap().unwrap();
                 let relaxed_host = dom.query_selector("#relaxed").unwrap().unwrap();
+                let allow_so_host = dom.query_selector("#allow-so").unwrap().unwrap();
                 let strict_root = dom.iframe_content_document(strict_host).unwrap();
                 let relaxed_root = dom.iframe_content_document(relaxed_host).unwrap();
+                let allow_so_root = dom.iframe_content_document(allow_so_host).unwrap();
                 (
                     dom.document_scope(strict_root).unwrap(),
                     dom.document_scope(relaxed_root).unwrap(),
+                    dom.document_scope(allow_so_root).unwrap(),
                 )
             })
             .unwrap();
@@ -11707,23 +11758,36 @@ mod tests {
         assert!(relaxed.sandbox.active);
         assert!(relaxed.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS));
         assert!(relaxed.origin.is_opaque());
+        // The response CSP `sandbox` omits `allow-same-origin`, so the
+        // delegated frame refuses isolation under the isolated embedder.
         assert!(!relaxed.cross_origin_isolated);
+        assert!(allow_so.sandbox.active);
+        assert!(allow_so.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS));
+        assert!(allow_so.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN));
+        assert!(!allow_so.origin.is_opaque());
+        // The same directive with `allow-same-origin` isolates as if there
+        // were no sandbox at all: only the token list is read.
+        assert!(allow_so.cross_origin_isolated);
 
-        let (strict_host, relaxed_host) = page
+        let (strict_host, relaxed_host, allow_so_host) = page
             .with_dom(|dom| {
                 (
                     dom.query_selector("#strict").unwrap().unwrap(),
                     dom.query_selector("#relaxed").unwrap().unwrap(),
+                    dom.query_selector("#allow-so").unwrap().unwrap(),
                 )
             })
             .unwrap();
         let strict_frame = page.frames.by_host(strict_host).unwrap();
         let relaxed_frame = page.frames.by_host(relaxed_host).unwrap();
-        let (strict_id, strict_generation, relaxed_id, relaxed_generation) = (
+        let allow_so_frame = page.frames.by_host(allow_so_host).unwrap();
+        let (strict_id, strict_generation, relaxed_id, relaxed_generation, allow_so_id, allow_so_generation) = (
             strict_frame.frame_id.clone(),
             strict_frame.document_generation,
             relaxed_frame.frame_id.clone(),
             relaxed_frame.document_generation,
+            allow_so_frame.frame_id.clone(),
+            allow_so_frame.document_generation,
         );
         let strict_ran = page
             .js
@@ -11747,8 +11811,20 @@ mod tests {
                 "relaxedRan",
             )
             .unwrap();
+        let allow_so_ran = page
+            .js
+            .as_mut()
+            .unwrap()
+            .execute_script_in_frame_realm(
+                &allow_so_id,
+                allow_so_generation,
+                "<csp-sandbox-probe>",
+                "allowSoRan",
+            )
+            .unwrap();
         assert_eq!(strict_ran, serde_json::json!("undefined"));
         assert_eq!(relaxed_ran, serde_json::json!(1.0));
+        assert_eq!(allow_so_ran, serde_json::json!(1.0));
     }
 
     /// Chrome 153 oracle, two-port COOP/COEP fixture: an isolated top-level
@@ -15053,6 +15129,26 @@ fn response_requires_cross_origin_embedding(response: &obscura_net::Response) ->
         })
 }
 
+/// Whether the response's own `Content-Security-Policy: sandbox` directive
+/// omits `allow-same-origin` -- the one sandbox shape that refuses
+/// cross-origin isolation in the reference browser.
+///
+/// Measured Chrome 149, two-origin fixture, eight cells: a CSP
+/// `sandbox allow-same-origin ...` isolates exactly like no sandbox at all
+/// (the live challenge widget shape, which additionally carries the iframe
+/// `sandbox` attribute); the same directive without `allow-same-origin`
+/// refuses; and the iframe `sandbox` attribute never changes the answer on
+/// its own. The judgement reads the directive's token list, not the merged
+/// sandbox flags: an attribute-granted `allow-same-origin` beside a CSP list
+/// that omits it still refuses (cell v8).
+fn csp_sandbox_excludes_same_origin(response: &obscura_net::Response) -> bool {
+    response
+        .header("content-security-policy")
+        .map(crate::frame_policy::ContentSecurityPolicy::parse)
+        .and_then(|policy| policy.sandbox_flags())
+        .is_some_and(|flags| !flags.allows(obscura_dom::SandboxFlags::ALLOW_SAME_ORIGIN))
+}
+
 /// Whether the response carries `Cross-Origin-Resource-Policy: cross-origin`
 /// (case-insensitive), the token a `require-corp` embedder accepts for a
 /// nested document. Measured Chrome 149 drops a child that answers with only
@@ -15092,16 +15188,17 @@ fn response_denies_cross_origin_isolation(response: &obscura_net::Response) -> b
 /// Whether a committed frame document joins its embedder's cross-origin
 /// isolated agent cluster.
 ///
-/// Three things decide it and the child's own COOP is not one of them:
+/// Four things decide it and the child's own COOP is not one of them:
 ///
-/// * the embedder must itself be isolated, which is why the challenge widget
-///   -- a cross-origin child of a plain page -- reads `false` however it is
-///   embedded;
+/// * the embedder must itself be isolated;
 /// * the container must grant the child the `cross-origin-isolated` feature:
 ///   the default allowlist is `self`, so a same-origin child inherits it and a
 ///   cross-origin one needs `allow="cross-origin-isolated"`;
 /// * the child must carry its own embedder policy, since an embedder under
-///   `require-corp` never loads a document without one.
+///   `require-corp` never loads a document without one;
+/// * and the only sandbox shape that refuses it is a CSP `sandbox` directive
+///   whose own token list omits `allow-same-origin` (measured Chrome 149,
+///   eight-cell fixture; see `csp_sandbox_excludes_same_origin`).
 ///
 /// The first two were measured together on the local Chrome (two-host
 /// fixture, four routes). With an isolated top: a cross-origin child without
@@ -15116,7 +15213,6 @@ fn frame_document_isolation(
     response_origin: &obscura_dom::Origin,
     parent_origin: &obscura_dom::Origin,
     parent_cross_origin_isolated: bool,
-    sandbox: obscura_dom::SandboxFlags,
     allow: Option<&str>,
     parent_allowed: bool,
 ) -> bool {
@@ -15130,14 +15226,13 @@ fn frame_document_isolation(
         )
         && response_requires_cross_origin_embedding(response)
         && !response_denies_cross_origin_isolation(response)
-        // A sandboxed browsing context never enters cross-origin isolation,
-        // even with allow-same-origin: the reference build answers
-        // crossOriginIsolated=false (and exposes no SharedArrayBuffer) in the
-        // challenge widget, whose frame carries sandbox="allow-same-origin
-        // allow-scripts allow-popups" alongside the COOP/COEP headers and the
-        // allow="cross-origin-isolated" delegation that would otherwise
-        // isolate an unsandboxed frame.
-        && !sandbox.active
+        // The one sandbox shape that refuses isolation: a CSP `sandbox`
+        // directive whose own token list omits `allow-same-origin` (measured
+        // Chrome 149, eight-cell two-origin fixture). The iframe `sandbox`
+        // attribute never refuses it, and the merged sandbox flags are the
+        // wrong input -- an attribute-granted `allow-same-origin` beside a
+        // CSP list without it still reads crossOriginIsolated=false.
+        && !csp_sandbox_excludes_same_origin(response)
 }
 
 fn is_text_like_content_type(content_type: Option<&str>) -> bool {

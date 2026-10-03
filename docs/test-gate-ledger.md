@@ -347,3 +347,4 @@ run covers are then removed.
 - clampBox passthrough (10-02 eve): scoped: render 628/628 (from corner commit); live r47 fo2 -> cf-chl-out + cf-chl-out-s + cf_clearance issued (first full pass with clampBox fix); HPcn5[2] bitwise == Chrome
 - clampBox followup (10-02 eve): scoped js 750/750 (one timing-flake passed on rerun), browser 140/140; ov2 rotated 20:04 (md5 3fe2ea87) and the pass reproduced on the new build (r48/r49)
 - session batch 10-02/10-03 (22 commits, HEAD 585f7bc): full workspace gate 2042 passed / 0 failed (render+all crates, no-fail-fast); opt-out check (no-default-features) blocked by host CLT-shim env — needs CI or full-Xcode host; live acceptance trail r47-r85 (HPcn5 +39→±9, exception face clean, EvalError+Illegal zero)
+- COI CSP token-list fix (10-03): scoped: obscura-browser 141/141, obscura-render 637/637 (1 skipped); Chrome 149 eight-cell COI fixture 8/8 (v1-v5 true, v6-v8 false; was v4-only before the fix)
