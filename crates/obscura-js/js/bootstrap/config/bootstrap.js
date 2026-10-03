@@ -89,6 +89,9 @@ const SVG_TAGS = {
 };
 
 const _ecmaScriptGlobals = new Set(Object.getOwnPropertyNames(globalThis));
+// queueMicrotask is installed by V8 but sits inside the Chrome 149 payload
+// region; drop it from the snapshot so the window walk re-inserts it in order.
+_ecmaScriptGlobals.delete('queueMicrotask');
 
 // Static Window APIs use one mount primitive. Capability modules still own the
 // implementation, while this keeps the WebIDL descriptor policy explicit and

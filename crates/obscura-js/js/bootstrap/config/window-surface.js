@@ -23,6 +23,10 @@ function _obscuraInstallWindowSurface(target = globalThis, keyOrder = _chromeWin
   } catch (_error) {}
 
   const seen = new Set();
+  // SharedArrayBuffer is installed by V8 but sits inside the Chrome 149 payload
+  // region, so it is re-inserted like the rest of the table. queueMicrotask is
+  // handled in bootstrap.js by dropping it from the _ecmaScriptGlobals snapshot.
+  const orderOverrides = new Set(['SharedArrayBuffer']);
   for (const name of keyOrder || []) {
     if (seen.has(name)) continue;
     seen.add(name);
@@ -30,7 +34,7 @@ function _obscuraInstallWindowSurface(target = globalThis, keyOrder = _chromeWin
     // realm must keep them in place: deleting Object while this installer is
     // calling Object.defineProperty would remove the global before it can be
     // restored. Frame realms use their own globals and can still be aligned.
-    if (target === globalThis && _ecmaScriptGlobals.has(name)) continue;
+    if (target === globalThis && _ecmaScriptGlobals.has(name) && !orderOverrides.has(name)) continue;
     let descriptor;
     try { descriptor = Object.getOwnPropertyDescriptor(target, name); } catch (_error) { continue; }
     if (!descriptor || !descriptor.configurable) continue;

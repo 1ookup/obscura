@@ -224,7 +224,7 @@ _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
   set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; _navigateCurrentContext(r, 'GET', ''); },
-  configurable: false,
+  configurable: true,
   enumerable: true,
 });
 // The object literal above inherits straight from Object.prototype, so
