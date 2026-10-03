@@ -15731,10 +15731,14 @@ mod tests {
         let sample = "Build fast, responsive sites with Bootstrap";
         let system = measure_text(sample, 64.0, false, Some("system-ui, sans-serif"));
         let arial = measure_text(sample, 64.0, false, Some("Arial, sans-serif"));
+        // The system-ui identity table now carries the measured macOS SF
+        // advances, which sit close to Arial's Liberation Sans but stay a
+        // distinct face (ratio ~1.009 at 64px; the old Linux DejaVu ratio
+        // of 1.08 no longer applies). The guard is here to catch system-ui
+        // silently aliasing to the Arial table.
         assert!(
-            system > arial * 1.08,
-            "Chromium's Linux system-ui face is DejaVu Sans, not the narrower \
-             Liberation Sans used for Arial: system={system}, arial={arial}"
+            system > arial * 1.004,
+            "system-ui must not fall back to the Arial face: system={system}, arial={arial}"
         );
     }
 
