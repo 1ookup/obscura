@@ -5206,10 +5206,17 @@ fn identity_transform_operation(operation: &crate::TransformOp) -> crate::Transf
         crate::TransformOp::Translate(x, y) => {
             crate::TransformOp::Translate(zero_transform_length(x), zero_transform_length(y))
         }
+        crate::TransformOp::Translate3d(x, y, z) => crate::TransformOp::Translate3d(
+            zero_transform_length(x),
+            zero_transform_length(y),
+            zero_transform_length(z),
+        ),
         crate::TransformOp::Scale(_, _) => crate::TransformOp::Scale(1.0, 1.0),
         crate::TransformOp::Rotate(_) => crate::TransformOp::Rotate(0.0),
         crate::TransformOp::Skew(_, _) => crate::TransformOp::Skew(0.0, 0.0),
         crate::TransformOp::Matrix(_) => crate::TransformOp::Matrix(crate::Affine2::IDENTITY),
+        crate::TransformOp::Perspective(_) => crate::TransformOp::Perspective(0.0),
+        crate::TransformOp::ZFold(_) => crate::TransformOp::ZFold(1.0),
     }
 }
 
@@ -5244,6 +5251,20 @@ fn interpolate_transform_operation(
             interpolate_transform_length(from_x, to_x, position)?,
             interpolate_transform_length(from_y, to_y, position)?,
         ),
+        (
+            crate::TransformOp::Translate3d(from_x, from_y, from_z),
+            crate::TransformOp::Translate3d(to_x, to_y, to_z),
+        ) => crate::TransformOp::Translate3d(
+            interpolate_transform_length(from_x, to_x, position)?,
+            interpolate_transform_length(from_y, to_y, position)?,
+            interpolate_transform_length(from_z, to_z, position)?,
+        ),
+        (crate::TransformOp::Perspective(from), crate::TransformOp::Perspective(to)) => {
+            crate::TransformOp::Perspective(lerp(*from, *to))
+        }
+        (crate::TransformOp::ZFold(from), crate::TransformOp::ZFold(to)) => {
+            crate::TransformOp::ZFold(lerp(*from, *to))
+        }
         (crate::TransformOp::Scale(from_x, from_y), crate::TransformOp::Scale(to_x, to_y)) => {
             crate::TransformOp::Scale(lerp(*from_x, *to_x), lerp(*from_y, *to_y))
         }

@@ -927,10 +927,22 @@ impl TransformLength {
 #[derive(Clone, Debug)]
 pub enum TransformOp {
     Translate(TransformLength, TransformLength),
+    /// `translateZ(z)`, or the Z component of `translate3d(x, y, z)`. The 2D
+    /// renderer drops Z (its projection fold is carried by `ZFold`); the 4x4
+    /// computed-value serialization keeps it.
+    Translate3d(TransformLength, TransformLength, TransformLength),
     Scale(f32, f32),
     Rotate(f32),
     Skew(f32, f32),
     Matrix(Affine2),
+    /// `perspective(d)` storing `1/d`, so the no-perspective identity is
+    /// `0.0` and interpolation lerps naturally.
+    Perspective(f32),
+    /// The 2D projection fold of `perspective()` plus Z translation: the
+    /// uniform scale `1/(1 - z_total*inv_d)` about the transform origin.
+    /// Applied by the 2D renderer, skipped by the 4x4 serialization, which
+    /// carries the real perspective structure instead.
+    ZFold(f32),
 }
 
 impl Rect {

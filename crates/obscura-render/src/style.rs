@@ -3668,30 +3668,37 @@ fn parse_transform_ops(value: &str) -> Option<Vec<crate::TransformOp>> {
                 // Without perspective, translation along Z does not change the
                 // projection of the element's plane. Keep accepting it so the
                 // useful X/Y part of common compositor transforms is retained.
-                parse_transform_z_length(values[2])?;
+                let z = parse_transform_z_length(values[2])?;
                 if let Some(z) = transform_z_px(values[2]) {
                     z_total += z;
                 }
-                crate::TransformOp::Translate(
+                crate::TransformOp::Translate3d(
                     parse_transform_length(values[0])?,
                     parse_transform_length(values[1])?,
+                    z,
                 )
             }
             "translatez" if values.len() == 1 => {
-                parse_transform_z_length(values[0])?;
+                let z = parse_transform_z_length(values[0])?;
                 if let Some(z) = transform_z_px(values[0]) {
                     z_total += z;
                 }
-                crate::TransformOp::Matrix(crate::Affine2::IDENTITY)
+                crate::TransformOp::Translate3d(
+                    crate::TransformLength::px(0.0),
+                    crate::TransformLength::px(0.0),
+                    z,
+                )
             }
             "perspective" if values.len() == 1 => {
                 parse_transform_z_length(values[0])?;
-                if let Some(d) = transform_z_px(values[0]) {
-                    if d > 0.0 {
+                let inv = match transform_z_px(values[0]) {
+                    Some(d) if d > 0.0 => {
                         inv_d += 1.0 / d;
+                        1.0 / d
                     }
-                }
-                crate::TransformOp::Matrix(crate::Affine2::IDENTITY)
+                    _ => 0.0,
+                };
+                crate::TransformOp::Perspective(inv)
             }
             "scale" if (1..=2).contains(&values.len()) => {
                 let x = scale_number(values[0])?;
@@ -3814,8 +3821,7 @@ fn parse_transform_ops(value: &str) -> Option<Vec<crate::TransformOp>> {
     if inv_d != 0.0 && z_total != 0.0 {
         let w = 1.0 - z_total * inv_d;
         if w > 0.0 {
-            let scale = 1.0 / w;
-            operations.push(crate::TransformOp::Scale(scale, scale));
+            operations.push(crate::TransformOp::ZFold(1.0 / w));
         }
     }
     Some(operations)
@@ -6623,7 +6629,7 @@ fn contextual_atom(value: &str, context: &LengthContext) -> Option<f32> {
         return Some(value);
     }
     if let Some(value) = lower.strip_suffix("pt").and_then(parse) {
-        return Some(value * 1.333);
+        return Some(value * (96.0 / 72.0));
     }
     parse(&lower)
 }
@@ -7404,7 +7410,7 @@ fn dimension_value(tok: &str) -> crate::Dimension {
         return Dimension::Px(v);
     }
     if let Some(v) = lower.strip_suffix("pt").and_then(parse) {
-        return Dimension::Px(v * 1.333);
+        return Dimension::Px(v * (96.0 / 72.0));
     }
     // CSS lengths accept a unitless number only when it is zero. Treating
     // arbitrary numbers as pixels changes invalid declarations into tiny
@@ -7659,7 +7665,7 @@ fn px_value(tok: &str) -> Option<f32> {
         n = &n[..n.len() - 2];
     } else if n.ends_with("pt") {
         n = &n[..n.len() - 2];
-        scale = 1.333; // 1pt ≈ 1.333px
+        scale = 96.0 / 72.0; // 1pt = 96/72 px
     } else if n.ends_with("em") || n.ends_with("rem") {
         n = n.trim_end_matches(|c: char| c.is_ascii_alphabetic());
         scale = 16.0; // 1em = 16px

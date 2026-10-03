@@ -1394,14 +1394,24 @@ impl PreparedRender {
 
     /// Unscaled padding-box size used by CSSOM View's `clientWidth` and
     /// `clientHeight`. Layout rects are border boxes, so remove the resolved
-    /// borders but retain padding. This deliberately ignores visual
-    /// transforms: client metrics describe layout geometry, unlike
-    /// `getBoundingClientRect()`.
+    /// borders but retain padding. Table boxes are the exception: Chromium
+    /// reports their border-box size, matching Blink's LayoutTable. This
+    /// deliberately ignores visual transforms: client metrics describe layout
+    /// geometry, unlike `getBoundingClientRect()`. Chromium measures in
+    /// LayoutUnits (1/64px), so prefer the snapped `cssom_rects` map; the
+    /// integer `rects` map is only a fallback for unwritten nodes.
     pub fn client_size(&self, id: obscura_dom::tree::NodeId) -> Option<(f32, f32)> {
-        let rect = self.layout.rects.get(&id)?;
+        let rect = self
+            .layout
+            .cssom_rects
+            .get(&id)
+            .or_else(|| self.layout.rects.get(&id))?;
         let style = self.layout.styles.get(&id)?;
         if style.ignores_used_box_sizes() {
             return Some((0.0, 0.0));
+        }
+        if style.is_table_box {
+            return Some((rect.width, rect.height));
         }
         Some((
             (rect.width - style.border.left - style.border.right).max(0.0),
@@ -1418,7 +1428,14 @@ impl PreparedRender {
         id: obscura_dom::tree::NodeId,
     ) -> Option<HashMap<&'static str, String>> {
         let style = self.layout.styles.get(&id)?;
-        let rect = self.layout.rects.get(&id);
+        // The used width/height below come back out through getComputedStyle.
+        // Chromium reports them in LayoutUnits (1/64px), so read the snapped
+        // map first and keep the integer `rects` map as the fallback.
+        let rect = self
+            .layout
+            .cssom_rects
+            .get(&id)
+            .or_else(|| self.layout.rects.get(&id));
         let mut out = HashMap::new();
 
         let active_webkit_clamp = style.webkit_box_display.is_some()
@@ -1979,12 +1996,20 @@ impl PreparedRender {
         id: obscura_dom::tree::NodeId,
         requested_scroll: (f32, f32),
     ) -> Option<Vec<crate::Rect>> {
-        let source = self
-            .layout
-            .inline_fragments
-            .get(&id)
-            .cloned()
-            .or_else(|| self.layout.rects.get(&id).copied().map(|rect| vec![rect]))?;
+        // CSSOM answers on the identity pen: a single-line owner's identity
+        // box is filed in `rects` while `inline_fragments` keeps the shaped
+        // ink. Report that box so the client rects agree with the bounding
+        // rect. Owners with several line fragments keep the per-line list;
+        // its union is the box already in `rects`.
+        let fragments = self.layout.inline_fragments.get(&id);
+        let single_line = fragments.map(|list| list.len() == 1).unwrap_or(true);
+        let source = if single_line {
+            self.layout.rects.get(&id).copied().map(|rect| vec![rect])
+        } else {
+            None
+        }
+        .or_else(|| fragments.cloned())
+        .or_else(|| self.layout.rects.get(&id).copied().map(|rect| vec![rect]))?;
         let movement = self.root_only_movement_for(id, requested_scroll);
         Some(
             source
@@ -2012,12 +2037,20 @@ impl PreparedRender {
         id: obscura_dom::tree::NodeId,
         scroll: &ResolvedScrollState,
     ) -> Option<Vec<crate::Rect>> {
-        let source = self
-            .layout
-            .inline_fragments
-            .get(&id)
-            .cloned()
-            .or_else(|| self.layout.rects.get(&id).copied().map(|rect| vec![rect]))?;
+        // CSSOM answers on the identity pen: a single-line owner's identity
+        // box is filed in `rects` while `inline_fragments` keeps the shaped
+        // ink. Report that box so the client rects agree with the bounding
+        // rect. Owners with several line fragments keep the per-line list;
+        // its union is the box already in `rects`.
+        let fragments = self.layout.inline_fragments.get(&id);
+        let single_line = fragments.map(|list| list.len() == 1).unwrap_or(true);
+        let source = if single_line {
+            self.layout.rects.get(&id).copied().map(|rect| vec![rect])
+        } else {
+            None
+        }
+        .or_else(|| fragments.cloned())
+        .or_else(|| self.layout.rects.get(&id).copied().map(|rect| vec![rect]))?;
         let movement = scroll.movement_for(id);
         Some(
             source
@@ -2115,6 +2148,40 @@ fn css_number(value: f32) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// `%.6g` like a C printf: six significant digits, scientific notation when
+/// the rounded exponent is below -4 or at least 6, trailing decimal zeros and
+/// a bare trailing point stripped. This is the numeric form Chrome's CSSOM
+/// uses for transform matrices (`matrix(1e+35, ...)`,
+/// `matrix3d(..., -7.75795e-05, ...)`), which the shortest-roundtrip
+/// `css_number` does not reproduce.
+fn css_g6(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    if !value.is_finite() {
+        return css_number(value as f32);
+    }
+    let scientific = format!("{value:.5e}");
+    let (mantissa, exponent) = scientific.split_once('e').expect("e notation");
+    let exponent: i32 = exponent.parse().expect("exponent");
+    if exponent < -4 || exponent >= 6 {
+        let mantissa = trim_decimal_zeros(mantissa);
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
+    } else {
+        let decimals = (5 - exponent).max(0) as usize;
+        trim_decimal_zeros(&format!("{value:.decimals$}")).to_string()
+    }
+}
+
+fn trim_decimal_zeros(text: &str) -> &str {
+    if !text.contains('.') {
+        return text;
+    }
+    let trimmed = text.trim_end_matches('0');
+    trimmed.strip_suffix('.').unwrap_or(trimmed)
 }
 
 fn css_px(value: f32) -> String {
@@ -2250,21 +2317,80 @@ fn transform_css(
         width: 0.0,
         height: 0.0,
     };
-    let matrix = crate::dom::resolved_transform_property_matrix(
-        style,
-        rect.unwrap_or(&fallback),
-        root_font_size,
-        viewport,
-    );
-    format!(
-        "matrix({}, {}, {}, {}, {}, {})",
-        css_number(matrix.a),
-        css_number(matrix.b),
-        css_number(matrix.c),
-        css_number(matrix.d),
-        css_number(matrix.e),
-        css_number(matrix.f),
-    )
+    let rect = rect.unwrap_or(&fallback);
+    // A 3D function in the list makes the serialization keep the full 4x4
+    // matrix; a purely 2D list stays on the 2D path. Both use Chrome's %.6g
+    // numeric form.
+    if style.transform_ops.iter().any(|operation| {
+        matches!(
+            operation,
+            crate::TransformOp::Perspective(_) | crate::TransformOp::Translate3d(..)
+        )
+    }) {
+        let matrix = crate::dom::resolved_transform_property_matrix4x4(
+            style,
+            rect,
+            root_font_size,
+            viewport,
+        );
+        if let Some((a, b, c, d, e, f)) = matrix2d_of(&matrix) {
+            format!(
+                "matrix({}, {}, {}, {}, {}, {})",
+                css_g6(a),
+                css_g6(b),
+                css_g6(c),
+                css_g6(d),
+                css_g6(e),
+                css_g6(f),
+            )
+        } else {
+            let values = matrix
+                .iter()
+                .map(|value| css_g6(*value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("matrix3d({values})")
+        }
+    } else {
+        let matrix = crate::dom::resolved_transform_property_matrix(
+            style,
+            rect,
+            root_font_size,
+            viewport,
+        );
+        format!(
+            "matrix({}, {}, {}, {}, {}, {})",
+            css_g6(matrix.a as f64),
+            css_g6(matrix.b as f64),
+            css_g6(matrix.c as f64),
+            css_g6(matrix.d as f64),
+            css_g6(matrix.e as f64),
+            css_g6(matrix.f as f64),
+        )
+    }
+}
+
+/// The 2D-compatible `matrix(...)` entries of a column-major 4x4, if the
+/// matrix is 2D (the z=0 plane maps to itself): Chrome serializes those as
+/// `matrix(...)` and everything else as `matrix3d(...)`.
+fn matrix2d_of(matrix: &[f64; 16]) -> Option<(f64, f64, f64, f64, f64, f64)> {
+    let is_2d = matrix[2] == 0.0
+        && matrix[3] == 0.0
+        && matrix[6] == 0.0
+        && matrix[7] == 0.0
+        && matrix[8] == 0.0
+        && matrix[9] == 0.0
+        && matrix[10] == 1.0
+        && matrix[11] == 0.0
+        && matrix[14] == 0.0
+        && matrix[15] == 1.0;
+    if is_2d {
+        Some((
+            matrix[0], matrix[1], matrix[4], matrix[5], matrix[12], matrix[13],
+        ))
+    } else {
+        None
+    }
 }
 
 fn transform_origin_css(style: &crate::LayoutStyle, rect: Option<&crate::Rect>) -> String {
@@ -15511,6 +15637,47 @@ mod tests {
         assert_eq!(computed["translate"], "7px 0px");
         assert_eq!(computed["rotate"], "30deg");
         assert_eq!(computed["scale"], "2 2");
+    }
+
+    #[test]
+    fn computed_transform_serialization_matches_chrome_g6_and_matrix3d() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+              <div id="skew-y" style="position:absolute;width:20px;height:10px;
+                   transform:skewY(23.1753218deg)"></div>
+              <div id="huge-scale" style="position:absolute;width:20px;height:10px;
+                   transform:scale(100000000000000000000009999999999999.99,1.89)"></div>
+              <div id="perspective-z" style="position:absolute;width:20px;height:10px;
+                   transform:perspective(12890px) translateZ(101.5px)"></div>
+              <div id="flat-3d" style="position:absolute;width:20px;height:10px;
+                   transform:translate3d(5px,6px,0px)"></div>
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (500.0, 600.0), None, &mut resources)
+            .expect("prepared transform serialization");
+        let computed_transform = |id: &str| {
+            let node = tree.get_element_by_id(id).unwrap();
+            prepared.computed_style(node).unwrap()["transform"].clone()
+        };
+        // %.6g rounds the shortest-roundtrip f32 to six significant digits.
+        assert_eq!(
+            computed_transform("skew-y"),
+            "matrix(1, 0.428091, 0, 1, 0, 0)"
+        );
+        // Exponent 35 switches to scientific notation.
+        assert_eq!(
+            computed_transform("huge-scale"),
+            "matrix(1e+35, 0, 0, 1.89, 0, 0)"
+        );
+        // Perspective plus Z keeps the real 4x4: the 2D projection fold must
+        // not multiply into the serialized matrix.
+        assert_eq!(
+            computed_transform("perspective-z"),
+            "matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, -7.75795e-05, 0, 0, 101.5, 0.992126)"
+        );
+        // A 3D function with z=0 still folds back to the 2D serialization.
+        assert_eq!(computed_transform("flat-3d"), "matrix(1, 0, 0, 1, 5, 6)");
     }
 
     #[test]

@@ -1634,7 +1634,16 @@ impl DomLayout {
             );
         }
 
-        let content_size = (content_right.ceil(), content_bottom.ceil());
+        // Chromium quantizes the scrolling area's edges to the current
+        // device-pixel grid. The snapped (1/64px) overflow values retained
+        // above make a ceiling disagree with that rounding on either side
+        // of a pixel (100.40625 must report 100, not 101), so snap the
+        // same way assigned offsets are snapped and the range quantization
+        // below stays consistent with the reported scrollWidth.
+        let content_size = (
+            crate::quantize_scroll_value(content_right, 1.0),
+            crate::quantize_scroll_value(content_bottom, 1.0),
+        );
         containers[0].content_size = content_size;
         containers[0].max_offset = (
             crate::quantized_scroll_range(content_size.0, viewport.0, 1.0),
@@ -1933,7 +1942,14 @@ impl DomLayout {
             }
 
             let style = laid.styles.get(&id);
-            let rect = laid.rects.get(&id).copied();
+            // Scroll-container client boxes back both CSSOM `clientWidth` and
+            // the scroll-range quantization, so read the snapped (1/64px)
+            // map first and keep the integer rects as the fallback.
+            let rect = laid
+                .cssom_rects
+                .get(&id)
+                .or_else(|| laid.rects.get(&id))
+                .copied();
             let establishes = style.is_some_and(|style| {
                 style.overflow_scroll_container
                     && !style.overflow_propagated_to_viewport
@@ -1997,10 +2013,20 @@ impl DomLayout {
         // Compute scrolling overflow for every boxed node in one reverse pass.
         // A clipping/scrolling child contributes only its own border box to an
         // ancestor, while still exposing its complete local overflow through
-        // CSSOM. Visible descendants propagate their union upward.
+        // CSSOM. Visible descendants propagate their union upward, and that
+        // union also carries their own border box: Chromium measures a
+        // descendant's contribution to an ancestor's scrollable overflow from
+        // its border box, while the box's own scroll size stays padding-based.
         let mut overflow_bounds = vec![None; node_capacity];
         for &id in nodes.iter().rev() {
-            let Some(rect) = self.rects.get(&id).copied() else {
+            // Scrolling overflow accrues on snapped (1/64px) rects so the
+            // CSSOM scroll sizes keep Chromium's LayoutUnit residue.
+            let Some(rect) = self
+                .cssom_rects
+                .get(&id)
+                .or_else(|| self.rects.get(&id))
+                .copied()
+            else {
                 continue;
             };
             let style = self.styles.get(&id);
@@ -2017,8 +2043,13 @@ impl DomLayout {
                 width: (rect.width - style.border.left - style.border.right).max(0.0),
                 height: (rect.height - style.border.top - style.border.bottom).max(0.0),
             });
-            let visual_padding = visual(padding_rect);
-            let mut local = visual_padding;
+            // The box's own scrolling area lives in its untransformed
+            // coordinate space: the element's own transform moves the whole
+            // box (paint included) and must not enlarge its own overflow.
+            // Descendant bounds already carry their own transforms; the
+            // assembled union is mapped through the self transform only for
+            // the contribution an ancestor sees.
+            let mut local = padding_rect;
             for child in rendered_children(tree, id) {
                 let Some(child_overflow) = overflow_bounds.get(child.index()).copied().flatten()
                 else {
@@ -2029,8 +2060,9 @@ impl DomLayout {
                         style.overflow_hidden && !style.overflow_propagated_to_viewport
                     }) {
                         let border_box = self
-                            .rects
+                            .cssom_rects
                             .get(&child)
+                            .or_else(|| self.rects.get(&child))
                             .copied()
                             .map(|rect| {
                                 self.transforms
@@ -2072,17 +2104,17 @@ impl DomLayout {
                 local = local.union(&contribution);
             }
             let mut content = (
-                (local.x + local.width - visual_padding.x).max(visual_padding.width),
-                (local.y + local.height - visual_padding.y).max(visual_padding.height),
+                (local.x + local.width - padding_rect.x).max(padding_rect.width),
+                (local.y + local.height - padding_rect.y).max(padding_rect.height),
             );
             // Scroll containers include trailing end padding in their
             // scrolling area. Visible/clip boxes expose descendant overflow
             // but, matching Chromium, do not append that trailing padding.
             if let Some(style) = style.filter(|style| style.overflow_scroll_container) {
-                if content.0 > visual_padding.width {
+                if content.0 > padding_rect.width {
                     content.0 += style.padding.right;
                 }
-                if content.1 > visual_padding.height {
+                if content.1 > padding_rect.height {
                     content.1 += style.padding.bottom;
                 }
             }
@@ -2096,7 +2128,10 @@ impl DomLayout {
                 );
             }
             if let Some(slot) = overflow_bounds.get_mut(id.index()) {
-                *slot = Some(local);
+                // Ancestors see this box's border box: Chromium includes
+                // descendant border boxes in a scroll container's scrollable
+                // overflow. The padding-based `content` above is unaffected.
+                *slot = Some(visual(local.union(&rect)));
             }
         }
         for container in containers.iter_mut().skip(1) {
@@ -2154,6 +2189,7 @@ impl DomLayout {
                 None,
                 fixed,
                 &self.rects,
+                &self.cssom_rects,
                 &self.styles,
                 &self.translates,
                 &self.transforms,
@@ -2162,7 +2198,12 @@ impl DomLayout {
             );
         }
 
-        (right.ceil(), bottom.ceil())
+        // Same device-grid snap as the fused walk: a fractional overflow
+        // edge is rounded, not ceilinged, into the CSSOM extent.
+        (
+            crate::quantize_scroll_value(right, 1.0),
+            crate::quantize_scroll_value(bottom, 1.0),
+        )
     }
 
     /// Capture sticky constraints from the normal-flow result. The historical
@@ -2704,7 +2745,15 @@ impl FusedScrollWalk<'_> {
     ) -> Option<Rect> {
         let tree = self.tree;
         let style = self.laid.styles.get(&id);
-        let rect = self.laid.rects.get(&id).copied();
+        // Snapped (1/64px) sizes first, matching `scroll_tree`: scrolling
+        // overflow and the client boxes it feeds keep Chromium's LayoutUnit
+        // residue. The integer rects map stays as the fallback.
+        let rect = self
+            .laid
+            .cssom_rects
+            .get(&id)
+            .or_else(|| self.laid.rects.get(&id))
+            .copied();
 
         // Viewport-fixed classification (viewport_fixed_nodes).
         let starts_viewport_fixed =
@@ -2816,14 +2865,20 @@ impl FusedScrollWalk<'_> {
             width: (rect.width - style.border.left - style.border.right).max(0.0),
             height: (rect.height - style.border.top - style.border.bottom).max(0.0),
         });
-        let visual_padding = self
-            .laid
-            .transforms
-            .get(&id)
-            .copied()
-            .map(|transform| transform.map_rect(padding_rect))
-            .unwrap_or(padding_rect);
-        let mut local = visual_padding;
+        let visual = |rect: Rect| {
+            self.laid
+                .transforms
+                .get(&id)
+                .copied()
+                .map(|transform| transform.map_rect(rect))
+                .unwrap_or(rect)
+        };
+        // The box's own scrolling area lives in its untransformed coordinate
+        // space: the element's own transform moves the whole box (paint
+        // included) and must not enlarge its own overflow. Descendant bounds
+        // already carry their own transforms; the assembled union is mapped
+        // through the self transform only for the contribution a parent sees.
+        let mut local = padding_rect;
         for child in rendered_children(tree, id) {
             let Some(child_overflow) = self.node(
                 child,
@@ -2840,8 +2895,9 @@ impl FusedScrollWalk<'_> {
                 }) {
                     let border_box = self
                         .laid
-                        .rects
+                        .cssom_rects
                         .get(&child)
+                        .or_else(|| self.laid.rects.get(&child))
                         .copied()
                         .map(|rect| {
                             self.laid
@@ -2884,17 +2940,17 @@ impl FusedScrollWalk<'_> {
             local = local.union(&contribution);
         }
         let mut content = (
-            (local.x + local.width - visual_padding.x).max(visual_padding.width),
-            (local.y + local.height - visual_padding.y).max(visual_padding.height),
+            (local.x + local.width - padding_rect.x).max(padding_rect.width),
+            (local.y + local.height - padding_rect.y).max(padding_rect.height),
         );
         // Scroll containers include trailing end padding in their scrolling
         // area. Visible/clip boxes expose descendant overflow but, matching
         // Chromium, do not append that trailing padding.
         if let Some(style) = style.filter(|style| style.overflow_scroll_container) {
-            if content.0 > visual_padding.width {
+            if content.0 > padding_rect.width {
                 content.0 += style.padding.right;
             }
-            if content.1 > visual_padding.height {
+            if content.1 > padding_rect.height {
                 content.1 += style.padding.bottom;
             }
         }
@@ -2907,7 +2963,10 @@ impl FusedScrollWalk<'_> {
                 },
             );
         }
-        Some(local)
+        // Mirror `scroll_tree`: the parent sees this box's border box in its
+        // scrollable overflow; the padding-based `content` above is the box's
+        // own scroll size.
+        Some(visual(local.union(&rect)))
     }
 }
 
@@ -2918,6 +2977,7 @@ fn accumulate_scrolling_overflow(
     inherited_clip: Option<OverflowClip>,
     fixed: &HashSet<NodeId>,
     rects: &HashMap<NodeId, Rect>,
+    cssom_rects: &HashMap<NodeId, Rect>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     translates: &HashMap<NodeId, (f32, f32)>,
     transforms: &HashMap<NodeId, crate::Affine2>,
@@ -2928,7 +2988,12 @@ fn accumulate_scrolling_overflow(
         return;
     }
 
-    let translated = rects.get(&id).map(|rect| {
+    // Snapped (1/64px) rects first, mirroring the fused walk: the root
+    // scrolling area keeps Chromium's LayoutUnit residue.
+    let translated = cssom_rects
+        .get(&id)
+        .or_else(|| rects.get(&id))
+        .map(|rect| {
         transforms
             .get(&id)
             .copied()
@@ -2951,7 +3016,10 @@ fn accumulate_scrolling_overflow(
     // painting, but it does not truncate the root scrolling area's CSSOM
     // overflow dimensions. Ordinary descendant overflow clips still bound
     // their subtree's contribution.
-    let child_clip = match (styles.get(&id), rects.get(&id)) {
+    let child_clip = match (
+        styles.get(&id),
+        cssom_rects.get(&id).or_else(|| rects.get(&id)),
+    ) {
         (Some(style), Some(rect))
             if style.overflow_hidden && !is_viewport_overflow_source(id, styles) =>
         {
@@ -2971,6 +3039,7 @@ fn accumulate_scrolling_overflow(
             child_clip.clone(),
             fixed,
             rects,
+            cssom_rects,
             styles,
             translates,
             transforms,
@@ -3738,12 +3807,145 @@ pub(crate) fn resolved_transform_property_matrix(
                 resolve_transform_length(x, 0, style, rect, root_font_size, viewport),
                 resolve_transform_length(y, 1, style, rect, root_font_size, viewport),
             ),
+            crate::TransformOp::Translate3d(x, y, _) => crate::Affine2::translate(
+                resolve_transform_length(x, 0, style, rect, root_font_size, viewport),
+                resolve_transform_length(y, 1, style, rect, root_font_size, viewport),
+            ),
             crate::TransformOp::Scale(x, y) => crate::Affine2::scale(*x, *y),
             crate::TransformOp::Rotate(angle) => crate::Affine2::rotate(*angle),
             crate::TransformOp::Skew(x, y) => crate::Affine2::skew(*x, *y),
             crate::TransformOp::Matrix(matrix) => *matrix,
+            // The 2D projection of a perspective is the uniform fold scale,
+            // recorded separately as `ZFold`; the perspective op itself is
+            // identity in 2D.
+            crate::TransformOp::Perspective(_) => crate::Affine2::IDENTITY,
+            crate::TransformOp::ZFold(scale) => crate::Affine2::scale(*scale, *scale),
         };
         matrix = matrix.then(operation);
+    }
+    matrix
+}
+
+/// Full 4x4 transform-property matrix (column-major, the `matrix3d` order),
+/// used by the computed-value serialization when the op list contains 3D
+/// functions. Unlike `resolved_transform_property_matrix` this keeps the real
+/// Z geometry: the 2D renderer's projection fold (`ZFold`) is skipped, and
+/// `Perspective` contributes its projective column instead of an identity.
+pub(crate) fn resolved_transform_property_matrix4x4(
+    style: &crate::LayoutStyle,
+    rect: &Rect,
+    root_font_size: f32,
+    viewport: (f32, f32),
+) -> [f64; 16] {
+    fn multiply(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
+        let mut out = [0.0f64; 16];
+        for column in 0..4 {
+            for row in 0..4 {
+                let mut sum = 0.0;
+                for k in 0..4 {
+                    sum += a[k * 4 + row] * b[column * 4 + k];
+                }
+                out[column * 4 + row] = sum;
+            }
+        }
+        out
+    }
+    let mut matrix = [
+        1.0f64, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    for operation in &style.transform_ops {
+        let operation = match operation {
+            crate::TransformOp::Translate(x, y) => {
+                let x =
+                    resolve_transform_length(x, 0, style, rect, root_font_size, viewport) as f64;
+                let y =
+                    resolve_transform_length(y, 1, style, rect, root_font_size, viewport) as f64;
+                [
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, x, y, 0.0,
+                    1.0,
+                ]
+            }
+            crate::TransformOp::Translate3d(x, y, z) => {
+                let x =
+                    resolve_transform_length(x, 0, style, rect, root_font_size, viewport) as f64;
+                let y =
+                    resolve_transform_length(y, 1, style, rect, root_font_size, viewport) as f64;
+                let z =
+                    resolve_transform_length(z, 2, style, rect, root_font_size, viewport) as f64;
+                [
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, x, y, z, 1.0,
+                ]
+            }
+            crate::TransformOp::Scale(x, y) => [
+                *x as f64, 0.0, 0.0, 0.0, 0.0, *y as f64, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0,
+            ],
+            crate::TransformOp::Rotate(angle) => {
+                let (sin, cos) = (*angle as f64).to_radians().sin_cos();
+                [
+                    cos, sin, 0.0, 0.0, -sin, cos, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0,
+                ]
+            }
+            crate::TransformOp::Skew(x, y) => [
+                1.0,
+                (*y as f64).to_radians().tan(),
+                0.0,
+                0.0,
+                (*x as f64).to_radians().tan(),
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+            crate::TransformOp::Matrix(source) => [
+                source.a as f64,
+                source.b as f64,
+                0.0,
+                0.0,
+                source.c as f64,
+                source.d as f64,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                source.e as f64,
+                source.f as f64,
+                0.0,
+                1.0,
+            ],
+            crate::TransformOp::Perspective(inv_d) => [
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                -(*inv_d as f64),
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+            // The fold is the 2D renderer's projection shortcut; the 4x4
+            // serialization carries the perspective structure itself.
+            crate::TransformOp::ZFold(_) => continue,
+        };
+        matrix = multiply(&matrix, &operation);
     }
     matrix
 }
