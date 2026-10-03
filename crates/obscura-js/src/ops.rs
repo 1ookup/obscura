@@ -10085,6 +10085,18 @@ struct LayoutGeometryJson {
     layout_width: Option<f64>,
     #[serde(rename = "layoutHeight")]
     layout_height: Option<f64>,
+    /// Untransformed layout border-box origin and padding-box origin. CSSOM
+    /// View measures `offsetLeft`/`offsetTop` and the used inset of a
+    /// positioned box against the padding edge of the offset parent, so both
+    /// must ignore the visual transform the transformed rect carries.
+    #[serde(rename = "layoutX")]
+    layout_x: Option<f64>,
+    #[serde(rename = "layoutY")]
+    layout_y: Option<f64>,
+    #[serde(rename = "paddingX")]
+    padding_x: Option<f64>,
+    #[serde(rename = "paddingY")]
+    padding_y: Option<f64>,
     #[serde(rename = "clientWidth")]
     client_width: f64,
     #[serde(rename = "clientHeight")]
@@ -10151,11 +10163,34 @@ fn frame_geometry_json(
     // one, offset* the untransformed one). The transformed rect above can
     // overflow binary32 for pathological scales, so ship the layout size
     // alongside it instead of deriving offset* from it in the bootstrap.
+    // Chromium measures this box in LayoutUnits (1/64px); the integer `rects`
+    // map dropped that residue, so read the snapped map first.
     let layout_size = prepared
         .layout()
-        .rects
+        .cssom_rects
         .get(&nid)
+        .or_else(|| prepared.layout().rects.get(&nid))
         .map(|rect| (rect.width as f64, rect.height as f64));
+    // CSSOM View measures against the layout-unit-snapped geometry (Chromium
+    // keeps LayoutUnits at 1/64px), not the integer-rounded `rects` used for
+    // offset* sizes; mixing the rounded origin with the snapped margins threw
+    // the used insets off by the rounding residue.
+    let layout_origin = prepared
+        .layout()
+        .cssom_rects
+        .get(&nid)
+        .map(|rect| (rect.x as f64, rect.y as f64));
+    let padding_origin = prepared
+        .layout()
+        .cssom_rects
+        .get(&nid)
+        .zip(prepared.layout().styles.get(&nid))
+        .map(|(rect, style)| {
+            (
+                (rect.x + style.border.left) as f64,
+                (rect.y + style.border.top) as f64,
+            )
+        });
     let payload = LayoutGeometryJson {
         x: rect.x as f64,
         y: rect.y as f64,
@@ -10163,6 +10198,10 @@ fn frame_geometry_json(
         height: rect.height as f64,
         layout_width: layout_size.map(|(width, _)| width),
         layout_height: layout_size.map(|(_, height)| height),
+        layout_x: layout_origin.map(|(x, _)| x),
+        layout_y: layout_origin.map(|(_, y)| y),
+        padding_x: padding_origin.map(|(x, _)| x),
+        padding_y: padding_origin.map(|(_, y)| y),
         client_width: client_width as f64,
         client_height: client_height as f64,
         client_rects,

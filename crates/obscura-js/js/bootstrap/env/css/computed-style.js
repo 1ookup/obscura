@@ -96,11 +96,44 @@ globalThis.getComputedStyle = (el) => {
     const authored = target.getPropertyValue ? target.getPropertyValue('position') : '';
     return authored || 'static';
   };
+  // Used inset of an absolutely positioned box: the margin edge measured from
+  // the containing block's padding edge. Layout has already resolved the
+  // placement (specified inset or static position), so the used value is the
+  // untransformed layout origin minus the used margin, less the offset
+  // parent's padding edge. The transformed getBoundingClientRect() must not
+  // leak in. `undefined` defers to the rect-based fallback.
+  const positionedInset = (name) => {
+    const geometry = el._renderBoxGeometry ? el._renderBoxGeometry() : null;
+    if (!geometry) return undefined;
+    const layout = name === 'left' ? geometry.layoutX : geometry.layoutY;
+    if (!Number.isFinite(layout)) return undefined;
+    const margin = parseFloat(lookupValue('margin-' + name));
+    const marginUsed = Number.isFinite(margin) ? margin : 0;
+    let anchor = 0;
+    const parent = el.offsetParent;
+    const parentGeometry = parent && parent._renderBoxGeometry
+      ? parent._renderBoxGeometry() : null;
+    if (parentGeometry) {
+      const padding = name === 'left' ? parentGeometry.paddingX : parentGeometry.paddingY;
+      if (Number.isFinite(padding)) anchor = padding;
+    }
+    return chromeLengthPx(layout - marginUsed - anchor);
+  };
   const dimensionFor = (name) => {
     try {
-      const positioned = name !== 'left' && name !== 'top'
-        && name !== 'right' && name !== 'bottom';
-      if (!positioned && computedPosition() === 'static') return null;
+      const isInset = name === 'left' || name === 'top'
+        || name === 'right' || name === 'bottom';
+      if (isInset) {
+        const position = computedPosition();
+        if (position === 'static') return null;
+        // Chrome reports the used value (the static position when the inset
+        // is auto) for absolute and fixed boxes.
+        if ((name === 'left' || name === 'top')
+            && (position === 'absolute' || position === 'fixed')) {
+          const used = positionedInset(name);
+          if (used !== undefined) return used;
+        }
+      }
       const r = el.getBoundingClientRect && el.getBoundingClientRect();
       if (!r) return null;
       switch (name) {

@@ -1393,7 +1393,7 @@ var Element = _swappableInterface('Element', class extends Node {
   }
   add(item, before = null) {
     if (this.localName !== 'select') {
-      throw new TypeError("Illegal invocation");
+      throw new TypeError('Illegal invocation @env/dom/element-object.js:1396');
     }
     if (!item || item.nodeType !== 1
         || (item.localName !== 'option' && item.localName !== 'optgroup')) {
@@ -1556,8 +1556,35 @@ var Element = _swappableInterface('Element', class extends Node {
     }
     return Math.round(this.getBoundingClientRect().height);
   }
-  get offsetTop() { return Math.round(this.getBoundingClientRect().top); }
-  get offsetLeft() { return Math.round(this.getBoundingClientRect().left); }
+  // offsetLeft/offsetTop measure the untransformed border box against the
+  // offsetParent's padding edge (CSSOM View); the transformed rect that
+  // getBoundingClientRect() reports (and its scroll offset) must not leak in.
+  get offsetTop() {
+    const geometry = this._renderBoxGeometry();
+    if (geometry && Number.isFinite(geometry.layoutY)) {
+      const parent = this.offsetParent;
+      const parentGeometry = parent && parent._renderBoxGeometry
+        ? parent._renderBoxGeometry() : null;
+      if (parentGeometry && Number.isFinite(parentGeometry.paddingY)) {
+        return Math.round(geometry.layoutY - parentGeometry.paddingY);
+      }
+      return Math.round(geometry.layoutY);
+    }
+    return Math.round(this.getBoundingClientRect().top);
+  }
+  get offsetLeft() {
+    const geometry = this._renderBoxGeometry();
+    if (geometry && Number.isFinite(geometry.layoutX)) {
+      const parent = this.offsetParent;
+      const parentGeometry = parent && parent._renderBoxGeometry
+        ? parent._renderBoxGeometry() : null;
+      if (parentGeometry && Number.isFinite(parentGeometry.paddingX)) {
+        return Math.round(geometry.layoutX - parentGeometry.paddingX);
+      }
+      return Math.round(geometry.layoutX);
+    }
+    return Math.round(this.getBoundingClientRect().left);
+  }
   // The offset parent is the ancestor those two are measured against. It was
   // absent entirely, so reading it gave `undefined` -- a value the attribute
   // never has in a browser, which returns an element or null.
@@ -1601,6 +1628,15 @@ var Element = _swappableInterface('Element', class extends Node {
       const raw = Deno.core.ops.op_layout_geometry(this[_nidSym] | 0);
       if (!raw) return { width: 0, height: 0 };
       const geometry = JSON.parse(raw);
+      // client* is the untransformed layout size and stays finite even under
+      // scale(1e37), so gate on the element's rect magnitude instead and
+      // record the raw pre-clamp values plus the caller stack: that pins
+      // which property the challenge read on the overflow probe element.
+      if (geometry && (Math.abs(geometry.x || 0) > 1e30 || Math.abs(geometry.width || 0) > 1e30)) {
+        Deno.core.print("[prop-probe] client " + (this.id || this.tagName) +
+          " rawClient=" + geometry.clientWidth + "x" + geometry.clientHeight +
+          " stack=" + String(new Error().stack).replace(/\s+/g, " ").slice(0, 500) + "\n", true);
+      }
       if (geometry
           && Number.isFinite(geometry.clientWidth)
           && Number.isFinite(geometry.clientHeight)) {
@@ -1621,6 +1657,23 @@ var Element = _swappableInterface('Element', class extends Node {
   // CSSOM View returns an empty rect list for the latter, while the former
   // deliberately retains Obscura's compatibility geometry.
   _renderBoxGeometry() {
+    // Same self-gating idea, parse-based: serde_json prints float exponents
+    // without a '+' (3.4e32), so an `e+3x` string test never fires. Gate on
+    // the parsed rect magnitude, print the full geometry JSON, and capture
+    // the caller stack -- every geometry read (gBCR, offset*, client*)
+    // funnels here, so one line names the raw values and the reading
+    // property at once.
+    try {
+      const raw0 = Deno.core.ops.op_layout_geometry(this[_nidSym] | 0);
+      if (raw0) {
+        const g0 = JSON.parse(raw0);
+        if (g0 && (Math.abs(g0.x || 0) > 1e30 || Math.abs(g0.y || 0) > 1e30
+            || Math.abs(g0.width || 0) > 1e30 || Math.abs(g0.height || 0) > 1e30)) {
+          Deno.core.print("[prop-probe] box nid=" + (this[_nidSym] | 0) + " " + (this.id || this.tagName) +
+            " raw=" + raw0 + " stack=" + String(new Error().stack).replace(/\s+/g, " ").slice(0, 700) + "\n", true);
+        }
+      }
+    } catch (_e) {}
     if (typeof Deno.core.ops.op_layout_geometry !== 'function') return undefined;
     try {
       const raw = Deno.core.ops.op_layout_geometry(this[_nidSym] | 0);
@@ -1659,6 +1712,14 @@ var Element = _swappableInterface('Element', class extends Node {
     }
     const metrics = this._renderElementScrollMetrics();
     if (metrics !== undefined) {
+      // The overflow probe element's scroll metrics are the one suspect for
+      // the payload's 2^25-family rect values; record them (and the reader)
+      // whenever they leave ordinary magnitudes. stderr only.
+      if (metrics && (Math.abs(metrics.scrollWidth || 0) > 1e6 || Math.abs(metrics.x || 0) > 1e6)) {
+        Deno.core.print("[prop-probe] scrollW " + (this.id || this.tagName) +
+          " " + JSON.stringify(metrics) +
+          " stack=" + String(new Error().stack).replace(/\s+/g, " ").slice(0, 500) + "\n", true);
+      }
       return metrics ? Math.round(Math.max(0, metrics.scrollWidth || 0)) : 0;
     }
     return 100;
@@ -1775,7 +1836,14 @@ var Element = _swappableInterface('Element', class extends Node {
       if (offset) return offset.x || 0;
     } else {
       const metrics = this._renderElementScrollMetrics();
-      if (metrics !== undefined) return metrics ? (metrics.x || 0) : 0;
+      if (metrics !== undefined) {
+        if (metrics && Math.abs(metrics.x || 0) > 1e6) {
+          Deno.core.print("[prop-probe] scrollL " + (this.id || this.tagName) +
+            " x=" + metrics.x + " maxX=" + metrics.maxX +
+            " stack=" + String(new Error().stack).replace(/\s+/g, " ").slice(0, 500) + "\n", true);
+        }
+        return metrics ? (metrics.x || 0) : 0;
+      }
     }
     return this._scrollLeft || 0;
   }
