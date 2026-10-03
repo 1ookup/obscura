@@ -349,3 +349,4 @@ run covers are then removed.
 - session batch 10-02/10-03 (22 commits, HEAD 585f7bc): full workspace gate 2042 passed / 0 failed (render+all crates, no-fail-fast); opt-out check (no-default-features) blocked by host CLT-shim env — needs CI or full-Xcode host; live acceptance trail r47-r85 (HPcn5 +39→±9, exception face clean, EvalError+Illegal zero)
 - COI CSP token-list fix (10-03): scoped: obscura-browser 141/141, obscura-render 637/637 (1 skipped); Chrome 149 eight-cell COI fixture 8/8 (v1-v5 true, v6-v8 false; was v4-only before the fix)
 - ownKeys v4 alignment (10-04): scoped: obscura-js 750/750 (render shape); runtime capture census/plain six-key positions+descriptors match k981
+- SDP video section transcription (10-04): scoped: obscura-js 750/750; captured offer matches Chrome ref with session lines normalized
