@@ -2157,22 +2157,13 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
             } else {
                 parent_origin.clone()
             };
-            // The initial about:blank used by an iframe that is about to
-            // navigate cross-origin is not an isolated document in Chrome.
-            // It can run briefly before the network response commits and is
-            // observable by early fingerprint probes. Do not leak the
-            // parent's isolation bit into that transient cross-origin
-            // browsing context; the committed navigation computes it again
-            // from the response and the real parent scope.
-            let iframe_src = dom
-                .get_node(host)
-                .and_then(|node| node.get_attribute("src").map(str::to_string));
-            let initial_cross_origin_isolated = initial_iframe_cross_origin_isolated(
-                &parent_origin,
-                parent_cross_origin_isolated,
-                &base_url,
-                iframe_src.as_deref(),
-            );
+            // The initial about:blank shares the parent's agent cluster --
+            // measured Chrome 149 answers crossOriginIsolated=true for a
+            // freshly inserted frame of an isolated page whether or not a
+            // src is pending. A committed response recomputes the bit from
+            // the response and the real parent scope.
+            let initial_cross_origin_isolated =
+                initial_iframe_cross_origin_isolated(parent_cross_origin_isolated);
             let Ok((root, _previous)) = dom.create_iframe_content_document(host) else {
                 return "-1".into();
             };
@@ -3592,34 +3583,16 @@ fn request_origin(request_url: &str) -> Option<String> {
 }
 
 /// Return the isolation bit visible from an iframe's initial about:blank
-/// document. A network `src` with a different origin will replace that
-/// document asynchronously, so Chrome keeps the transient realm
-/// non-isolated even when its parent is isolated.
-fn initial_iframe_cross_origin_isolated(
-    parent_origin: &obscura_dom::Origin,
-    parent_cross_origin_isolated: bool,
-    parent_base_url: &str,
-    src: Option<&str>,
-) -> bool {
-    if !parent_cross_origin_isolated {
-        return false;
-    }
-    // The initial about:blank document has a transient, non-isolated realm.
-    // Isolation is recalculated only after a committed response grants it.
-    let Some(raw) = src.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return false;
-    };
-    let Some(target) = url::Url::parse(parent_base_url)
-        .ok()
-        .and_then(|base| base.join(raw).ok())
-    else {
-        // A src that cannot be resolved against the parent's base gives no
-        // evidence of a same-origin successor document, and this realm is
-        // replaced by whichever response lands. Treating that as isolated
-        // handed a frame the parent capability on a guess.
-        return false;
-    };
-    obscura_dom::Origin::from_url(target.as_str()) == *parent_origin
+/// document: it inherits the embedder's bit.
+///
+/// Measured Chrome 149 answers `crossOriginIsolated === true` for a freshly
+/// inserted frame of an isolated page whether or not a `src` is pending --
+/// no src, a same-origin src, and a cross-origin src whose response is still
+/// seconds away all read the parent's value (the payload table that once
+/// suggested a transient `false` evaluates in this window and mirrors the
+/// parent). A committed response recomputes the bit.
+fn initial_iframe_cross_origin_isolated(parent_cross_origin_isolated: bool) -> bool {
+    parent_cross_origin_isolated
 }
 
 fn cors_response_allows(
@@ -5235,46 +5208,9 @@ mod tests {
     }
 
     #[test]
-    fn initial_cross_origin_iframe_about_blank_is_not_isolated() {
-        let parent = obscura_dom::Origin::from_url("https://page.example/");
-        assert!(!initial_iframe_cross_origin_isolated(
-            &parent,
-            true,
-            "https://page.example/",
-            Some("https://widget.example/frame"),
-        ));
-        assert!(initial_iframe_cross_origin_isolated(
-            &parent,
-            true,
-            "https://page.example/",
-            Some("/same-origin-frame"),
-        ));
-        assert!(!initial_iframe_cross_origin_isolated(
-            &parent,
-            true,
-            "https://page.example/",
-            None,
-        ));
-        // A src that cannot be resolved against the parent base is unknown,
-        // not same-origin: the old `true` answered a guess with a capability.
-        assert!(!initial_iframe_cross_origin_isolated(
-            &parent,
-            true,
-            "not a url",
-            Some("/same-origin-frame"),
-        ));
-        assert!(!initial_iframe_cross_origin_isolated(
-            &parent,
-            true,
-            "https://page.example/",
-            Some("http://[::page.example"),
-        ));
-        assert!(!initial_iframe_cross_origin_isolated(
-            &parent,
-            false,
-            "https://page.example/",
-            Some("/same-origin-frame"),
-        ));
+    fn initial_cross_origin_iframe_about_blank_inherits_the_parent_bit() {
+        assert!(initial_iframe_cross_origin_isolated(true));
+        assert!(!initial_iframe_cross_origin_isolated(false));
     }
 
     #[test]
