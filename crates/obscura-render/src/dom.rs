@@ -9349,9 +9349,8 @@ fn layout_dom_once(
                                             ))
                                 })
                             {
-                                if let Ok(layout) = taffy_tree.layout(tnode) {
-                                    available_widths.insert(tnode, layout.size.width.max(0.0));
-                                }
+                                let layout = taffy_tree.unrounded_layout(tnode);
+                                available_widths.insert(tnode, layout.size.width.max(0.0));
                             }
                         }
                     }
@@ -9440,10 +9439,7 @@ fn layout_dom_once(
                                 },
                                 &mut measure,
                             );
-                            taffy_tree
-                                .layout(tnode)
-                                .map(|l| l.size.width)
-                                .unwrap_or(0.0)
+                            taffy_tree.unrounded_layout(tnode).size.width
                         };
                         // A table can never be narrower than an unshrinkable
                         // fixed-width descendant. A Wikipedia infobox holds a
@@ -9495,10 +9491,7 @@ fn layout_dom_once(
                                 },
                                 &mut measure,
                             );
-                            taffy_tree
-                                .layout(tnode)
-                                .map(|l| l.size.width)
-                                .unwrap_or(0.0)
+                            taffy_tree.unrounded_layout(tnode).size.width
                         };
                         for (child, display) in caption_restore {
                             let mut restored = match taffy_tree.style(child) {
@@ -9602,10 +9595,7 @@ fn layout_dom_once(
                                     },
                                     &mut measure,
                                 );
-                                let cmin = taffy_tree
-                                    .layout(*cell)
-                                    .map(|l| l.size.width)
-                                    .unwrap_or(0.0);
+                                let cmin = taffy_tree.unrounded_layout(*cell).size.width;
                                 let _ = taffy_tree.compute_layout_with_measure(
                                     *cell,
                                     taffy::Size {
@@ -9614,10 +9604,7 @@ fn layout_dom_once(
                                     },
                                     &mut measure,
                                 );
-                                let cmax = taffy_tree
-                                    .layout(*cell)
-                                    .map(|l| l.size.width)
-                                    .unwrap_or(0.0);
+                                let cmax = taffy_tree.unrounded_layout(*cell).size.width;
                                 // Chromium's max-content column contribution
                                 // rounds up onto the 1/64 grid before the
                                 // track is sized, so a cell whose shaped text
@@ -11639,6 +11626,24 @@ fn compute_absolute_unrounded_rects(
     rects: &mut HashMap<NodeId, Rect>,
 ) {
     let layout = taffy_tree.unrounded_layout(taffy_id);
+    if std::env::var_os("OBSCURA_DEBUG_TABLE").is_some() {
+        if let Ok(st) = taffy_tree.style(taffy_id) {
+            eprintln!(
+                "[unrounded] node={:?} w={} h={} @ {},{} size={:?}/{:?} margin t={:?} l={:?} b={:?} r={:?}",
+                taffy_id,
+                layout.size.width,
+                layout.size.height,
+                layout.location.x,
+                layout.location.y,
+                st.size.width,
+                st.size.height,
+                st.margin.top,
+                st.margin.left,
+                st.margin.bottom,
+                st.margin.right,
+            );
+        }
+    }
     // Children accumulate on the snapped parent edge, the same way a LayoutUnit
     // child offset is added to the parent's LayoutUnit origin in Blink.
     let left = abs_x + layout.location.x;
@@ -14845,6 +14850,37 @@ fn build_table(
                 // the table width minus its inline margins).
                 cstyle.size.width = taffy::Dimension::length(0.0);
                 cstyle.min_size.width = taffy::Dimension::length(0.0);
+                // Chromium anchors the caption's top edge at the table's
+                // border-box top and keeps the table's top border plus the
+                // outer border-spacing band BELOW the caption, not above
+                // it. The grid hands the caption row the table's padding
+                // box, so pull the caption up by that offset: the track
+                // height still comes from the caption's own height (taffy
+                // ignores margins there), and the reclaimed band shows up
+                // as the table being one top band shorter, which is what
+                // Chromium measures too. The synthetic caption row already
+                // sits above the first content row, so the top border-spacing
+                // band is not laid into the grid padding (see grid_style
+                // below); only the authored padding is compensated here.
+                let (h_spacing, _) = table_spacing(style);
+                let band_top = style.padding.top;
+                let pull_y = style.border.top + band_top;
+                let pull_x = style.border.left + style.padding.left + h_spacing;
+                // Only concrete lengths move: auto and percent margins keep
+                // their own semantics (an auto margin must stay auto).
+                let lp_len = |m: taffy::LengthPercentageAuto| {
+                    let raw = m.into_raw();
+                    (raw.tag() == taffy::style::CompactLength::LENGTH_TAG).then(|| raw.value())
+                };
+                if let Some(v) = lp_len(cstyle.margin.top) {
+                    cstyle.margin.top = taffy::LengthPercentageAuto::length(v - pull_y);
+                }
+                if let Some(v) = lp_len(cstyle.margin.left) {
+                    cstyle.margin.left = taffy::LengthPercentageAuto::length(v - pull_x);
+                }
+                if let Some(v) = lp_len(cstyle.margin.bottom) {
+                    cstyle.margin.bottom = taffy::LengthPercentageAuto::length(v + band_top);
+                }
             }
             // Taffy's grid-item automatic minimum is an engine artifact here:
             // the table track has already collected the cell's min-content
@@ -15086,7 +15122,12 @@ fn build_table(
     let mut grid_style = style.clone();
     grid_style.padding.left += horizontal_spacing;
     grid_style.padding.right += horizontal_spacing;
-    grid_style.padding.top += vertical_spacing;
+    // Chromium keeps the top border and the outer spacing band BELOW a
+    // caption, so when the synthetic caption row is present the top band is
+    // already covered by that row and must not be laid in a second time.
+    if !synthetic_caption_row {
+        grid_style.padding.top += vertical_spacing;
+    }
     grid_style.padding.bottom += vertical_spacing;
     let mut tstyle = to_taffy_style(&grid_style);
     tstyle.display = Display::Grid;
