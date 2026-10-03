@@ -14881,6 +14881,13 @@ fn build_table(
                 if let Some(v) = lp_len(cstyle.margin.bottom) {
                     cstyle.margin.bottom = taffy::LengthPercentageAuto::length(v + band_top);
                 }
+                // Chromium sizes a caption from its own content, never from
+                // the row track. Left to stretch, the pulled-up top margin
+                // (negative) would be added back into the used height, so
+                // the caption would grow by exactly the pulled band. Start
+                // alignment keeps the measure-driven height and lets the
+                // margins only place the box at the table's border-box top.
+                cstyle.align_self = Some(taffy::style::AlignSelf::START);
             }
             // Taffy's grid-item automatic minimum is an engine artifact here:
             // the table track has already collected the cell's min-content
