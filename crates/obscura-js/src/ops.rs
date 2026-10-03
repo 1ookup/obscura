@@ -9013,81 +9013,104 @@ pub(crate) fn ensure_prepared_render(
         incompatible || prepared.animation_sample() != animation_sample
     }) || !state.pending_style_mutations.is_empty();
     if needs_rebuild {
-        if let Some(dom) = state.dom.as_ref() {
-            state
-                .animation_timeline
-                .materialize_start_candidates(dom);
-        }
-        let previous = (!incompatible && render_media == obscura_render::CssMediaType::Screen)
-            .then(|| state.prepared_render.take())
-            .flatten();
-        let mutations = std::mem::take(&mut state.pending_style_mutations);
-        let prepared = {
-            let dom = state.dom.as_ref()?;
-            match previous {
-                Some(previous) => obscura_render::prepare_dom_with_retained_styles_with_animation_state(
-                    dom,
-                    viewport,
-                    base_url.as_deref(),
-                    &mut state.render_resources,
-                    &state.dynamic_fonts,
-                    &mut state.stylesheet_cache,
-                    previous,
-                    &mutations,
-                    animation_sample,
-                    &mut state.animation_timeline,
-                )
-                .or_else(|| {
-                    obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+        // JS-visible geometry and style reads must never block on the
+        // network for images. The prepare pass otherwise fetches not-yet-
+        // cached images through the synchronous RenderResourceLoader, a
+        // blocking HTTP call (with retry backoff) executed inside the V8
+        // stack: a geometry read next to a fresh <img> measured 197-288ms
+        // against Chrome's <1ms on the same page and proxy, and the
+        // challenge's appearance census (getComputedStyle +
+        // getBoundingClientRect) reported the stall as its own 842ms payload
+        // field. Fonts keep the synchronous path (few, bounded, and they
+        // bound text geometry). Image bytes arrive through the asynchronous
+        // element/transport seeding instead; its completion queues
+        // RetainedStyleMutation::Resource, which rebuilds with the real
+        // intrinsic sizes - Chrome's placeholder-then-relayout behavior.
+        let previous_sync = state
+            .render_resources
+            .set_image_sync_loading_enabled(false);
+        let rebuilt = (|| -> Option<()> {
+            if let Some(dom) = state.dom.as_ref() {
+                state
+                    .animation_timeline
+                    .materialize_start_candidates(dom);
+            }
+            let previous = (!incompatible && render_media == obscura_render::CssMediaType::Screen)
+                .then(|| state.prepared_render.take())
+                .flatten();
+            let mutations = std::mem::take(&mut state.pending_style_mutations);
+            let prepared = {
+                let dom = state.dom.as_ref()?;
+                match previous {
+                    Some(previous) => obscura_render::prepare_dom_with_retained_styles_with_animation_state(
                         dom,
                         viewport,
                         base_url.as_deref(),
                         &mut state.render_resources,
                         &state.dynamic_fonts,
                         &mut state.stylesheet_cache,
+                        previous,
+                        &mutations,
                         animation_sample,
                         &mut state.animation_timeline,
                     )
-                })?,
-                None => match render_media {
-                    obscura_render::CssMediaType::Screen => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
-                        dom,
-                        viewport,
-                        base_url.as_deref(),
-                        &mut state.render_resources,
-                        &state.dynamic_fonts,
-                        &mut state.stylesheet_cache,
-                        animation_sample,
-                        &mut state.animation_timeline,
-                    )?,
-                    obscura_render::CssMediaType::Print => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
-                        dom,
-                        viewport,
-                        base_url.as_deref(),
-                        &mut state.render_resources,
-                        &state.dynamic_fonts,
-                        &mut state.stylesheet_cache,
-                        render_media,
-                        animation_sample,
-                        &mut state.animation_timeline,
-                    )?,
-                },
+                    .or_else(|| {
+                        obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                            dom,
+                            viewport,
+                            base_url.as_deref(),
+                            &mut state.render_resources,
+                            &state.dynamic_fonts,
+                            &mut state.stylesheet_cache,
+                            animation_sample,
+                            &mut state.animation_timeline,
+                        )
+                    })?,
+                    None => match render_media {
+                        obscura_render::CssMediaType::Screen => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_with_animation_state(
+                            dom,
+                            viewport,
+                            base_url.as_deref(),
+                            &mut state.render_resources,
+                            &state.dynamic_fonts,
+                            &mut state.stylesheet_cache,
+                            animation_sample,
+                            &mut state.animation_timeline,
+                        )?,
+                        obscura_render::CssMediaType::Print => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
+                            dom,
+                            viewport,
+                            base_url.as_deref(),
+                            &mut state.render_resources,
+                            &state.dynamic_fonts,
+                            &mut state.stylesheet_cache,
+                            render_media,
+                            animation_sample,
+                            &mut state.animation_timeline,
+                        )?,
+                    },
+                }
+            };
+            if animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime {
+                state.animation_timeline.clear_start_candidates();
             }
-        };
-        if animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime {
-            state.animation_timeline.clear_start_candidates();
-        }
-        let connected = state
-            .dom
-            .as_ref()
-            .map(shadow_including_connected_nodes);
-        if let Some(connected) = connected {
-            state
-                .animation_timeline
-                .retain_nodes(|node| connected.contains(&node));
-        }
-        state.prepared_render = Some(prepared);
-        state.resolved_scroll = None;
+            let connected = state
+                .dom
+                .as_ref()
+                .map(shadow_including_connected_nodes);
+            if let Some(connected) = connected {
+                state
+                    .animation_timeline
+                    .retain_nodes(|node| connected.contains(&node));
+            }
+            state.prepared_render = Some(prepared);
+            state.resolved_scroll = None;
+            Some(())
+        })();
+        state
+            .render_resources
+            .set_image_sync_loading_enabled(previous_sync);
+        rebuilt?;
     }
     state.prepared_render.as_ref()
 }
@@ -9885,6 +9908,33 @@ pub(crate) fn prepared_for_frame_root(
     frame_states: &mut HashMap<NodeId, FrameRenderState>,
     depth: usize,
 ) -> Option<obscura_render::PreparedRender> {
+    // Frame-document geometry (getBoundingClientRect, getComputedStyle) is
+    // JS-visible, so the frame's prepare must not block on the synchronous
+    // image loader either: see the no-sync rationale on
+    // ensure_prepared_render. Restore on every exit, including the early
+    // returns inside the inner body.
+    let previous_sync = resources.set_image_sync_loading_enabled(false);
+    let result = prepared_for_frame_root_inner(
+        dom,
+        frame_root,
+        main_prepared,
+        resources,
+        frame_states,
+        depth,
+    );
+    resources.set_image_sync_loading_enabled(previous_sync);
+    result
+}
+
+#[cfg(feature = "render")]
+fn prepared_for_frame_root_inner(
+    dom: &DomTree,
+    frame_root: NodeId,
+    main_prepared: &obscura_render::PreparedRender,
+    resources: &mut obscura_render::RenderResourceCache,
+    frame_states: &mut HashMap<NodeId, FrameRenderState>,
+    depth: usize,
+) -> Option<obscura_render::PreparedRender> {
     if depth > 32 {
         return None;
     }
@@ -9893,7 +9943,7 @@ pub(crate) fn prepared_for_frame_root(
     let viewport = if parent_root == dom.document() {
         frame_content_box_from_parent(main_prepared, host)?
     } else {
-        let parent = prepared_for_frame_root(
+        let parent = prepared_for_frame_root_inner(
             dom,
             parent_root,
             main_prepared,

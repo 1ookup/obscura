@@ -20578,8 +20578,8 @@ RequestRedirect value",
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn prepared_render_shares_resource_geometry_with_cssom_and_screenshots() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_render_shares_resource_geometry_with_cssom_and_screenshots() {
         let dom = parse_html(
             r#"<html style="margin:0"><head>
                 <base href="/assets/">
@@ -20610,6 +20610,10 @@ RequestRedirect value",
             });
         rt.run_page_init();
 
+        // JS-visible preparation never blocks on the image network: the first
+        // read sees the placeholder (no intrinsic size yet), exactly like
+        // Chrome before an image loads. The geometry must still agree with
+        // the retained prepared render.
         let before = rt
             .evaluate(
                 r#"
@@ -20621,8 +20625,37 @@ RequestRedirect value",
             .expect("initial geometry");
         let before = before.as_array().expect("initial tuple");
         assert_eq!(before[0].as_f64(), Some(160.0));
-        assert_eq!(before[1].as_f64(), Some(40.0));
-        let cssom_height = before[2].as_f64().expect("scroll height") as f32;
+        assert_eq!(before[1].as_f64(), Some(0.0));
+        let placeholder_height = before[2].as_f64().expect("scroll height") as f32;
+        {
+            let state = rt.state.borrow();
+            let prepared = state.prepared_render.as_ref().expect("prepared by CSSOM");
+            assert_eq!(placeholder_height, prepared.content_size().1);
+        }
+        assert_eq!(*loads.lock().expect("prepare load count"), 0);
+
+        // Touching the element schedules the lifecycle load; the pump drives
+        // this standalone runtime's compatibility loader (real pages load
+        // through the same task using the async page transport, whose
+        // completion queues the retained relayout). The next geometry read
+        // then sees the real intrinsic size.
+        rt.evaluate("document.getElementById(\"hero\").complete")
+            .expect("image touch");
+        rt.run_event_loop_bounded(200).await.unwrap();
+
+        let loaded = rt
+            .evaluate(
+                r#"
+                const hero = document.getElementById("hero");
+                const rect = hero.getBoundingClientRect();
+                return [rect.width, rect.height, document.documentElement.scrollHeight];
+                "#,
+            )
+            .expect("loaded geometry");
+        let loaded = loaded.as_array().expect("loaded tuple");
+        assert_eq!(loaded[0].as_f64(), Some(160.0));
+        assert_eq!(loaded[1].as_f64(), Some(40.0));
+        let cssom_height = loaded[2].as_f64().expect("scroll height") as f32;
         let (prepared_address, prepared_height) = {
             let state = rt.state.borrow();
             let prepared = state.prepared_render.as_ref().expect("prepared by CSSOM");
@@ -20979,8 +21012,8 @@ RequestRedirect value",
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn document_region_capture_preserves_live_runtime_state_and_resource_cache() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_region_capture_preserves_live_runtime_state_and_resource_cache() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0;height:260px">
                 <div style="height:120px;background:red"></div>
@@ -21008,6 +21041,13 @@ RequestRedirect value",
                 )
             });
         rt.run_page_init();
+        // Touching the element schedules the lifecycle load and the pump
+        // drives this standalone runtime's compatibility loader (real pages
+        // load through the same task using the async page transport).
+        // JS-visible preparation itself never blocks on the image network.
+        rt.evaluate("document.querySelector('img').complete")
+            .expect("image touch");
+        rt.run_event_loop_bounded(200).await.unwrap();
         assert_eq!(
             rt.evaluate("(function(){ window.scrollTo(0, 50); return window.scrollY; })()")
                 .expect("live scroll")
@@ -27213,8 +27253,8 @@ RequestRedirect value",
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn parser_image_first_getter_observes_prepare_seeded_cache_synchronously() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_image_first_getter_observes_loaded_cache_synchronously() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loader_calls = calls.clone();
         let png = two_by_three_png();
@@ -27225,15 +27265,18 @@ RequestRedirect value",
                 Some(png.clone())
             },
         );
-        {
-            let mut state = rt.state.borrow_mut();
-            assert!(ensure_prepared_render(&mut state).is_some());
-        }
+        // Touching the element schedules the lifecycle load; the pump drives
+        // this standalone runtime's compatibility loader (real pages load
+        // through the same task using the async page transport). A JS-visible
+        // preparation pass no longer performs synchronous image fetches.
+        rt.evaluate("document.getElementById(\"cached\").complete")
+            .expect("first getter");
+        rt.run_event_loop_bounded(200).await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // Constructing the JS wrapper happens here, after prepare_dom loaded
-        // the resource. The first complete getter must see that cache hit
-        // immediately; it must not briefly regress to pending/zero.
+        // The getter above loaded and cached the resource. A later complete
+        // getter must see that cache hit immediately; it must not briefly
+        // regress to pending/zero.
         assert_eq!(
             rt.evaluate(
                 r#"(() => {

@@ -146,6 +146,7 @@ pub struct RenderResourceCache {
     #[cfg(test)]
     content_image_layout_retries: usize,
     sync_loading_enabled: bool,
+    image_sync_loading_enabled: bool,
     loader: Box<dyn RenderResourceLoader>,
     font_csp: Option<(String, String)>,
     image_csp: Option<(String, String)>,
@@ -187,6 +188,7 @@ impl RenderResourceCache {
             #[cfg(test)]
             content_image_layout_retries: 0,
             sync_loading_enabled: true,
+            image_sync_loading_enabled: true,
             loader: Box::new(loader),
             font_csp: None,
             image_csp: None,
@@ -199,6 +201,20 @@ impl RenderResourceCache {
     /// unknown and can still be fetched by a later navigation/settle warmup.
     pub fn set_sync_loading_enabled(&mut self, enabled: bool) -> bool {
         std::mem::replace(&mut self.sync_loading_enabled, enabled)
+    }
+
+    /// Temporarily control only the synchronous image loader. JS-visible
+    /// preparation (geometry, computed style) disables it so a layout read
+    /// next to a fresh <img> never blocks on the network: the same read
+    /// measured 197-288ms against Chrome's <1ms on an identical page and
+    /// proxy, because image loads go through a blocking HTTP client with
+    /// retry backoff. Fonts keep the synchronous path (they are few, bounded,
+    /// and affect text geometry immediately); their steady-state async
+    /// coverage remains a follow-up. Unknown URLs stay unknown and are
+    /// fetched by the asynchronous element/transport seeding, whose
+    /// completion queues the retained relayout with the real dimensions.
+    pub fn set_image_sync_loading_enabled(&mut self, enabled: bool) -> bool {
+        std::mem::replace(&mut self.image_sync_loading_enabled, enabled)
     }
 
     /// Set the enforced CSP context used by synchronous font and image loading.
@@ -518,7 +534,7 @@ impl RenderResourceCache {
                 CachedResource::Missing(_) => {}
             }
         }
-        if !self.sync_loading_enabled {
+        if !self.sync_loading_enabled || !self.image_sync_loading_enabled {
             return None;
         }
         self.remove(&key);
