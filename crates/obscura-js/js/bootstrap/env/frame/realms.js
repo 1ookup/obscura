@@ -734,6 +734,26 @@ function _frameWindowProxyFor(hostEl) {
       if (st.root < 0) return 0;
       return (_domParse("query_selector_all_scoped", st.root, "iframe") || []).length;
     },
+    // The isolation bit belongs to the frame's document, and the document
+    // scope is written synchronously with the document. Answering from the
+    // scope keeps the value right across the tick between this facade
+    // materializing the realm and the realm's surface init landing (measured:
+    // the realm's own value arrives one tick late, and a reader probing on
+    // the line after append -- the payload collector does exactly that --
+    // must see what the reference browser's synchronous init answers). A
+    // cross-origin caller keeps the SecurityError every other non-allowlisted
+    // member throws.
+    get crossOriginIsolated() {
+      const st = frameState();
+      if (!st.same) throw securityError();
+      if (st.root < 0) return false;
+      try {
+        const info = _domParse("document_scope_info", st.root);
+        return !!info && info.crossOriginIsolated === true;
+      } catch (_error) {
+        return false;
+      }
+    },
     get closed() { return false; },
     get opener() { return null; },
     // Cross-document messaging (Phase 4): enqueue through the realm-aware
