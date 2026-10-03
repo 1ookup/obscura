@@ -33,13 +33,23 @@ try:
 except ImportError:
     sys.exit("pip3 install websockets")
 
-PRELOAD = "(function(){window.__roots=[];var a=Element.prototype.attachShadow;Element.prototype.attachShadow=function(i){var r=a.apply(this,arguments);try{window.__roots.push(r);}catch(e){}return r;};window.__pm=[];window.__t0=Date.now();window.addEventListener('message',function(e){try{var d=e.data;window.__pm.push((Date.now()-window.__t0)+'|'+((typeof d==='object')?JSON.stringify(d):String(d)).slice(0,200));}catch(x){}});})()"
+# Nothing here may leave a trace in the realm: the CF payload enumerates window
+# own keys (gsLi5) and reads attachShadow.toString (tRta4). State lives on a
+# non-enumerable Symbol.for slot; the attachShadow wrapper restores the native
+# method the moment it has captured its first root.
+PRELOAD = "(function(){var sk=Symbol.for('obscura.click.state');if(globalThis[sk])return;var st={roots:[],pm:[],t0:Date.now(),restored:false};Object.defineProperty(globalThis,sk,{value:st,writable:false,configurable:true,enumerable:false});var a=Element.prototype.attachShadow;st.orig=a;st.restore=function(){if(st.restored)return;st.restored=true;try{Element.prototype.attachShadow=st.orig;}catch(e){}};Element.prototype.attachShadow=function(i){var r=a.apply(this,arguments);try{st.roots.push(r);}catch(e){}st.restore();return r;};window.addEventListener('message',function(e){try{var d=e.data;if(d==='__obscura_click_restore__'){st.restore();return;}st.pm.push((Date.now()-st.t0)+'|'+((typeof d==='object')?JSON.stringify(d):String(d)).slice(0,200));}catch(x){}});})()"
 
 # NOTE: keep every expression on ONE line and avoid `JSON.stringify(IIFE)` with
 # newlines -- obscura's Runtime.evaluate silently returns nothing for some
 # multi-line forms, which reads as "the page has no widget" and sends the whole
 # investigation down the wrong path. Single-line IIFEs evaluate fine on both.
-PROBE = "(function(){var b=null;var it=false;var ev=[];var seen={};(window.__pm||[]).forEach(function(m){if(m.indexOf('food')>=0)return;var k=m.slice(0,60);if(!seen[k]){seen[k]=1;ev.push(m.slice(0,140));}if(m.indexOf('interactiveBegin')>=0)it=true;});var fr=[];(window.__roots||[]).forEach(function(r){try{var f=r.querySelectorAll('iframe');for(var i=0;i<f.length;i++)fr.push(f[i]);}catch(e){}});try{var t=document.querySelectorAll('iframe');for(var j=0;j<t.length;j++)fr.push(t[j]);}catch(e){}for(var k2=0;k2<fr.length;k2++){var q=fr[k2].getBoundingClientRect();if(q.width>100&&q.height>20){b={x:q.left,y:q.top,w:q.width,h:q.height};break;}}return JSON.stringify({box:b,interactive:it,events:ev});})()"
+PROBE = "(function(){var st=globalThis[Symbol.for('obscura.click.state')]||{pm:[],roots:[]};var b=null;var it=false;var ev=[];var seen={};(st.pm||[]).forEach(function(m){if(m.indexOf('food')>=0)return;var k=m.slice(0,60);if(!seen[k]){seen[k]=1;ev.push(m.slice(0,140));}if(m.indexOf('interactiveBegin')>=0)it=true;});var fr=[];(st.roots||[]).forEach(function(r){try{var f=r.querySelectorAll('iframe');for(var i=0;i<f.length;i++)fr.push(f[i]);}catch(e){}});try{var t=document.querySelectorAll('iframe');for(var j=0;j<t.length;j++)fr.push(t[j]);}catch(e){}for(var k2=0;k2<fr.length;k2++){var q=fr[k2].getBoundingClientRect();if(q.width>100&&q.height>20){b={x:q.left,y:q.top,w:q.width,h:q.height};break;}}return JSON.stringify({box:b,interactive:it,events:ev});})()"
+
+# Broadcast a restore to every frame realm right before the click. The
+# challenge iframe never creates a shadow root, so its per-realm one-shot never
+# fires; the parent-window walk reaches it through postMessage even though it
+# is cross-origin, and without this its tRta4 would still read the wrapper.
+RESTORE = "(function(){function w(f){try{f.postMessage('__obscura_click_restore__','*');}catch(e){}}try{w(window);}catch(e){}try{var fs=window.frames;for(var i=0;i<fs.length;i++){try{w(fs[i]);}catch(e){}}}catch(e){}return 'ok';})()"
 
 STATE = "(function(){return JSON.stringify({url:location.href,title:document.title,text:document.body?document.body.innerText.slice(0,160):''});})()"
 
@@ -108,6 +118,7 @@ async def run(endpoint, url, offset, deadline, settle, require_interactive, star
             probe = await c.eval(PROBE, session) or {}
             box = probe.get("box")
             if box and (probe.get("interactive") or not require_interactive):
+                await c.eval(RESTORE, session)
                 ox, oy = offset
                 x, y = box["x"] + ox, box["y"] + oy
                 await c.call("Input.dispatchMouseEvent",

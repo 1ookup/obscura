@@ -34,7 +34,7 @@ PRELOAD = r"""
 (function () {
   var stateKey = Symbol.for('obscura.capture.state');
   if (globalThis[stateKey]) return;
-  var state = { cap: [], roots: [] };
+  var state = { cap: [], roots: [], restored: false };
   Object.defineProperty(globalThis, stateKey, {
     value: state, writable: false, configurable: true, enumerable: false,
   });
@@ -45,11 +45,20 @@ PRELOAD = r"""
     try { cap.push(o); console.warn('[CAP] ' + JSON.stringify(o)); } catch (e) {}
   }
   // shadow-root capture, so the click probe can see the widget iframe inside
-  // Turnstile's closed shadow root.
+  // Turnstile's closed shadow root. Self-restoring on first capture: the CF
+  // payload reads attachShadow.toString (tRta4), so no wrapper may remain on
+  // the prototype once it has served its purpose.
   var _ash = Element.prototype.attachShadow;
+  state.orig = _ash;
+  state.restore = function () {
+    if (state.restored) return;
+    state.restored = true;
+    try { Element.prototype.attachShadow = state.orig; } catch (e) {}
+  };
   Element.prototype.attachShadow = function (i) {
     var r = _ash.apply(this, arguments);
     try { state.roots.push(r); } catch (e) {}
+    state.restore();
     return r;
   };
   // passive postMessage listener (does NOT wrap postMessage/contentWindow)
