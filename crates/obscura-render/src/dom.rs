@@ -10683,6 +10683,7 @@ fn synthesize_shaped_inline_fragments(
     engine: &crate::inline::TextEngine,
 ) -> HashMap<NodeId, Vec<Rect>> {
     let mut fragments: HashMap<NodeId, Vec<((usize, usize), Rect)>> = HashMap::new();
+    let mut identity_entries: HashMap<NodeId, Vec<Rect>> = HashMap::new();
     for shaped in engine.inline_owner_line_fragments() {
         let Some(style) = styles.get(&shaped.owner) else {
             continue;
@@ -10711,9 +10712,28 @@ fn synthesize_shaped_inline_fragments(
             .entry(shaped.owner)
             .or_default()
             .push(((shaped.item_index, shaped.line_index), rect));
+        identity_entries
+            .entry(shaped.owner)
+            .or_default()
+            .push(Rect {
+                x: shaped.identity_x + relative_x,
+                y: rect.y,
+                width: shaped.identity_width,
+                height: rect.height,
+            });
     }
 
     let mut canonical = HashMap::with_capacity(fragments.len());
+    let mut identity_boxes: HashMap<NodeId, Rect> = HashMap::with_capacity(identity_entries.len());
+    for (owner, mut entries) in identity_entries {
+        // Single-line owners only: a wrapped owner's identity union changes
+        // the box height profile the decorated-inline tests pin, and the
+        // per-line advance delta there is the smaller residual.
+        if entries.len() != 1 {
+            continue;
+        }
+        identity_boxes.insert(owner, entries[0]);
+    }
     for (owner, mut pieces) in fragments {
         pieces.sort_by(|(order_a, rect_a), (order_b, rect_b)| {
             order_a
@@ -10734,7 +10754,15 @@ fn synthesize_shaped_inline_fragments(
                 height: (bottom - top).max(0.0),
             };
         }
-        rects.insert(owner, union);
+        // The CSSOM box answers on the identity pen (the reference browser's
+        // table advances) while the painted fragments stay on the shaped pen
+        // the glyphs actually occupy: one pen per consumer, no rect-vs-ink
+        // tear inside transformed subtrees.
+        if let Some(boxes) = identity_boxes.get(&owner) {
+            rects.insert(owner, *boxes);
+        } else {
+            rects.insert(owner, union);
+        }
         canonical.insert(owner, fragments);
     }
     canonical

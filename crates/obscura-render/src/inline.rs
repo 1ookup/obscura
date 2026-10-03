@@ -1606,6 +1606,11 @@ pub(crate) struct InlineOwnerLineFragment {
     pub x: f32,
     pub baseline_y: f32,
     pub width: f32,
+    /// The same edges under the identity's table advances. Glyphs keep
+    /// painting on the shaped pen, while the CSSOM box reports the pen the
+    /// reference browser lays the run on.
+    pub identity_x: f32,
+    pub identity_width: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -3375,14 +3380,53 @@ impl TextEngine {
         styles: &std::collections::HashMap<NodeId, LayoutStyle>,
         flattened_owner_chains: &std::collections::HashMap<NodeId, Vec<NodeId>>,
     ) -> Option<usize> {
+        if std::env::var_os("OBSCURA_DEBUG_TABLE").is_some() {
+            eprintln!("[table-debug] try_build_run parent={parent:?} members={}", run.len());
+        }
         let mut has_text = false;
         for &cid in run {
             if !inline_child_ok(tree, cid, styles, &mut has_text) {
+                if std::env::var_os("OBSCURA_DEBUG_TABLE").is_some() {
+                    let node = tree.get_node(cid);
+                    let local = node
+                        .as_ref()
+                        .and_then(|n| n.as_element())
+                        .map(|e| e.local.to_string());
+                    let style = styles.get(&cid);
+                    eprintln!(
+                        "[table-debug] try_build_run inline_child_ok false at {cid:?} local={local:?} \
+                         display={:?} pos={:?} float={:?} ovf={:?} before={:?} after={:?} ib={:?}",
+                        style.map(|s| s.display),
+                        style.and_then(|s| s.position),
+                        style.map(|s| s.float),
+                        style.map(|s| s.overflow_hidden),
+                        style.and_then(|s| s.before_pseudo.clone()),
+                        style.and_then(|s| s.after_pseudo.clone()),
+                        style.map(|s| s.is_inline_block),
+                    );
+                }
                 return None;
             }
         }
         if !has_text {
-            return None;
+            // A whitespace-only run still carries advance under a pre chain:
+            // a lone `<span style="white-space:pre"> </span>` renders its
+            // space at full width in Chromium, so it folds like text.
+            let preserves = run.iter().any(|&cid| {
+                flattened_owner_chains.get(&cid).is_some_and(|chain| {
+                    chain.iter().any(|&owner| {
+                        matches!(
+                            styles.get(&owner).and_then(|s| s.white_space),
+                            Some(crate::WhiteSpace::Pre)
+                                | Some(crate::WhiteSpace::PreWrap)
+                                | Some(crate::WhiteSpace::BreakSpaces)
+                        )
+                    })
+                })
+            });
+            if !preserves {
+                return None;
+            }
         }
         let base = styles.get(&parent)?;
         let mut collector = Collector::new();
@@ -3395,37 +3439,65 @@ impl TextEngine {
         let ctx = base_span_ctx(base, font, &mut collector);
         let line_height = ctx.line_height;
         let mut spans: Vec<(String, SpanAttrs)> = Vec::new();
+        // A flattened boxless inline above this child is still an element
+        // with a box in every real browser, and its own style must shape the
+        // text: re-enter the walk at the chain's outermost element so the
+        // ordinary element branch reopens the owner and threads the span's
+        // font-size and white-space into the shaped attributes. Collecting
+        // at the chain root once per run also keeps a span with several
+        // flattened children from contributing its text twice.
+        let mut last_chain_root: Option<NodeId> = None;
+        if std::env::var_os("OBSCURA_DEBUG_TABLE").is_some() {
+            let members: Vec<String> = run
+                .iter()
+                .map(|&cid| {
+                    let chain = flattened_owner_chains
+                        .get(&cid)
+                        .map(|c| format!("->{:?}", c))
+                        .unwrap_or_default();
+                    let text = tree.get_node(cid).and_then(|n| match &n.data {
+                        obscura_dom::tree::NodeData::Text { contents } => {
+                            Some(format!("{:?}", contents.clone()))
+                        }
+                        _ => None,
+                    });
+                    match text {
+                        Some(t) => format!("{cid}{chain}{t}"),
+                        None => format!("{cid}{chain}"),
+                    }
+                })
+                .collect();
+            eprintln!("[table-debug] run members: {}", members.join(" , "));
+        }
         for &cid in run {
-            // A flattened boxless inline above this child is still an element
-            // with a box in every real browser: reopen each ancestor of the
-            // chain as an inline owner so shaping provenance attributes this
-            // text to it and CSSOM gets a fragment box.
-            let chain = flattened_owner_chains.get(&cid);
-            let opened = chain.map(|chain| {
-                let mut opened = 0usize;
-                for &owner in chain {
-                    if let Some(owner_style) = styles.get(&owner) {
-                        collector.begin_owner(owner, owner_style);
-                        opened += 1;
-                    }
+            let chain_root = flattened_owner_chains
+                .get(&cid)
+                .and_then(|chain| chain.first().copied());
+            if let Some(root) = chain_root {
+                if last_chain_root == Some(root) {
+                    continue;
                 }
-                opened
-            });
-            collect_node_spans(
-                tree,
-                cid,
-                styles,
-                ctx.clone(),
-                &mut spans,
-                &mut collector,
-                &self.loaded_families,
-            );
-            if let Some(opened) = opened {
-                if let Some(chain) = chain {
-                    for &owner in chain.iter().take(opened).rev() {
-                        collector.end_owner(owner);
-                    }
-                }
+                last_chain_root = Some(root);
+                collect_node_spans(
+                    tree,
+                    root,
+                    styles,
+                    ctx.clone(),
+                    &mut spans,
+                    &mut collector,
+                    &self.loaded_families,
+                );
+            } else {
+                last_chain_root = None;
+                collect_node_spans(
+                    tree,
+                    cid,
+                    styles,
+                    ctx.clone(),
+                    &mut spans,
+                    &mut collector,
+                    &self.loaded_families,
+                );
             }
         }
         self.push_shaped_item(
@@ -4353,15 +4425,17 @@ Some((width, height, left, top, coverage))
         } else {
             Wrap::Word
         };
-        // Collapsible trailing whitespace does not widen the last line.
-        if matches!(
-            white_space,
-            crate::WhiteSpace::Normal | crate::WhiteSpace::NoWrap | crate::WhiteSpace::PreLine
-        ) {
-            if let Some((text, _)) = spans.last_mut() {
-                if text.ends_with(' ') {
-                    text.pop();
-                }
+        // Collapsible trailing whitespace does not widen the last line. The
+        // last span's own white-space decides: a pre span's trailing space
+        // keeps its advance, and Chromium measures that span box at its full
+        // width even when the block around it is collapsible.
+        if let Some((text, attrs)) = spans.last_mut() {
+            if matches!(
+                attrs.white_space,
+                crate::WhiteSpace::Normal | crate::WhiteSpace::NoWrap | crate::WhiteSpace::PreLine
+            ) && text.ends_with(' ')
+            {
+                text.pop();
             }
         }
         if owner_boxes.is_empty()
@@ -4875,6 +4949,33 @@ Some((width, height, left, top, coverage))
                     0.0
                 };
                 let alignment_shift = line_edge_alignment_shift(item, line_start, line_end);
+                if std::env::var_os("OBSCURA_DEBUG_TABLE").is_some() {
+                    let glyphs: Vec<String> = run
+                        .glyphs
+                        .iter()
+                        .map(|g| {
+                            format!(
+                                "[{}..{}] x={:.3} w={:.3}",
+                                g.start,
+                                g.end,
+                                g.x,
+                                g.w
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "[table-debug] owner-line text={:?} line_w={:.3} glyphs={} owners={:?} table={} face={:?}",
+                        &run.text,
+                        run.line_w,
+                        glyphs.join(" "),
+                        item.owner_boxes
+                            .iter()
+                            .map(|o| (o.start, o.end))
+                            .collect::<Vec<_>>(),
+                        item.identity_table.is_some(),
+                        item.identity_face
+                    );
+                }
                 for owner in &item.owner_boxes {
                     let empty = owner.start == owner.end;
                     let intersects = if empty {
@@ -4907,8 +5008,31 @@ Some((width, height, left, top, coverage))
                     } else {
                         run.line_w + line_edge_advance(item, line_start, line_end)
                     };
+                    let identity_left = if first {
+                        identity_cursor_x(item, &run, line_start, owner.start)
+                            + line_advance_before_event(
+                                item,
+                                owner.start_event,
+                                line_start,
+                                line_end,
+                            )
+                            + owner.start_edge.margin
+                    } else {
+                        identity_cursor_x(item, &run, line_start, line_start)
+                    };
+                    let identity_right = if last {
+                        identity_cursor_x(item, &run, line_start, owner.end)
+                            + line_advance_before_event(item, owner.end_event, line_start, line_end)
+                            + owner.end_edge.border_padding()
+                    } else {
+                        identity_cursor_x(item, &run, line_start, line_end)
+                            + line_edge_advance(item, line_start, line_end)
+                    };
                     let x = item.origin.0 + first_line_offset + alignment_shift + raw_left;
                     let width = (raw_right - raw_left).max(0.0);
+                    let identity_x =
+                        item.origin.0 + first_line_offset + alignment_shift + identity_left;
+                    let identity_width = (identity_right - identity_left).max(0.0);
                     let baseline_y = item.origin.1 + run.line_y;
                     if let Some(existing) = out.iter_mut().find(|fragment| {
                         fragment.owner == owner.owner
@@ -4919,6 +5043,11 @@ Some((width, height, left, top, coverage))
                         let right = (existing.x + existing.width).max(x + width);
                         existing.x = left;
                         existing.width = (right - left).max(0.0);
+                        let ileft = existing.identity_x.min(identity_x);
+                        let iright = (existing.identity_x + existing.identity_width)
+                            .max(identity_x + identity_width);
+                        existing.identity_x = ileft;
+                        existing.identity_width = (iright - ileft).max(0.0);
                     } else {
                         out.push(InlineOwnerLineFragment {
                             owner: owner.owner,
@@ -4927,6 +5056,8 @@ Some((width, height, left, top, coverage))
                             x,
                             baseline_y,
                             width: width.max(0.0),
+                            identity_x,
+                            identity_width,
                         });
                     }
                 }
@@ -5256,6 +5387,13 @@ fn collect_node_spans(
     };
     match &node.data {
         obscura_dom::tree::NodeData::Text { contents } => {
+            if std::env::var_os("OBSCURA_DEBUG_TABLE").is_some() {
+                eprintln!(
+                    "[table-debug] text cid={cid:?} raw={contents:?} ctx-ws={:?} ctx-size={:?}",
+                    ctx.white_space,
+                    ctx.font_size
+                );
+            }
             let attrs = SpanAttrs {
                 font_size: ctx.font_size,
                 line_height: ctx.line_height,
@@ -5315,6 +5453,15 @@ fn collect_node_spans(
             let owns_inline_fragment = style
                 .is_some_and(|style| style.ignores_used_box_sizes() && !style.display_contents);
             if owns_inline_fragment {
+                if std::env::var_os("OBSCURA_DEBUG_TABLE").is_some() {
+                    eprintln!(
+                        "[table-debug] begin_owner cid={:?} local={:?} font_size={:?} ws={:?}",
+                        cid,
+                        elem.local.as_ref(),
+                        style.and_then(|s| s.font_size),
+                        style.and_then(|s| s.white_space)
+                    );
+                }
                 c.begin_owner(cid, style.expect("inline owner style"));
             }
             let own_clip_fill = style.and_then(clip_text_fill).map(|fill| {
@@ -5438,9 +5585,21 @@ fn push_text(
         }
     }
     if buf.is_empty() {
+        if std::env::var_os("OBSCURA_DEBUG_TABLE").is_some() {
+            eprintln!(
+                "[table-debug] push_text EMPTY raw={raw:?} ws={white_space:?} last_was_space={}",
+                c.last_was_space
+            );
+        }
         return;
     }
     c.record_text(buf.len());
+    if std::env::var_os("OBSCURA_DEBUG_TABLE").is_some() {
+        eprintln!(
+            "[table-debug] push_text recorded {buf:?} ws={white_space:?} text_len={}",
+            c.text_len
+        );
+    }
     if let Some((last_text, last_attrs)) = out.last_mut() {
         if last_attrs == attrs {
             last_text.push_str(&buf);
@@ -5611,6 +5770,60 @@ fn run_cursor_x(run: &cosmic_text::LayoutRun<'_>, byte: usize) -> f32 {
             .last()
             .map_or(run.line_w, |glyph| glyph.x + glyph.w)
     }
+}
+
+/// The pen position at `byte` (absolute in the item source) under the
+/// identity's table advances, mirroring `identity_line`: a covered cluster
+/// contributes its table advance once, an uncovered cluster keeps the shaped
+/// stand-in advance. Owner fragment boxes read their edges here so an inline
+/// element's geometry lands on the same pen as the reference browser, whose
+/// sans face advances are the identity table's.
+fn identity_cursor_x(
+    item: &InlineItem,
+    run: &cosmic_text::LayoutRun<'_>,
+    line_start: usize,
+    byte: usize,
+) -> f32 {
+    let local = byte.saturating_sub(line_start).min(run.text.len());
+    let mut x = 0.0f32;
+    let mut counted: Vec<(usize, usize)> = Vec::new();
+    let mut previous: Option<char> = None;
+    for glyph in run.glyphs.iter() {
+        if glyph.start >= local {
+            break;
+        }
+        let span = (glyph.start, glyph.end);
+        if counted.contains(&span) {
+            continue;
+        }
+        let cluster = run.text.get(span.0..span.1);
+        let units = cluster.and_then(|cluster| {
+            identity_measured_cluster(
+                item.identity_face,
+                item.identity_table,
+                previous,
+                cluster,
+                item.identity_bold,
+            )
+        });
+        match units {
+            Some(units) => {
+                x += identity_units_to_px(
+                    units,
+                    glyph.font_size,
+                    MACOS_SANS_METRICS.units_per_em,
+                );
+                counted.push(span);
+            }
+            None => x += glyph.w,
+        }
+        if let Some(cluster) = cluster {
+            if let Some(last) = cluster.chars().last() {
+                previous = Some(last);
+            }
+        }
+    }
+    x
 }
 
 fn glyph_relative_offset(

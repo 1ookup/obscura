@@ -15369,7 +15369,10 @@ mod tests {
         assert!(
             (20..100).any(|x| (20..60).any(|y| {
                 let pixel = pixmap.pixel(x, y).expect("scaled text region");
-                pixel.red() < 80 && pixel.green() < 80 && pixel.blue() < 80
+                // The span's own #0000ff threads into the flattened run now,
+                // so the ink is blue over the red box: blue dominates and the
+                // red background's channel drops where a glyph core lands.
+                pixel.blue() > 200 && pixel.red() < 120 && pixel.green() < 120
             })),
             "text must be rasterized inside the scaled atomic subtree"
         );
