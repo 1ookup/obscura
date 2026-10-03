@@ -12339,10 +12339,13 @@ fn apply_table_row_geometry(
                 + layout.padding.bottom
                 + layout.border.top
                 + layout.border.bottom;
-            // Taffy's content_size is the furthest content/child overflow in
-            // border-box coordinates (an empty padded cell reports its padding
-            // extent), so it is already the right natural border-box floor.
-            let mut natural = layout.content_size.height.max(edges);
+            // A leaf cell reports content_size as measured content plus
+            // padding, so its border still has to be added back on top; the
+            // inset extent stays as the floor for an empty padded cell.
+            let mut natural = (layout.content_size.height
+                + layout.border.top
+                + layout.border.bottom)
+                .max(edges);
             if let Some(dom_id) = id_map.get(&cell) {
                 if let Some(style) = styles.get(dom_id) {
                     if let crate::Dimension::Px(height) = style.height {
