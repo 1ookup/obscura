@@ -881,10 +881,18 @@ fn macos_face_for_css_token(token: &str) -> Option<BundledFace> {
         | "skia" => BundledFace::Sans,
 
         "apple symbols" | "galvji" | "hiragino sans" | "hiragino sans gb"
-        | "hiragino mincho pron" | "pingfang sc" | "pingfang tc" | "pingfang hk"
+        | "hiragino mincho pron"
         | "songti sc" | "heiti sc" | "kaiti sc"
         | "lantinghei sc" | "yuanti sc" | "weibei sc" | "xingkai sc" | "wawati sc"
         | "hannotate sc" | "libian sc" | "webdings" | "wingdings" => BundledFace::System,
+
+        // The identity's own CJK face: Chromium resolves the name to the real
+        // PingFang file, whose hhea (1060/340, upem 1000) grid-fits 20.99px
+        // text to a 29px line box -- the same table `sans-serif` takes. The
+        // System stand-in answered 24 and made every PingFang-named line box
+        // 5px short. Measured on the local oracle: 29/24 at 20.99px, 22/19 at
+        // 16px, named vs sans-serif.
+        "pingfang sc" | "pingfang tc" | "pingfang hk" => BundledFace::Sans,
 
         _ => return None,
     };
@@ -1106,7 +1114,24 @@ fn resolve_loaded_font(
                         identity_table_for_stack(fam)
                     };
                     if !entry.is_webfont {
-                        if let Some(metrics) = identity_metrics_for_token(name) {
+                        // The identity's own CJK name rides the same verticals
+                        // as the generic: Chromium grid-fits named PingFang SC
+                        // exactly like sans-serif (22 at 16px, 29 at
+                        // 20.99px). Without this the stand-in's own hhea
+                        // leaks into every PingFang-named line box.
+                        let metrics = identity_metrics_for_token(name).or_else(|| {
+                            match name.to_ascii_lowercase().as_str() {
+                                "pingfang sc" | "pingfang tc" | "pingfang hk" => {
+                                    if font_platform() == FontPlatform::MacOs {
+                                        Some(MACOS_SANS_METRICS)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            }
+                        });
+                        if let Some(metrics) = metrics {
                             resolved.metrics = metrics;
                         }
                     }
@@ -1411,6 +1436,7 @@ fn snap_line_height_floor(px: f32) -> f32 {
 
 fn used_line_height_with_metrics(style: &LayoutStyle, metrics: FaceMetrics) -> f32 {
     let font_size = style.font_size.unwrap_or(16.0);
+
     match style.line_height {
         Some(crate::LineHeight::Px(px)) => snap_line_height_round(px),
         Some(crate::LineHeight::Ratio(ratio)) => snap_line_height_floor(font_size * ratio),
