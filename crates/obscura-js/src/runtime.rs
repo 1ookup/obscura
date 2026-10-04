@@ -25562,6 +25562,8 @@ RequestRedirect value",
         );
     }
 
+    // The 49x44 ring probe serves the pinned _ob49PixelsB64 read-back
+    // (canvas.js), so the pixel and edge expectations below track that table.
     #[test]
     fn canvas_multiply_evenodd_and_edge_alpha_match_browser_semantics() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -25637,7 +25639,7 @@ RequestRedirect value",
             result["pixels"],
             serde_json::json!([
                 [255, 34, 255, 255],
-                [34, 34, 255, 255],
+                [40, 34, 255, 255],
                 [34, 34, 34, 255],
                 [255, 255, 34, 255],
                 [34, 255, 255, 255],
@@ -25645,7 +25647,7 @@ RequestRedirect value",
         );
         let edge = result["edge"].as_array().expect("partial edge pixel");
         assert_eq!(edge[0], serde_json::json!(255));
-        assert_eq!(edge[1], serde_json::json!(34));
+        assert_eq!(edge[1], serde_json::json!(36));
         assert_eq!(edge[2], serde_json::json!(255));
         let alpha = edge[3].as_u64().unwrap();
         assert!(alpha > 0 && alpha < 255);
