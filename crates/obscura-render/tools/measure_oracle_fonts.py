@@ -48,7 +48,7 @@ def expression(families):
         (() => {{
           const ctx = document.createElement('canvas').getContext('2d');
           ctx.font = {font};
-          const singles = {{}}, pairs = {{}};
+          const singles = {{}}, pairs = {{}}, pairsRaw = {{}};
           for (const code of {json.dumps(ASCII + LATIN1)}) {{
             singles[code] = ctx.measureText(String.fromCharCode(code)).width;
           }}
@@ -58,10 +58,13 @@ def expression(families):
               const width = ctx.measureText(pair).width;
               const base = singles[first] + singles[second];
               const delta = Math.round((width - base) * 128);
-              if (delta !== 0) pairs[first + '|' + second] = delta;
+              if (delta !== 0) {{
+                pairs[first + '|' + second] = delta;
+                pairsRaw[first + '|' + second] = width - base;
+              }}
             }}
           }}
-          return {{singles, pairs, probe: ctx.measureText({json.dumps(PROBE)}).width}};
+          return {{singles, pairs, pairsRaw, probe: ctx.measureText({json.dumps(PROBE)}).width}};
         }})()
         """)
     return 'JSON.stringify([' + (',\n'.join(parts)) + '])'
@@ -112,7 +115,9 @@ def main():
     for family, data in zip(families, measured):
         out['families'][family.lstrip('@')] = {
             'advances': {str(code): round(width * STEPS) for code, width in data['singles'].items()},
+            'advances_raw': {str(code): width for code, width in data['singles'].items()},
             'pairs': data['pairs'],
+            'pairs_raw': data['pairsRaw'],
             'probe': data['probe'],
         }
     json.dump(out, sys.stdout, indent=1, sort_keys=True)
