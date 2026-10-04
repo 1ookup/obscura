@@ -34970,8 +34970,11 @@ RequestRedirect value",
     #[test]
     fn offscreen_context_interface_owns_its_members() {
         // The default identity is macOS, so the default font's advances come
-        // from the built-in table: PingFang SC's 'a' is 559/1000 em, 5.59 at
-        // 10px, not the bundled stand-in's 5.5625.
+        // from the built-in table: PingFang SC's 'a' holds the raw 16px
+        // oracle reading 8.943984985351562 (raw 16px table path, see
+        // 1b6af20), so at 10px the em scale of 16 gives
+        // f32(8.943984985351562 * 10 / 16) = 5.589990615844727, not the
+        // bundled stand-in's 5.5625.
         #[cfg(feature = "render")]
         obscura_render::inline::set_font_platform("MacIntel");
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -35007,7 +35010,7 @@ RequestRedirect value",
                 "constructorName": "OffscreenCanvasRenderingContext2D",
                 "tag": "[object OffscreenCanvasRenderingContext2D]",
                 "bothHaveFillRect": true,
-                "measureWidth": 5.590000152587891,
+                "measureWidth": 5.589990615844727,
             })
         );
     }
