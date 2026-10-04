@@ -186,7 +186,7 @@ for (const name of [
     '__obscura_frame_realm_globals', '__obscura_realm_bridge',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_pointer_id',
     '__obscura_registerLinkedStylesheet', '__obscura_install_window_surface',
-    '__obscura_install_platform_surfaces',
+    '__obscura_install_platform_surfaces', '__obscura_install_tracelog',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
     '__obscura_nextPendingTimeoutDelay',

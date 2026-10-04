@@ -351,3 +351,4 @@ run covers are then removed.
 - ownKeys v4 alignment (10-04): scoped: obscura-js 750/750 (render shape); runtime capture census/plain six-key positions+descriptors match k981
 - SDP video section transcription (10-04): scoped: obscura-js 750/750; captured offer matches Chrome ref with session lines normalized
 - frame-realm insertion-time materialization (10-04): scoped: obscura-js 750/750; rt-phase same-tick contentWindow read 3.0-6.1ms -> 0.1-0.3ms (zero-read fixture still materializes), first-touch hydration band 16-22ms unchanged
+- frame-realm tracelog install (10-04): scoped: obscura-js 750/750; live F2-CF round reads layer-2 tracelog from the template-restored frame realm; full-path negative control vs the pre-change binary byte-identical on stdout/op/trace except the accepted +1 hidden global; opt-out lib check still fails on the pre-existing ops.rs render-gate gap (15 errors, none in the touched files); full gate deferred to the next backfill

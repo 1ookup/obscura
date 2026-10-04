@@ -389,6 +389,16 @@ static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 // Window interceptor. The generated source is still snapshotted for normal
 // runs.
 static BOOTSTRAP_SRC: &str = include_str!(env!("OBSCURA_BOOTSTRAP_PATH"));
+// The snapshot-baked bootstrap defines the tracelog installer but never calls
+// it (the snapshot is built with no destination configured). Snapshot-restored
+// realms run this after restore: set the flag first, then invoke the
+// installer. The typeof guard keeps the call soft; tracing stays best-effort,
+// matching the sink's own posture.
+pub(crate) const TRACELOG_INSTALL_SRC: &str = concat!(
+    "globalThis.__obscura_tracelog_enabled = true; ",
+    "if (typeof globalThis.__obscura_install_tracelog === 'function') { ",
+    "globalThis.__obscura_install_tracelog(); }",
+);
 
 /// Serializes V8 isolate construction across OS threads. The thread-per-
 /// connection server (issue #430) builds isolates on many threads. The main
@@ -880,16 +890,17 @@ impl ObscuraJsRuntime {
                 deno_core::v8::icu::set_default_locale(&primary);
             }
 
-            // Either trace stream opts the runtime out of the startup
-            // snapshot: op tracing needs the JS-side source-label wrappers, and
-            // the tracelog sink installs window.external.tracelog from the
-            // bootstrap, which the snapshot was built without.
+            // Op tracing opts the runtime out of the startup snapshot: it
+            // needs the JS-side source-label wrappers, which install only when
+            // their flag precedes the bootstrap. A tracelog destination does
+            // not skip the snapshot; its installer is baked in and the
+            // snapshot-path branch below calls it after restore.
             let trace_requested = crate::trace_source::enabled();
             let tracelog_requested = crate::tracelog::enabled();
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
                 module_loader: Some(module_loader),
-                startup_snapshot: (!(trace_requested || tracelog_requested)).then_some(SNAPSHOT),
+                startup_snapshot: (!trace_requested).then_some(SNAPSHOT),
                 ..Default::default()
             });
             // A trace-enabled runtime executes bootstrap after context
@@ -897,16 +908,15 @@ impl ObscuraJsRuntime {
             // its early DOM ops need the same op-state registration that the
             // snapshot path already has by the time page init runs.
             runtime.op_state().borrow_mut().put(state_clone);
-            if trace_requested || tracelog_requested {
+            if trace_requested {
                 // Must precede the bootstrap: the source-attribution wrappers
                 // (Function proxy, Promise.then, on* snapshots) install only
                 // when their flag is set, and so does the tracelog method whose
                 // caller decided on a destination. The snapshot was built with
-                // neither, which is exactly why it is skipped here.
+                // neither flag set, which is why the tracelog-only case gets
+                // its install from the branch below instead.
                 let mut mode_flags = String::new();
-                if trace_requested {
-                    mode_flags.push_str("globalThis.__obscura_trace_from_enabled = true;");
-                }
+                mode_flags.push_str("globalThis.__obscura_trace_from_enabled = true;");
                 if tracelog_requested {
                     mode_flags.push_str("globalThis.__obscura_tracelog_enabled = true;");
                 }
@@ -916,6 +926,16 @@ impl ObscuraJsRuntime {
                 runtime
                     .execute_script("<obscura:bootstrap>", BOOTSTRAP_SRC.to_string())
                     .expect("bootstrap.js should not fail in native trace mode");
+            } else if tracelog_requested {
+                // Snapshot path. The installer is baked into the snapshot but
+                // its call site never ran (no destination at build time); call
+                // it here. Soft failure: tracing must not break page creation.
+                if let Err(error) = runtime.execute_script(
+                    "<obscura:tracelog-install>",
+                    TRACELOG_INSTALL_SRC.to_string(),
+                ) {
+                    tracing::warn!("tracelog installer failed on the snapshot path: {error}");
+                }
             }
             runtime
                 .v8_isolate()

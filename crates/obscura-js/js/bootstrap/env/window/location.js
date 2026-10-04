@@ -399,7 +399,13 @@ function _tracelogSend(key, value) {
     Deno.core.ops.op_tracelog(key, typeof json === 'string' ? json : '');
   } catch (error) { /* tracing stays best-effort, like the other streams */ }
 }
-if (globalThis.__obscura_tracelog_enabled === true) {
+// The method is per-realm state and only the host knows whether a trace
+// destination was configured, so the install lives in a function the runtime
+// can call again after restoring the startup snapshot (the snapshot is built
+// with no destination, so its copy of this file defines the installer and the
+// tail below leaves it uncalled). The full-bootstrap path installs inline
+// through the same function, byte for byte what this file always did.
+function _obscuraInstallTracelog() {
   // WebIDL declares an operation on the prototype as enumerable, and the
   // enumerability pass at the end of the bootstrap promotes class members to
   // match; declaring it here keeps the shape right in a realm where that pass
@@ -410,6 +416,16 @@ if (globalThis.__obscura_tracelog_enabled === true) {
     }),
     writable: true, enumerable: true, configurable: true,
   });
+}
+// Published the same way as the window-surface installers (see
+// config/window-surface.js): a hidden global the runtime can reach from a
+// snapshot-restored realm, where module-scope functions are not addressable.
+Object.defineProperty(globalThis, '__obscura_install_tracelog', {
+  value: _obscuraInstallTracelog,
+  writable: false, enumerable: false, configurable: false,
+});
+if (globalThis.__obscura_tracelog_enabled === true) {
+  _obscuraInstallTracelog();
 }
 globalThis.BarProp = BarProp;
 globalThis.External = External;

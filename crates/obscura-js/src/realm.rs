@@ -28,7 +28,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use deno_core::v8;
 
 use crate::import_map::ImportMap;
-use crate::runtime::ObscuraJsRuntime;
+use crate::runtime::{ObscuraJsRuntime, TRACELOG_INSTALL_SRC};
 
 /// The frame's own Window realm: the default execution context CDP reports
 /// with `auxData.isDefault = true`. Isolated worlds use ids above this.
@@ -1114,6 +1114,18 @@ impl ObscuraJsRuntime {
             let scope = &mut self.deno_runtime_mut().handle_scope();
             let context_local = v8::Local::new(scope, &context);
             drop_realm_deno_global(scope, context_local);
+        } else if crate::tracelog::enabled() {
+            // Template-restored realms skipped the bootstrap, so the
+            // snapshot-baked tracelog installer was defined but never called
+            // (the snapshot is built with no destination). Install it here.
+            // Best-effort: a failed install must not fail frame creation.
+            if let Err(error) = self.execute_in_context(
+                &context,
+                "<obscura:frame-realm-tracelog>",
+                TRACELOG_INSTALL_SRC,
+            ) {
+                tracing::warn!("frame realm tracelog install failed: {error}");
+            }
         }
         if timing {
             realm_phase_print("bootstrap_core", t_phase.elapsed());
@@ -2272,6 +2284,16 @@ pub(crate) fn spawn_frame_realm(
             drop_realm_deno_global(scope, context);
             if timing {
                 realm_phase_print("sync bootstrap_core", t_phase.elapsed());
+            }
+        } else if crate::tracelog::enabled() {
+            // Template-restored realms skipped the bootstrap, so the
+            // snapshot-baked tracelog installer was defined but never called
+            // (the snapshot is built with no destination). Install it here.
+            // Best-effort: a failed install must not fail frame creation.
+            if let Err(error) =
+                run_script(scope, "<obscura:frame-realm-tracelog>", TRACELOG_INSTALL_SRC)
+            {
+                tracing::warn!("frame realm tracelog install failed: {error}");
             }
         }
         run_script(scope, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
