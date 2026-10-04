@@ -245,19 +245,19 @@ function _materializeFrameRealm(hostNid, knownState) {
   }
 }
 
-// The Turnstile-shaped embed: a sandboxed frame that keeps same-origin access
-// and loads no external document, so its initial about:blank is the page the
-// widget writes into. Only these pay the skeleton realm at insertion time;
-// every other frame falls back to the lazy read-time materialization the
+// A same-origin-capable sandboxed frame: the Turnstile embed keeps
+// allow-same-origin so the widget can write into the frame, and the real
+// challenge frame carries a cross-origin src on top. Every such frame pays
+// the skeleton realm at insertion time; frames without sandbox or without
+// allow-same-origin fall back to the lazy read-time materialization the
 // contentWindow/contentDocument getters already perform, which is the
-// pre-skeleton behaviour. get_attribute answers null for a missing attribute
-// (ops.rs get_attribute maps the Option), so both null and "" mean "absent".
+// pre-skeleton behaviour. get_attribute answers null for a missing
+// attribute (ops.rs get_attribute maps the Option), so null and "" both
+// mean "absent".
 function _isCfShapedFrame(hostNid) {
   const sandbox = _domParse("get_attribute", hostNid, "sandbox");
   if (sandbox === null || sandbox === undefined) return false;
-  if (!String(sandbox).includes("allow-same-origin")) return false;
-  const src = _domParse("get_attribute", hostNid, "src");
-  return src === null || src === undefined || src === "";
+  return String(sandbox).includes("allow-same-origin");
 }
 
 // Insertion-time entry point used by __prepareInsertedSubtree. The frame-class
