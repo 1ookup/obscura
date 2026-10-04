@@ -174,10 +174,11 @@ function __prepareInsertedSubtree(root) {
     _queueIframeNavigation(root[_nidSym]);
     // Chrome builds the nested browsing context's realm at insertion time, so
     // a probe reading contentWindow on the line after append must find a live
-    // Window. Materialize the skeleton realm here too; the surface stays
-    // deferred (hydrated on first property operation). Idempotent, and a
+    // Window. Materialize the skeleton realm here too, gated to the
+    // sandboxed-same-origin no-src embeds that need it; other frames keep the
+    // lazy read-time path, the pre-skeleton behaviour. Idempotent, and a
     // no-op once the realm exists or the loader has already committed.
-    _materializeFrameRealm(root[_nidSym]);
+    _materializeFrameRealmAtConnect(root[_nidSym]);
   }
   _armPreloadImageLinks(root);
   // Shadow-piercing on purpose. A selector query stops at a shadow boundary,
@@ -190,7 +191,7 @@ function __prepareInsertedSubtree(root) {
     _dom("create_blank_iframe_document", +nid);
     _queueIframeNavigation(+nid);
     // Same insertion-time materialization as the root-iframe branch above.
-    _materializeFrameRealm(+nid);
+    _materializeFrameRealmAtConnect(+nid);
   }
   // `_syncWindowFrameIndices` answers Window's indexed frame properties by
   // querying the whole document for iframes. Connecting a subtree that holds

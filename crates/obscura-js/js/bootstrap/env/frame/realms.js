@@ -244,6 +244,29 @@ function _materializeFrameRealm(hostNid, knownState) {
     globals[String(root)] = bridge;
   }
 }
+
+// The Turnstile-shaped embed: a sandboxed frame that keeps same-origin access
+// and loads no external document, so its initial about:blank is the page the
+// widget writes into. Only these pay the skeleton realm at insertion time;
+// every other frame falls back to the lazy read-time materialization the
+// contentWindow/contentDocument getters already perform, which is the
+// pre-skeleton behaviour. get_attribute answers null for a missing attribute
+// (ops.rs get_attribute maps the Option), so both null and "" mean "absent".
+function _isCfShapedFrame(hostNid) {
+  const sandbox = _domParse("get_attribute", hostNid, "sandbox");
+  if (sandbox === null || sandbox === undefined) return false;
+  if (!String(sandbox).includes("allow-same-origin")) return false;
+  const src = _domParse("get_attribute", hostNid, "src");
+  return src === null || src === undefined || src === "";
+}
+
+// Insertion-time entry point used by __prepareInsertedSubtree. The frame-class
+// gate decides who pays at connect time; the delegate keeps the original
+// idempotence checks (existing realm, loader-committed document).
+function _materializeFrameRealmAtConnect(hostNid) {
+  if (!_isCfShapedFrame(hostNid)) return;
+  _materializeFrameRealm(hostNid);
+}
 const _chromeWindowKeyOrder = [
   // The canonical Window own-key order, regenerated verbatim from a
   // getOwnPropertyNames census of the local Chrome 149 oracle on this host
