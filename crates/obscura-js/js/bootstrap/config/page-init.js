@@ -651,6 +651,10 @@ globalThis.__obscura_init = function() {
     // binding the bootstrap captured (the global is gone before page script).
     if (globalThis.__obscura_frame_snapshot_surface) {
       try { _markNativeObject(Deno, 2); } catch (_e) {}
+      // Last reader: the flag is configurable (batch 21 template) so it can
+      // be deleted here. Frame page script must not observe the name
+      // (Chrome reports typeof undefined for it).
+      try { delete globalThis.__obscura_frame_snapshot_surface; } catch (_e) {}
     }
   }
   try {

@@ -248,6 +248,8 @@ fn build_frame_template_context(
         // Same hydration tail the deferred-surface assembler installs for
         // defer realms, minus the surface run (already baked): catch up the
         // fingerprint applicator and run the full page init at first touch.
+        // The snapshot-surface flag is configurable so page init can delete
+        // it after its last read; frame script must not see the name.
         run_template_script(
             scope,
             "globalThis.__obscura_hydrate = function () {\n\
@@ -257,7 +259,7 @@ fn build_frame_template_context(
              \x20 try { globalThis.__obscura_init(); } finally { delete globalThis.__obscura_init; }\n\
              };\n\
              Object.defineProperty(globalThis, '__obscura_frame_snapshot_surface', {\n\
-             \x20 value: true, writable: false, enumerable: false, configurable: false });",
+             \x20 value: true, writable: false, enumerable: false, configurable: true });",
         );
         context.set_allow_generation_from_strings(false);
     }
