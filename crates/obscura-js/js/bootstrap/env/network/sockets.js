@@ -187,7 +187,7 @@ function _reportOffscreenBrand(site, receiver) {
       state.width = Math.max(0, Math.trunc(Number(value)) || 0);
       if (!state.context) return;
       if (state.contextType === '2d') {
-        _canvas2dResizeFromCanvas(state, this);
+        _canvas2dResizeFromCanvas(_canvas2dState.get(state.context), this);
       } else {
         // A WebGL context reports the surface size through its drawing
         // buffer; keep it in step like the reference does on a resize.
@@ -214,7 +214,7 @@ function _reportOffscreenBrand(site, receiver) {
       state.height = Math.max(0, Math.trunc(Number(value)) || 0);
       if (!state.context) return;
       if (state.contextType === '2d') {
-        _canvas2dResizeFromCanvas(state, this);
+        _canvas2dResizeFromCanvas(_canvas2dState.get(state.context), this);
       } else {
         // A WebGL context reports the surface size through its drawing
         // buffer; keep it in step like the reference does on a resize.
