@@ -130,9 +130,9 @@ const _GPU_APPLE = {
     'texture-formats-tier1', 'bgra8unorm-storage', 'texture-compression-bc',
     'dual-source-blending', 'core-features-and-limits', 'float32-filterable',
     'indirect-first-instance', 'texture-compression-astc-sliced-3d',
-    'float32-blendable', 'depth-clip-control', 'texture-compression-astc',
-    'texture-compression-etc2', 'texture-compression-bc-sliced-3d',
-    'shader-f16', 'texture-formats-tier2', 'clip-distances',
+    'float32-blendable', 'texture-compression-astc', 'texture-compression-etc2',
+    'depth-clip-control', 'texture-compression-bc-sliced-3d',
+    'texture-formats-tier2', 'clip-distances', 'shader-f16',
     'texture-component-swizzle', 'subgroups',
   ],
 };
@@ -145,8 +145,8 @@ function _gpuAdapterProfile() {
 const _GPU_WGSL_FEATURES = [
   'packed_4x8_integer_dot_product', 'subgroup_uniformity', 'subgroup_id',
   'linear_indexing', 'readonly_and_readwrite_storage_textures',
-  'unrestricted_pointer_parameters', 'texture_and_sampler_let',
-  'pointer_composite_access', 'uniform_buffer_standard_layout',
+  'unrestricted_pointer_parameters', 'pointer_composite_access',
+  'texture_and_sampler_let', 'uniform_buffer_standard_layout',
 ];
 
 function _gpuSupportedLimits(values) {
