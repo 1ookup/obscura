@@ -350,3 +350,4 @@ run covers are then removed.
 - COI CSP token-list fix (10-03): scoped: obscura-browser 141/141, obscura-render 637/637 (1 skipped); Chrome 149 eight-cell COI fixture 8/8 (v1-v5 true, v6-v8 false; was v4-only before the fix)
 - ownKeys v4 alignment (10-04): scoped: obscura-js 750/750 (render shape); runtime capture census/plain six-key positions+descriptors match k981
 - SDP video section transcription (10-04): scoped: obscura-js 750/750; captured offer matches Chrome ref with session lines normalized
+- frame-realm insertion-time materialization (10-04): scoped: obscura-js 750/750; rt-phase same-tick contentWindow read 3.0-6.1ms -> 0.1-0.3ms (zero-read fixture still materializes), first-touch hydration band 16-22ms unchanged
