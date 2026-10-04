@@ -2752,7 +2752,8 @@ impl Page {
         if let Some(js) = &mut self.js {
             let _ = js.execute_script(
                 "<ready-state-interactive>",
-                "globalThis.__documentReadyState__ = 'interactive';",
+                "globalThis.__documentReadyState__ = 'interactive';\n\
+                 try { document.dispatchEvent(new Event('readystatechange', {bubbles:false,cancelable:false})); } catch(e) {}",
             );
         }
 
@@ -2866,6 +2867,7 @@ impl Page {
             let _ = js.execute_script(
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
+                 try { document.dispatchEvent(new Event('readystatechange', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  if (typeof window.onload === 'function') { try { __obscuraTraceCallWith(__obscuraTraceHandlerFrom(window, 'onload'), window.onload, window, []); } catch(e) {} }\n\
                  try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { globalThis.__obscura_performance_lifecycle?.('load', performance.now()); } catch(e) {}",
@@ -3124,6 +3126,16 @@ impl Page {
                 "globalThis.__obscura_referrer_policy={:?};",
                 scope.referrer_policy
             ),
+        );
+        // A committed frame document starts in `loading`, before any script
+        // that can observe it; the interactive/complete transitions follow at
+        // their lifecycle points below. Setting the value is not a transition,
+        // so no readystatechange fires here (Chrome fires exactly two).
+        let _ = js.execute_script_in_frame_realm(
+            frame_id,
+            generation,
+            "<frame-ready-state-loading>",
+            "globalThis.__documentReadyState__ = 'loading';",
         );
         // New-document scripts run in every matching frame world after the
         // browser bootstrap and before any author script, including when the
@@ -3697,6 +3709,19 @@ impl Page {
             }
         }
 
+        // Parsing is done; deferred scripts and non-async modules below still
+        // gate DOMContentLoaded but observe `interactive`. Mirrors the main
+        // path's <ready-state-interactive> point.
+        if let Some(js) = self.js.as_mut() {
+            let _ = js.execute_script_in_frame_realm(
+                frame_id,
+                generation,
+                "<frame-ready-state-interactive>",
+                "globalThis.__documentReadyState__ = 'interactive';\n\
+                 try { document.dispatchEvent(new Event('readystatechange', {bubbles:false,cancelable:false})); } catch(e) {}",
+            );
+        }
+
         for scheduled in post_parse {
             if tokio::time::Instant::now() >= deadline {
                 tracing::warn!("execute_frame_scripts: deadline reached during post-parse work");
@@ -3748,6 +3773,7 @@ impl Page {
                 generation,
                 "<frame-load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
+                 try { document.dispatchEvent(new Event('readystatechange', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  if (typeof window.onload === 'function') { try { __obscuraTraceCallWith(__obscuraTraceHandlerFrom(window, 'onload'), window.onload, window, []); } catch(e) {} }\n\
                  try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { globalThis.__obscura_performance_lifecycle?.('load', performance.now()); } catch(e) {}",
