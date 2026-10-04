@@ -13,6 +13,41 @@ run covers are then removed.
 
 ## Backfilled
 
+- 2026-10-05: backfill executed at HEAD `4d7192e`, `cargo nextest run
+  --release --features render --no-fail-fast --config
+  vendor/v8-source.toml` = **2049/2051 passed** (2 failed, 4 skipped),
+  log `/private/tmp/cf-parity-1002/fullgate_4d7192e.log`. Covers every
+  Deferred entry below through the 10-05 latin1 batch (`1b6af20`,
+  `90a6596`, `4d7192e`) including the frame-realm chain. Both failures
+  are resolved: (1)
+  `obscura-js runtime::tests::offscreen_context_interface_owns_its_members`
+  still expected the old units-derived 5.590000152587891; `b7f2c2a`
+  updates it to the raw 16px table reading chain,
+  f32(8.943984985351562 * 10 / 16) = 5.589990615844727 (obscura-js scoped
+  750/750 after). The chain start matters: the tables store the raw
+  oracle reading, 16 ULP away from f32(559 * 16 / 1000) =
+  8.944000244140625. (2) `obscura-cli::mcp_client test_wait_for_selector`
+  is a pre-existing load-sensitive timeout flake: idle 9/9 pass at
+  3.3-3.7s, 1/2 pass immediately after a full-load run, and the failures
+  are the plain five-second window expiring on `Timeout waiting for
+  'h1'` (introduced `bce055f`, the `640839f` fixture hardening did not
+  fully settle it; this batch touches no navigation or MCP surface).
+  Opt-out check (`cargo check -p obscura-js -p obscura-cli
+  --no-default-features --config vendor/v8-source.toml`): the
+  pre-existing ops.rs render-gate gap, 15 errors, all in `ops.rs`, none
+  in the files this batch touched (`inline.rs`, `runtime.rs`, `tools/`);
+  same count as the 10-04 entry below. Obstacle course still has to run
+  where `obscura-benchmark` is checked out, absent on this host.
+  Calibration for the font-table path: the stored tables are 16px
+  bit-exact; non-16px sizes can differ from the old units-derived chain
+  by up to 1 ulp and the 1/64px quantization absorbs every difference,
+  so end-to-end output stays bit-identical. Do not run bitwise
+  old-vs-new regression comparisons at non-16px sizes, they will produce
+  false positives. Scoped-run lesson: shared table or shared behaviour
+  changes must scope the downstream consumer crates too; `1b6af20` ran
+  `obscura-render` alone and missed the `obscura-js` expectation, caught
+  only in this full gate.
+
 - 2026-09-27: backfill executed at HEAD `38f6f84`,
   `cargo nextest run --release --features render --no-fail-fast --config
   vendor/v8-source.toml` = **2000/2000 passed** (4 skipped), plus
