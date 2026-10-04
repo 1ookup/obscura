@@ -43,7 +43,11 @@ run covers are then removed.
   by up to 1 ulp and the 1/64px quantization absorbs every difference,
   so end-to-end output stays bit-identical. Do not run bitwise
   old-vs-new regression comparisons at non-16px sizes, they will produce
-  false positives. Scoped-run lesson: shared table or shared behaviour
+  false positives. The instrumented challenge round's measureText log
+  (20 records) shows a single distinct font, '16px sans-serif',
+  throughout, so the non-16px band is unreachable from the CF
+  measurement channel and the 22.5% non-bit-identical simulation rate
+  carries no live risk. Scoped-run lesson: shared table or shared behaviour
   changes must scope the downstream consumer crates too; `1b6af20` ran
   `obscura-render` alone and missed the `obscura-js` expectation, caught
   only in this full gate.
