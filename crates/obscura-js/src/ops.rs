@@ -4883,7 +4883,14 @@ async fn stealth_fetch_all(
                 return Err(deno_error::JsErrorBox::generic(error.to_string()));
             }
         };
-        let current_response_start = performance_started.elapsed();
+        // responseStart is the transport's first byte. A local stamp here
+        // would land after the body read and fold the download into the
+        // TTFB. Blocked responses carry zero transport timing and keep it.
+        let current_response_start = if r.timing.response_start == std::time::Duration::ZERO {
+            performance_started.elapsed()
+        } else {
+            r.timing.start.saturating_duration_since(performance_started) + r.timing.response_start
+        };
 
         if !(300..400).contains(&r.status) {
             break (r.status, r.headers, r.body, current_response_start);
