@@ -209,12 +209,12 @@ impl IdentityFace {
     }
 
     /// The advance of the last-resort glyph a browser draws for a cluster the
-    /// face has no glyph for, in font units.
+    /// face has no glyph for, at 16px in pixels.
     ///
     /// A face that covers no emoji at all draws one glyph for the whole
-    /// cluster, so `😀` and `👨‍👩‍👧‍👦` measure the same 999-unit advance,
-    /// 15.984px at 16px, however many code points the cluster holds.
-    const LAST_RESORT_ADVANCE: f32 = 999.0;
+    /// cluster, so `😀` and `👨‍👩‍👧‍👦` measure the same 15.984px advance,
+    /// however many code points the cluster holds.
+    const LAST_RESORT_ADVANCE: f32 = 15.984000205993652;
 
     /// The face's own emoji metric for a shaped cluster, when the cluster
     /// begins with an emoji the face covers.
@@ -233,8 +233,8 @@ impl IdentityFace {
     }
 }
 
-/// One emoji's advance in the identity sans face's own 1000-unit em, plus the
-/// ink box the reference reports for it.
+/// One emoji's advance at 16px in pixels, plus the ink box the reference
+/// reports for it.
 ///
 /// The box is placed once per run: the reference's `actualBoundingBox*` for a
 /// repeated emoji are the single-glyph box while the width doubles, so the box
@@ -247,23 +247,33 @@ struct EmojiMetric {
 
 /// The ink box seven of the ten emoji share: the face draws them from one
 /// component, and a page reads the same rectangle for each.
-const MACOS_SANS_SHARED_EMOJI_INK: Option<(f32, f32, f32, f32)> = Some((42.0, 546.0, 758.0, 14.0));
+const MACOS_SANS_SHARED_EMOJI_INK: Option<(f32, f32, f32, f32)> =
+    Some((0.671999990940094, 8.736000061035156, 12.128000259399414, 0.2240000069141388));
 
 /// The emoji the identity sans face covers, read off the reference's
 /// `TextMetrics` at 16px. A base character and its emoji presentation selector
 /// shape as one cluster, so the cluster's first character decides.
 fn macos_sans_emoji_metric(cluster: &str) -> Option<EmojiMetric> {
     let (advance, ink) = match cluster.chars().next()? {
-        '\u{1F600}' => (1794.0, MACOS_SANS_SHARED_EMOJI_INK),
-        '\u{1F923}' => (1394.0, MACOS_SANS_SHARED_EMOJI_INK),
-        '\u{1F631}' => (1596.5, MACOS_SANS_SHARED_EMOJI_INK),
-        '\u{1F44D}' => (1794.0, MACOS_SANS_SHARED_EMOJI_INK),
-        '\u{1F525}' => (1594.0, MACOS_SANS_SHARED_EMOJI_INK),
-        '\u{1F680}' => (1794.0, MACOS_SANS_SHARED_EMOJI_INK),
-        '\u{1F9E0}' => (1260.5, Some((42.0, 2103.0, 834.0, 112.0))),
-        '\u{1F436}' => (1573.5, Some((42.0, 3077.0, 811.0, 93.0))),
-        '\u{1F3E0}' => (1460.5, MACOS_SANS_SHARED_EMOJI_INK),
-        '\u{2600}' => (2052.5, Some((42.0, 3066.0, 716.0, 212.0))),
+        '\u{1F600}' => (28.70400047302246, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{1F923}' => (22.304000854492188, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{1F631}' => (25.54400062561035, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{1F44D}' => (28.70400047302246, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{1F525}' => (25.503999710083008, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{1F680}' => (28.70400047302246, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{1F9E0}' => (
+            20.167999267578125,
+            Some((0.671999990940094, 33.64799880981445, 13.343999862670898, 1.7920000553131104)),
+        ),
+        '\u{1F436}' => (
+            25.176000595092773,
+            Some((0.671999990940094, 49.231998443603516, 12.97599983215332, 1.4880000352859497)),
+        ),
+        '\u{1F3E0}' => (23.368000030517578, MACOS_SANS_SHARED_EMOJI_INK),
+        '\u{2600}' => (
+            32.84000015258789,
+            Some((0.671999990940094, 49.055999755859375, 11.456000328063965, 3.3919999599456787)),
+        ),
         // The presentation selector adds no advance and no ink of its own; it
         // only asks for the emoji-drawn form of the base character.
         '\u{FE0F}' => (0.0, None),
@@ -272,110 +282,118 @@ fn macos_sans_emoji_metric(cluster: &str) -> Option<EmojiMetric> {
     Some(EmojiMetric { advance, ink })
 }
 
-/// PingFang SC's hmtx advance for U+0020..=U+007E, in font units.
+/// PingFang SC's advance for U+0020..=U+007E at 16px, in pixels.
 const MACOS_SANS_ASCII: [f32; 95] = [
-    333.0, 333.0, 427.0, 600.0, 600.0, 970.0, 726.0, 244.0, 333.0, 333.0, 506.0, 605.0, 264.0,
-    605.0, 264.0, 500.0, 600.0, 401.0, 600.0, 600.0, 600.0, 600.0, 600.0, 547.0, 600.0, 600.0,
-    264.0, 264.0, 605.0, 605.0, 605.0, 537.0, 858.0, 657.0, 677.0, 728.0, 706.0, 637.0, 577.0,
-    748.0, 720.0, 237.0, 517.0, 690.0, 588.0, 882.0, 719.0, 767.0, 642.0, 767.0, 676.0, 632.0,
-    619.0, 714.0, 639.0, 930.0, 637.0, 662.0, 624.0, 333.0, 500.0, 333.0, 518.0, 500.0, 333.0,
-    559.0, 586.0, 547.0, 586.0, 555.0, 373.0, 591.0, 556.0, 256.0, 267.0, 529.0, 235.0, 855.0,
-    559.0, 586.0, 586.0, 586.0, 365.0, 505.0, 355.0, 560.0, 482.0, 755.0, 509.0, 496.0, 487.0,
-    333.0, 195.0, 333.0, 500.0,
+    5.3279876708984375, 5.3279876708984375, 6.8319854736328125, 9.599990844726562, 9.599990844726562, 15.519989013671875, 11.615997314453125, 3.90399169921875, 5.3279876708984375, 5.3279876708984375, 8.095993041992188, 9.67999267578125, 4.2239990234375,
+    9.67999267578125, 4.2239990234375, 8.0, 9.599990844726562, 6.415985107421875, 9.599990844726562, 9.599990844726562, 9.599990844726562, 9.599990844726562, 9.599990844726562, 8.751998901367188, 9.599990844726562, 9.599990844726562,
+    4.2239990234375, 4.2239990234375, 9.67999267578125, 9.67999267578125, 9.67999267578125, 8.591995239257812, 13.727996826171875, 10.511993408203125, 10.831985473632812, 11.647994995117188, 11.295989990234375, 10.191986083984375, 9.23199462890625,
+    11.967987060546875, 11.519989013671875, 3.7919921875, 8.271987915039062, 11.039993286132812, 9.407989501953125, 14.11199951171875, 11.503997802734375, 12.271987915039062, 10.271987915039062, 12.271987915039062, 10.815994262695312, 10.11199951171875,
+    9.90399169921875, 11.423995971679688, 10.2239990234375, 14.879989624023438, 10.191986083984375, 10.591995239257812, 9.983993530273438, 5.3279876708984375, 8.0, 5.3279876708984375, 8.287994384765625, 8.0, 5.3279876708984375,
+    8.943984985351562, 9.375991821289062, 8.751998901367188, 9.375991821289062, 8.879989624023438, 5.967987060546875, 9.45599365234375, 8.89599609375, 4.0959930419921875, 4.2719879150390625, 8.4639892578125, 3.7599945068359375, 13.67999267578125,
+    8.943984985351562, 9.375991821289062, 9.375991821289062, 9.375991821289062, 5.839996337890625, 8.079986572265625, 5.67999267578125, 8.959991455078125, 7.7119903564453125, 12.079986572265625, 8.143997192382812, 7.9359893798828125, 7.7919921875,
+    5.3279876708984375, 3.1199951171875, 5.3279876708984375, 8.0,
 ];
 
-/// PingFang SC's bold advances for U+0020..=U+007E, in font units. Measured
+/// PingFang SC's bold advances for U+0020..=U+007E at 16px, in pixels. Measured
 /// off the reference browser's `measureText` at `bold 16px sans-serif`: the
 /// face's Semibold is not a synthetic widening of the regular (h answers 577
 /// against 556, t 362 against 355), so a weight-scaled copy of the regular
 /// table cannot stand in for it. Latin-1 keeps the regular numbers; only the
 /// ASCII block has a measured bold table.
 const MACOS_SANS_BOLD_ASCII: [f32; 95] = [
-    333.0, 333.0, 488.0, 600.0, 600.0, 996.0, 751.0, 281.0, 333.0, 333.0,
-    516.0, 605.0, 275.0, 605.0, 275.0, 500.0, 600.0, 410.0, 600.0, 600.0,
-    600.0, 600.0, 600.0, 553.0, 600.0, 600.0, 275.0, 275.0, 605.0, 605.0,
-    605.0, 558.0, 866.0, 679.0, 690.0, 732.0, 720.0, 642.0, 582.0, 756.0,
-    736.0, 257.0, 538.0, 714.0, 592.0, 903.0, 732.0, 775.0, 655.0, 775.0,
-    697.0, 651.0, 615.0, 734.0, 659.0, 953.0, 664.0, 691.0, 639.0, 333.0,
-    500.0, 333.0, 545.0, 500.0, 333.0, 572.0, 602.0, 561.0, 602.0, 567.0,
-    378.0, 602.0, 577.0, 275.0, 276.0, 553.0, 254.0, 884.0, 581.0, 600.0,
-    602.0, 602.0, 374.0, 525.0, 362.0, 582.0, 506.0, 777.0, 537.0, 526.0,
-    506.0, 333.0, 214.0, 333.0, 500.0,
+    5.328000068664551, 5.328000068664551, 7.808000087738037, 9.600000381469727, 9.600000381469727, 15.935999870300293, 12.015999794006348, 4.495999813079834, 5.328000068664551, 5.328000068664551,
+    8.255999565124512, 9.680000305175781, 4.400000095367432, 9.680000305175781, 4.400000095367432, 8.0, 9.600000381469727, 6.559999942779541, 9.600000381469727, 9.600000381469727,
+    9.600000381469727, 9.600000381469727, 9.600000381469727, 8.847999572753906, 9.600000381469727, 9.600000381469727, 4.400000095367432, 4.400000095367432, 9.680000305175781, 9.680000305175781,
+    9.680000305175781, 8.928000450134277, 13.855999946594238, 10.86400032043457, 11.039999961853027, 11.711999893188477, 11.520000457763672, 10.272000312805176, 9.312000274658203, 12.095999717712402,
+    11.776000022888184, 4.111999988555908, 8.607999801635742, 11.423999786376953, 9.472000122070312, 14.447999954223633, 11.711999893188477, 12.399999618530273, 10.479999542236328, 12.399999618530273,
+    11.152000427246094, 10.416000366210938, 9.84000015258789, 11.744000434875488, 10.543999671936035, 15.248000144958496, 10.62399959564209, 11.055999755859375, 10.223999977111816, 5.328000068664551,
+    8.0, 5.328000068664551, 8.720000267028809, 8.0, 5.328000068664551, 9.152000427246094, 9.631999969482422, 8.97599983215332, 9.631999969482422, 9.071999549865723,
+    6.047999858856201, 9.631999969482422, 9.232000350952148, 4.400000095367432, 4.415999889373779, 8.847999572753906, 4.064000129699707, 14.144000053405762, 9.295999526977539, 9.600000381469727,
+    9.631999969482422, 9.631999969482422, 5.984000205993652, 8.399999618530273, 5.791999816894531, 9.312000274658203, 8.095999717712402, 12.432000160217285, 8.592000007629395, 8.416000366210938,
+    8.095999717712402, 5.328000068664551, 3.4240000247955322, 5.328000068664551, 8.0,
 ];
 
-/// Songti SC's hmtx advance for U+0020..=U+007E, in font units. Songti's Latin
-/// design is narrower than PingFang's: a digit is 469 units where PingFang's is
-/// 600, which is the difference a 64-character hex string reads as 4400px
+/// Songti SC's advance for U+0020..=U+007E at 16px, in pixels. Songti's Latin
+/// design is narrower than PingFang's: a digit is 7.504px where PingFang's is
+/// 9.6, which is the difference a 64-character hex string reads as 4400px
 /// against 5600px at 150px.
 const MACOS_SERIF_ASCII: [f32; 95] = [
-    250.0, 219.0, 406.0, 667.0, 448.0, 823.0, 729.0, 177.0, 292.0, 292.0, 427.0, 667.0, 219.0,
-    313.0, 219.0, 500.0, 469.0, 469.0, 469.0, 469.0, 469.0, 469.0, 469.0, 469.0, 469.0, 469.0,
-    219.0, 219.0, 667.0, 667.0, 667.0, 365.0, 917.0, 679.0, 618.0, 635.0, 771.0, 658.0, 566.0,
-    771.0, 766.0, 354.0, 333.0, 741.0, 576.0, 847.0, 773.0, 780.0, 566.0, 770.0, 636.0, 477.0,
-    617.0, 710.0, 680.0, 888.0, 700.0, 659.0, 653.0, 271.0, 500.0, 271.0, 500.0, 501.0, 333.0,
-    504.0, 521.0, 412.0, 514.0, 431.0, 327.0, 469.0, 532.0, 270.0, 224.0, 474.0, 272.0, 785.0,
-    532.0, 508.0, 525.0, 523.0, 362.0, 364.0, 323.0, 518.0, 470.0, 667.0, 457.0, 422.0, 424.0,
-    479.0, 500.0, 479.0, 667.0,
+    4.0, 3.503997802734375, 6.4959869384765625, 10.6719970703125, 7.167999267578125, 13.167999267578125, 11.663986206054688, 2.8319854736328125, 4.6719970703125, 4.6719970703125, 6.8319854736328125, 10.6719970703125, 3.503997802734375,
+    5.00799560546875, 3.503997802734375, 8.0, 7.503997802734375, 7.503997802734375, 7.503997802734375, 7.503997802734375, 7.503997802734375, 7.503997802734375, 7.503997802734375, 7.503997802734375, 7.503997802734375, 7.503997802734375,
+    3.503997802734375, 3.503997802734375, 10.6719970703125, 10.6719970703125, 10.6719970703125, 5.839996337890625, 14.6719970703125, 10.863998413085938, 9.887985229492188, 10.159988403320312, 12.33599853515625, 10.527999877929688, 9.055999755859375,
+    12.33599853515625, 12.255996704101562, 5.6639862060546875, 5.3279876708984375, 11.855987548828125, 9.215988159179688, 13.551986694335938, 12.367996215820312, 12.479995727539062, 9.055999755859375, 12.319992065429688, 10.175994873046875, 7.631988525390625,
+    9.871994018554688, 11.3599853515625, 10.879989624023438, 14.207992553710938, 11.199996948242188, 10.543991088867188, 10.447998046875, 4.33599853515625, 8.0, 4.33599853515625, 8.0, 8.0159912109375, 5.3279876708984375,
+    8.063995361328125, 8.33599853515625, 6.5919952392578125, 8.2239990234375, 6.89599609375, 5.23199462890625, 7.503997802734375, 8.511993408203125, 4.3199920654296875, 3.5839996337890625, 7.5839996337890625, 4.35198974609375, 12.55999755859375,
+    8.511993408203125, 8.12799072265625, 8.399993896484375, 8.367996215820312, 5.7919921875, 5.8239898681640625, 5.167999267578125, 8.287994384765625, 7.519989013671875, 10.6719970703125, 7.3119964599609375, 6.7519989013671875, 6.78399658203125,
+    7.6639862060546875, 8.0, 7.6639862060546875, 10.6719970703125,
 ];
 
-/// PingFang SC's hmtx advance for U+0080..=U+00FF. The C1 controls have no cmap
-/// entry in either identity face and take its .notdef advance, which is what a
-/// byte string shaped inside a PingFang run reads: 1000 units per byte, so a
-/// probe that passes UTF-8 bytes as latin-1 text sums them like any other run.
+/// PingFang SC's advance for U+0080..=U+00FF at 16px, in pixels. The C1
+/// controls have no cmap entry in either identity face and take its .notdef
+/// advance, which is what a byte string shaped inside a PingFang run reads:
+/// 16px per byte, so a probe that passes UTF-8 bytes as latin-1 text sums them
+/// like any other run.
 const MACOS_SANS_LATIN1: [f32; 128] = [
-    1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0,
-    1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0,
-    1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 333.0, 333.0, 600.0, 600.0,
-    600.0, 600.0, 195.0, 600.0, 500.0, 802.0, 355.0, 565.0, 605.0, 333.0, 802.0, 683.0, 331.0,
-    605.0, 500.0, 500.0, 333.0, 560.0, 559.0, 500.0, 290.0, 500.0, 385.0, 565.0, 1000.0, 1000.0,
-    1000.0, 537.0, 657.0, 657.0, 657.0, 657.0, 657.0, 657.0, 950.0, 728.0, 637.0, 637.0, 637.0,
-    637.0, 237.0, 237.0, 237.0, 237.0, 714.0, 719.0, 767.0, 767.0, 767.0, 767.0, 767.0, 605.0,
-    767.0, 714.0, 714.0, 714.0, 714.0, 662.0, 642.0, 632.0, 559.0, 559.0, 559.0, 559.0, 559.0,
-    559.0, 910.0, 547.0, 555.0, 555.0, 555.0, 555.0, 256.0, 256.0, 256.0, 256.0, 588.0, 559.0,
-    586.0, 586.0, 586.0, 586.0, 586.0, 605.0, 586.0, 560.0, 560.0, 560.0, 560.0, 496.0, 586.0,
-    496.0,
+    16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
+    16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
+    16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 5.3279876708984375, 5.3279876708984375, 9.599990844726562, 9.599990844726562,
+    9.599990844726562, 9.599990844726562, 3.1199951171875, 9.599990844726562, 8.0, 12.831985473632812, 5.67999267578125, 9.039993286132812, 9.67999267578125, 0.0, 12.831985473632812, 10.927993774414062, 5.295989990234375,
+    9.67999267578125, 8.0, 8.0, 5.3279876708984375, 8.959991455078125, 8.943984985351562, 8.0, 4.6399993896484375, 8.0, 6.1599884033203125, 9.039993286132812, 16.0, 16.0,
+    16.0, 8.591995239257812, 10.511993408203125, 10.511993408203125, 10.511993408203125, 10.511993408203125, 10.511993408203125, 10.511993408203125, 15.199996948242188, 11.647994995117188, 10.191986083984375, 10.191986083984375, 10.191986083984375,
+    10.191986083984375, 3.7919921875, 3.7919921875, 3.7919921875, 3.7919921875, 11.423995971679688, 11.503997802734375, 12.271987915039062, 12.271987915039062, 12.271987915039062, 12.271987915039062, 12.271987915039062, 9.67999267578125,
+    12.271987915039062, 11.423995971679688, 11.423995971679688, 11.423995971679688, 11.423995971679688, 10.591995239257812, 10.271987915039062, 10.11199951171875, 8.943984985351562, 8.943984985351562, 8.943984985351562, 8.943984985351562, 8.943984985351562,
+    8.943984985351562, 14.55999755859375, 8.751998901367188, 8.879989624023438, 8.879989624023438, 8.879989624023438, 8.879989624023438, 4.0959930419921875, 4.0959930419921875, 4.0959930419921875, 4.0959930419921875, 9.407989501953125, 8.943984985351562,
+    9.375991821289062, 9.375991821289062, 9.375991821289062, 9.375991821289062, 9.375991821289062, 9.67999267578125, 9.375991821289062, 8.959991455078125, 8.959991455078125, 8.959991455078125, 8.959991455078125, 7.9359893798828125, 9.375991821289062,
+    7.9359893798828125,
 ];
 
-/// Songti SC's hmtx advance for U+0080..=U+00FF, same convention as the sans
-/// table above.
+/// Songti SC's advance for U+0080..=U+00FF at 16px in pixels, same convention
+/// as the sans table above.
 const MACOS_SERIF_LATIN1: [f32; 128] = [
-    1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0,
-    1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0,
-    1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 250.0, 219.0, 417.0, 573.0,
-    1000.0, 692.0, 500.0, 1000.0, 1000.0, 760.0, 260.0, 365.0, 667.0, 1000.0, 760.0, 500.0,
-    1000.0, 1000.0, 313.0, 313.0, 333.0, 532.0, 448.0, 1000.0, 333.0, 313.0, 333.0, 365.0, 813.0,
-    813.0, 823.0, 365.0, 679.0, 679.0, 679.0, 679.0, 679.0, 679.0, 897.0, 635.0, 658.0, 658.0,
-    658.0, 658.0, 354.0, 354.0, 354.0, 354.0, 771.0, 773.0, 780.0, 780.0, 780.0, 781.0, 780.0,
-    1000.0, 781.0, 710.0, 710.0, 710.0, 710.0, 659.0, 566.0, 500.0, 506.0, 506.0, 457.0, 457.0,
-    457.0, 457.0, 583.0, 412.0, 432.0, 432.0, 432.0, 417.0, 229.0, 229.0, 233.0, 233.0, 521.0,
-    511.0, 511.0, 511.0, 507.0, 507.0, 507.0, 1000.0, 510.0, 517.0, 517.0, 493.0, 517.0, 430.0,
-    525.0, 422.0,
+    16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
+    16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0,
+    16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 4.0, 3.503997802734375, 6.6719970703125, 9.167999267578125,
+    16.0, 11.071990966796875, 8.0, 16.0, 16.0, 12.159988403320312, 4.1599884033203125, 5.839996337890625, 10.6719970703125, 0.0, 12.159988403320312, 8.0,
+    16.0, 16.0, 5.00799560546875, 5.00799560546875, 5.3279876708984375, 8.511993408203125, 7.167999267578125, 16.0, 5.3279876708984375, 5.00799560546875, 5.3279876708984375, 5.839996337890625, 13.00799560546875,
+    13.00799560546875, 13.167999267578125, 5.839996337890625, 10.863998413085938, 10.863998413085938, 10.863998413085938, 10.863998413085938, 10.863998413085938, 10.863998413085938, 14.35198974609375, 10.159988403320312, 10.527999877929688, 10.527999877929688,
+    10.527999877929688, 10.527999877929688, 5.6639862060546875, 5.6639862060546875, 5.6639862060546875, 5.6639862060546875, 12.33599853515625, 12.367996215820312, 12.479995727539062, 12.479995727539062, 12.479995727539062, 12.495986938476562, 12.479995727539062,
+    16.0, 12.495986938476562, 11.3599853515625, 11.3599853515625, 11.3599853515625, 11.3599853515625, 10.543991088867188, 9.055999755859375, 8.0, 8.095993041992188, 8.095993041992188, 7.3119964599609375, 7.3119964599609375,
+    7.3119964599609375, 7.3119964599609375, 9.327987670898438, 6.5919952392578125, 6.9119873046875, 6.9119873046875, 6.9119873046875, 6.6719970703125, 3.6639862060546875, 3.6639862060546875, 3.727996826171875, 3.727996826171875, 8.33599853515625,
+    8.175994873046875, 8.175994873046875, 8.175994873046875, 8.11199951171875, 8.11199951171875, 8.11199951171875, 16.0, 8.159988403320312, 8.271987915039062, 8.271987915039062, 7.8879852294921875, 8.271987915039062, 6.8799896240234375,
+    8.399993896484375, 6.7519989013671875,
 ];
 
-/// Punctuation outside the Latin-1 block that the identity faces widen.
-const MACOS_SANS_PUNCTUATION: [(char, f32); 3] =
-    [('\u{2022}', 500.0), ('\u{201C}', 537.0), ('\u{2019}', 340.0)];
-const MACOS_SERIF_PUNCTUATION: [(char, f32); 3] =
-    [('\u{2022}', 354.0), ('\u{201C}', 389.0), ('\u{2019}', 268.0)];
+/// Punctuation outside the Latin-1 block that the identity faces widen, at
+/// 16px in pixels.
+const MACOS_SANS_PUNCTUATION: [(char, f32); 3] = [
+    ('\u{2022}', 8.0),
+    ('\u{201C}', 8.592000007629395),
+    ('\u{2019}', 5.440000057220459),
+];
+const MACOS_SERIF_PUNCTUATION: [(char, f32); 3] = [
+    ('\u{2022}', 5.664000034332275),
+    ('\u{201C}', 6.223999977111816),
+    ('\u{2019}', 4.288000106811523),
+];
 
 /// The faces' standard ligatures ('liga'), which a browser applies to ordinary
 /// text and which change a run's width where the shaped stand-in ligates
 /// differently. Longest pattern first. Songti SC's are AAT ligatures and its
-/// 'ff' is 654 units against PingFang's 686, which a 64-character hex string
+/// 'ff' is 10.464px against PingFang's 10.976, which a 64-character hex string
 /// containing one 'ff' reads as 4.8px at 150px.
 const MACOS_SANS_LIGATURES: [(&str, f32); 5] = [
-    ("ffi", 921.0),
-    ("ffl", 921.0),
-    ("ff", 686.0),
-    ("fi", 608.0),
-    ("fl", 608.0),
+    ("ffi", 14.736000061035156),
+    ("ffl", 14.736000061035156),
+    ("ff", 10.97599983215332),
+    ("fi", 9.727999687194824),
+    ("fl", 9.727999687194824),
 ];
 const MACOS_SERIF_LIGATURES: [(&str, f32); 5] = [
-    ("ffi", 883.0),
-    ("ffl", 899.0),
-    ("ff", 654.0),
-    ("fi", 556.0),
-    ("fl", 572.0),
+    ("ffi", 14.128000259399414),
+    ("ffl", 14.383999824523926),
+    ("ff", 10.46399974822998),
+    ("fi", 8.895999908447266),
+    ("fl", 9.152000427246094),
 ];
 
 /// Whether the identity's faces have no glyph for `ch`, so a browser draws the
@@ -399,8 +417,8 @@ fn identity_last_resort_rune(ch: char) -> bool {
     )
 }
 
-/// One character's advance in the identity face's own em, or `None` when the
-/// face has no glyph for it.
+/// One character's advance at 16px in pixels, or `None` when the face has no
+/// glyph for it.
 fn identity_glyph(ch: char, face: IdentityFace, bold: bool) -> Option<f32> {
     let code = ch as u32;
     if (0x20..=0x7E).contains(&code) {
@@ -411,13 +429,13 @@ fn identity_glyph(ch: char, face: IdentityFace, bold: bool) -> Option<f32> {
     }
     // CJK Unified Ideographs carry the face's full-width advance.
     if (0x4E00..=0x9FFF).contains(&code) {
-        return Some(1000.0);
+        return Some(16.0);
     }
     // So do the rest of the East Asian wide and fullwidth ranges this face
     // covers: kana, CJK punctuation, compatibility ideographs and fullwidth
     // forms all answer one em (measured: 'あ', '、' and 'Ａ' are 16px at 16px).
     if identity_wide_rune(ch) {
-        return Some(1000.0);
+        return Some(16.0);
     }
     face.punctuation()
         .iter()
@@ -432,7 +450,7 @@ fn identity_glyph(ch: char, face: IdentityFace, bold: bool) -> Option<f32> {
 ///
 /// An emoji cluster is the exception. No face of the identity covers it, so
 /// every rune a last-resort fallback would stand in for makes the whole cluster
-/// one glyph: `😀` and `👨‍👩‍👧‍👦` both measure a single 999-unit advance
+/// one glyph: `😀` and `👨‍👩‍👧‍👦` both measure a single 15.984px advance
 /// instead of one advance per code point.
 fn identity_cluster_units(cluster: &str, face: IdentityFace, bold: bool) -> Option<f32> {
     if cluster.is_empty() {
@@ -457,7 +475,7 @@ fn identity_cluster_units(cluster: &str, face: IdentityFace, bold: bool) -> Opti
 /// A macOS identity carries no emoji font at all, so the last-resort cluster
 /// answers for *every* family and not only for the two generics that have an
 /// advance table: a page that measures an emoji in the default font sees the
-/// same single 999-unit glyph the generics report.
+/// same single 15.984px glyph the generics report.
 fn identity_measured_cluster(
     face: Option<IdentityFace>,
     table: Option<&'static crate::font_tables::FontTable>,
@@ -469,7 +487,7 @@ fn identity_measured_cluster(
         return None;
     }
     // A family macOS ships a font for answers that font's own advances and
-    // kern pairs, scaled to the 1000-unit em this metric path assumes. It
+    // kern pairs, scaled to the 16px advance this metric path assumes. It
     // outranks the identity face: a named family resolves to a bundled
     // stand-in, whose identity face would otherwise answer the identity's own
     // face for it (Courier reading back PingFang's width). A cluster the table
@@ -499,9 +517,9 @@ fn identity_measured_cluster(
     None
 }
 
-/// One cluster's units in a family table's own em, the kern pair with the
-/// cluster before it included. `None` when the table does not carry every
-/// character of the cluster.
+/// One cluster's advance at 16px in pixels, the kern pair with the cluster
+/// before it included. `None` when the table does not carry every character
+/// of the cluster.
 fn table_cluster_units(
     table: &'static crate::font_tables::FontTable,
     previous: Option<char>,
@@ -519,7 +537,7 @@ fn table_cluster_units(
         }
         before = Some(ch);
     }
-    Some(units * 1000.0 / table.upem)
+    Some(units * 1000.0 / table.upem * 16.0 / 1000.0)
 }
 
 /// East Asian wide and fullwidth characters: the ranges the identity's CJK face
@@ -542,7 +560,7 @@ fn identity_wide_rune(ch: char) -> bool {
 }
 
 /// The ligature the identity face would form at `text[offset..]`, longest
-/// pattern first, with its advance in font units.
+/// pattern first, with its advance at 16px in pixels.
 fn identity_ligature_at(
     text: &str,
     offset: usize,
@@ -578,11 +596,11 @@ fn identity_ligature_spans(text: &str, face: IdentityFace) -> (Vec<(usize, usize
     (spans, units)
 }
 
-/// Scale a face unit count to pixels the way a browser's 26.6/16.16 pipeline
-/// does, so a value derived from font units is bit-identical to the reference
-/// rather than merely close.
-fn identity_units_to_px(units: f32, size: f32, units_per_em: f32) -> f32 {
-    units * size / units_per_em
+/// Scale a 16px advance to pixels at `size` the way a browser's 26.6/16.16
+/// pipeline does, so a stored reference value stays bit-identical at 16px
+/// rather than merely close. `base` is the size the advance was measured at.
+fn identity_units_to_px(units: f32, size: f32, base: f32) -> f32 {
+    units * size / base
 }
 
 /// Union of two ink boxes, each `(left, right, ascent, descent)`.
@@ -617,7 +635,7 @@ fn identity_line(item: &InlineItem, run: &cosmic_text::LayoutRun, line_w: f32) -
     // ligatures included -- the reference's own measured pairs carry those
     // ('ff' in Arial measures 37 units under the plain sum). The identity
     // face's ligature table belongs to a different font and must not override
-    // it: `fl` in Courier answered the stand-in sans ligature (608 units)
+    // it: `fl` in Courier answered the stand-in sans ligature (9.728px)
     // instead of Courier's two 1229-unit advances.
     let (ligature_spans, mut units) = match (table, face) {
         (None, Some(face)) => identity_ligature_spans(run.text, face),
@@ -682,13 +700,13 @@ fn snap_layout_unit(value: f32) -> f32 {
 }
 
 /// Pixel width of a scaled unit count, zero when the line had no covered text
-/// (and so no font size to scale by). Both identity faces share the 1000-unit
-/// em.
+/// (and so no font size to scale by). Both identity faces store their advances
+/// at 16px.
 fn identity_width(units: f32, size: f32) -> f32 {
     if units == 0.0 {
         0.0
     } else {
-        identity_units_to_px(units, size, MACOS_SANS_METRICS.units_per_em)
+        identity_units_to_px(units, size, 16.0)
     }
 }
 
@@ -3894,7 +3912,7 @@ impl TextEngine {
             let mut emoji_ink: Option<(f32, f32, f32, f32)> = None;
             for ((left, right, top, bottom), font_size) in emoji_specs {
                 let px = |units: f32| {
-                    identity_units_to_px(units, font_size, MACOS_SANS_METRICS.units_per_em)
+                    identity_units_to_px(units, font_size, 16.0)
                 };
                 emoji_ink = ink_union(
                     emoji_ink,
@@ -5869,7 +5887,7 @@ fn identity_cursor_x(
                 x += identity_units_to_px(
                     units,
                     glyph.font_size,
-                    MACOS_SANS_METRICS.units_per_em,
+                    16.0,
                 );
                 counted.push(span);
             }
