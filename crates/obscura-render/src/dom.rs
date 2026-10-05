@@ -7054,6 +7054,20 @@ fn try_incremental_tree_updates(
         if !root_is_text && styles.get(&root).is_none() {
             return resync_reject("inserted-root-uncascaded", root);
         }
+        // A boxless root (display:contents or a flattenable inline wrapper)
+        // expands into its children below instead of running the normal
+        // inline pipeline. With text underneath, those leaves would be
+        // built on the detach/attach path and the paragraph can silently
+        // lose its line boxes; force the full rebuild instead. An empty
+        // wrapper still expands cheaply.
+        let root_is_boxless_inline = !root_is_text
+            && styles.get(&root).is_some_and(|style| {
+                (style.display_contents && style.display != crate::Display::None)
+                    || is_flattenable_inline(tree, root, styles)
+            });
+        if root_is_boxless_inline && subtree_contains_text(tree, root) {
+            return resync_reject("boxless-inline-text", root);
+        }
         build_any_for_resync(tree, root, state, styles, engine);
     }
 
@@ -13604,6 +13618,16 @@ fn is_flattenable_inline(
         && style.position.is_none()
         && !style.overflow_hidden
         && style.float.is_none()
+}
+
+/// Whether the DOM subtree rooted at `root` contains any text node. The
+/// resync path uses this to keep boxless inline wrappers with text out of
+/// the incremental expansion (their line boxes need the full pipeline).
+fn subtree_contains_text(tree: &DomTree, root: NodeId) -> bool {
+    tree.descendants(root).into_iter().any(|id| {
+        tree.get_node(id)
+            .is_some_and(|node| matches!(node.data, obscura_dom::tree::NodeData::Text { .. }))
+    })
 }
 
 /// Split a text node into one taffy leaf per word (a whitespace-delimited
