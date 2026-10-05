@@ -16124,6 +16124,116 @@ fn is_in_flow_grid_item(
     }
 }
 
+/// The width Chrome transfers onto a replaced box whose auto main axis faces a
+/// stretched flex cross axis: the stretch pass makes the used cross size
+/// definite, and the still-auto main size then resolves from it through the
+/// intrinsic ratio. An attribute-free 300x150 canvas in a 600x400 row flex
+/// container therefore measures 800x400, not 300x400. Taffy's stretch pass only
+/// writes the cross size (flexbox.rs notes it never affects the main size), so
+/// the transferred width is derived here. Returns `None` when the item is not a
+/// stretched row flex item with a definite cross size, or when cross-axis box
+/// details (auto margins, percent or relative padding, borders) would make the
+/// stretch outcome ambiguous.
+fn flex_stretch_transferred_width(
+    tree: &DomTree,
+    id: NodeId,
+    style: &crate::LayoutStyle,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    width: f32,
+    height: f32,
+) -> Option<f32> {
+    if matches!(style.position, Some(taffy::Position::Absolute)) {
+        return None;
+    }
+    // An auto cross-axis margin cancels the stretch entirely.
+    if style.margin_auto[0]
+        || style.margin_auto[2]
+        || style.margin_percent[0].is_some()
+        || style.margin_percent[2].is_some()
+        || style.margin_relative[0].is_some()
+        || style.margin_relative[2].is_some()
+        || style.margin_expressions[0].is_some()
+        || style.margin_expressions[2].is_some()
+    {
+        return None;
+    }
+    // The transferred width comes from the content-box cross size; padding or
+    // borders on the item's cross axis would need box adjustments that are not
+    // modeled here.
+    if style.padding.top != 0.0
+        || style.padding.bottom != 0.0
+        || style.border.top != 0.0
+        || style.border.bottom != 0.0
+        || style.padding_percent[0].is_some()
+        || style.padding_percent[2].is_some()
+        || style.padding_relative[0].is_some()
+        || style.padding_relative[2].is_some()
+        || style.padding_expressions[0].is_some()
+        || style.padding_expressions[2].is_some()
+    {
+        return None;
+    }
+    let mut parent = rendered_parent(tree, id);
+    let parent_style = loop {
+        let Some(parent_id) = parent else {
+            return None;
+        };
+        let Some(parent_style) = styles.get(&parent_id) else {
+            return None;
+        };
+        if parent_style.display_contents {
+            parent = rendered_parent(tree, parent_id);
+            continue;
+        }
+        break parent_style;
+    };
+    if parent_style.display != crate::Display::Flex || parent_style.internal_flex_container {
+        return None;
+    }
+    if matches!(
+        parent_style.flex_direction,
+        Some(taffy::FlexDirection::Column | taffy::FlexDirection::ColumnReverse)
+    ) {
+        return None;
+    }
+    // A wrapped container's line cross size is not the container's content
+    // height, and this derivation assumes a single line.
+    if matches!(
+        parent_style.flex_wrap,
+        Some(taffy::FlexWrap::Wrap | taffy::FlexWrap::WrapReverse)
+    ) {
+        return None;
+    }
+    if used_flex_alignment(style.align_self, parent_style.align_items) != taffy::AlignSelf::STRETCH {
+        return None;
+    }
+    let crate::Dimension::Px(parent_height) = parent_style.height else {
+        return None;
+    };
+    if parent_style.padding_percent[0].is_some()
+        || parent_style.padding_percent[2].is_some()
+        || parent_style.padding_relative[0].is_some()
+        || parent_style.padding_relative[2].is_some()
+        || parent_style.padding_expressions[0].is_some()
+        || parent_style.padding_expressions[2].is_some()
+    {
+        return None;
+    }
+    let container_cross = match parent_style.box_sizing {
+        crate::BoxSizing::ContentBox => parent_height,
+        crate::BoxSizing::BorderBox => {
+            parent_height
+                - parent_style.padding.top
+                - parent_style.padding.bottom
+                - parent_style.border.top
+                - parent_style.border.bottom
+        }
+        crate::BoxSizing::Inherit => return None,
+    };
+    let used_cross = container_cross - style.margin.top - style.margin.bottom;
+    Some((used_cross * (width / height)).max(0.0))
+}
+
 fn build(
     tree: &DomTree,
     id: NodeId,
@@ -16357,11 +16467,30 @@ fn build(
                     && !has_percentage_constraint
                     && !is_in_flow_grid_item(tree, id, style, styles)
                 {
-                    let constrained =
-                        crate::inline::constrained_auto_replaced_size(width, height, style);
-                    taffy_style.size.width = taffy::Dimension::length(constrained.width);
-                    if has_definite_constraint {
-                        taffy_style.size.height = taffy::Dimension::length(constrained.height);
+                    // A stretched row flex item has its cross size made definite
+                    // before the auto main size resolves, so Chrome derives the
+                    // width from the stretched height through the intrinsic
+                    // ratio (a 600x400 container gives an attribute-free canvas
+                    // 800x400). Seed that transferred width; the flex pass only
+                    // rewrites it if the item is allowed to shrink, so exempt
+                    // the transferred width from shrinking to keep the overflow
+                    // Chrome shows. Definite min/max constraints keep the
+                    // ratio-preserving constraint table instead.
+                    let transferred = if has_definite_constraint {
+                        None
+                    } else {
+                        flex_stretch_transferred_width(tree, id, style, styles, width, height)
+                    };
+                    if let Some(transferred) = transferred {
+                        taffy_style.size.width = taffy::Dimension::length(transferred);
+                        taffy_style.flex_shrink = 0.0;
+                    } else {
+                        let constrained =
+                            crate::inline::constrained_auto_replaced_size(width, height, style);
+                        taffy_style.size.width = taffy::Dimension::length(constrained.width);
+                        if has_definite_constraint {
+                            taffy_style.size.height = taffy::Dimension::length(constrained.height);
+                        }
                     }
                 }
             }
