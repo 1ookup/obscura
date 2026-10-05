@@ -118,6 +118,7 @@ const _GPU_APPLE = {
     maxComputeWorkgroupsPerDimension: 65535,
     minSubgroupSize: null,
     maxSubgroupSize: null,
+    maxImmediateSize: 64,
     maxStorageBuffersInFragmentStage: 10,
     maxStorageTexturesInFragmentStage: 8,
     maxStorageBuffersInVertexStage: 10,

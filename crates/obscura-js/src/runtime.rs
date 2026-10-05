@@ -31405,10 +31405,6 @@ RequestRedirect value",
             );
             assert_eq!(device[name].as_u64(), Some(*low), "device.limits.{name}");
         }
-        // Fields only one tier carries stay pinned too: the oracle's adapter
-        // row has no maxImmediateSize to enumerate, the device row has it.
-        assert_eq!(adapter["maxImmediateSize"].as_u64(), None);
-        assert_eq!(device["maxImmediateSize"].as_u64(), Some(64));
     }
 
     /// The full Apple M-series tier against the default-granted one, from the
@@ -31429,6 +31425,7 @@ RequestRedirect value",
         ("maxComputeWorkgroupsPerDimension", 65535, 65535),
         ("maxDynamicStorageBuffersPerPipelineLayout", 8, 4),
         ("maxDynamicUniformBuffersPerPipelineLayout", 10, 8),
+        ("maxImmediateSize", 64, 64),
         ("maxInterStageShaderVariables", 28, 16),
         ("maxSampledTexturesPerShaderStage", 48, 16),
         ("maxSamplersPerShaderStage", 16, 16),
