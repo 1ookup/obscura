@@ -269,21 +269,11 @@ var Document = _swappableInterface('Document', class extends Node {
     if (result.value) return;
     throw new DOMException('requestStorageAccess not allowed', 'NotAllowedError');
   }
-  async requestStorageAccessFor(requestedOrigin) {
-    _documentPrivacyRoot(this, 'requestStorageAccessFor');
-    if (arguments.length < 1) {
-      throw new TypeError(
-        "Failed to execute 'requestStorageAccessFor' on 'Document': 1 argument required, but only 0 present.");
-    }
-    let requested;
-    try { requested = new URL(String(requestedOrigin), this.URL).origin; }
-    catch (_error) { throw new DOMException('requestStorageAccessFor not allowed', 'NotAllowedError'); }
-    // Read the Window's location rather than `this.location`: the latter is an
-    // own accessor that page-init installs per realm, and this method must not
-    // depend on that having run.
-    if (requested === globalThis.location.origin) return;
-    throw new DOMException('requestStorageAccessFor not allowed', 'NotAllowedError');
-  }
+  // document.requestStorageAccessFor is not part of the Chrome 154 surface:
+  // the live probe answers `in document` false in the top document and in a
+  // cross-origin frame alike, while the sibling requestStorageAccess and
+  // hasStorageAccess both answer true, so its absence is a real signal, not
+  // an environment cut. Removed with the rest of the 149-era extras.
   captureEvents() { _documentPrivacyRoot(this, 'captureEvents'); }
   releaseEvents() { _documentPrivacyRoot(this, 'releaseEvents'); }
   clear() { _documentPrivacyRoot(this, 'clear'); }

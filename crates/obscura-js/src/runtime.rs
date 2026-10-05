@@ -6027,7 +6027,7 @@ mod tests {
             .evaluate_for_cdp(
                 r#"(async () => {
                     const lengths = {
-                        requestStorageAccess: 0, requestStorageAccessFor: 1,
+                        requestStorageAccess: 0,
                         exitFullscreen: 0, exitPictureInPicture: 0,
                         startViewTransition: 0, moveBefore: 2,
                     };
@@ -6074,11 +6074,10 @@ mod tests {
                         shapes,
                         storage: {
                             request: await outcome(() => document.requestStorageAccess()),
-                            same: await outcome(() =>
-                                document.requestStorageAccessFor(document.location.origin)),
-                            other: await outcome(() =>
-                                document.requestStorageAccessFor('https://other.example')),
-                            missing: await outcome(() => document.requestStorageAccessFor()),
+                            // Chrome 154 carries no requestStorageAccessFor;
+                            // pin its absence next to the surviving sibling.
+                            forAbsent: [typeof document.requestStorageAccessFor,
+                                'requestStorageAccessFor' in Document.prototype],
                         },
                         exits: {
                             fullscreen: await outcome(() => document.exitFullscreen()),
@@ -6116,7 +6115,7 @@ mod tests {
             .value
             .unwrap();
         let names = [
-            ("requestStorageAccess", 0), ("requestStorageAccessFor", 1),
+            ("requestStorageAccess", 0),
             ("exitFullscreen", 0), ("exitPictureInPicture", 0),
             ("startViewTransition", 0), ("moveBefore", 2),
         ];
@@ -6129,11 +6128,8 @@ mod tests {
             serde_json::json!({
                 "shapes": shapes,
                 "storage": {
-                    "request": {}, "same": {},
-                    "other": {"name": "NotAllowedError",
-                        "message": "requestStorageAccessFor not allowed"},
-                    "missing": {"name": "TypeError",
-                        "message": "Failed to execute 'requestStorageAccessFor' on 'Document': 1 argument required, but only 0 present."},
+                    "request": {},
+                    "forAbsent": ["undefined", false],
                 },
                 "exits": {
                     "fullscreen": {"name": "TypeError",

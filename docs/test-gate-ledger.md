@@ -513,3 +513,11 @@ run covers are then removed.
   scope strip extended instead; the census, persona, webidl and screen
   orientation tests flip to the 154 answers; full gate deferred to the
   next backfill
+
+- document.requestStorageAccessFor removed (10-05): scoped: obscura-js
+  750/751 with the known load-jitter digest flake (worker_dense_digest_loop
+  passes in isolation, 0.42s); the live Chrome 154 probe answers
+  `in document` false in the top document and in a cross-origin frame while
+  requestStorageAccess and hasStorageAccess both answer true, so the name
+  leaves the Document prototype and its behavior test pins the absence;
+  full gate deferred to the next backfill
