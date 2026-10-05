@@ -14666,14 +14666,21 @@ RequestRedirect value",
         );
     }
 
-    /// A worker's clock keeps the 100 microsecond quantum but reads back
-    /// through float32: its smallest observable step sits one float32 epsilon
-    /// away from 0.1 (Chrome 153 oracle: 0.09999999403953552), where a
-    /// document's step is the plain double `n * 0.1`. A step that reads as
-    /// double-clean is a clock no browser exposes, in a loop the challenge
-    /// times from inside the worker.
+    /// Two realms, one clock model: a browser's performance.now() is not a
+    /// clean multiple of 0.1. The document realm and a worker realm both walk
+    /// a 0.5 ms macro anchor in steps of one of two neighbouring doubles,
+    /// 0x3fb9999900000000 and 0x3fb9999a00000000, so the smallest positive
+    /// step between consecutive readings is the lower ring member exactly,
+    /// never the double-clean 0.1. A step that reads as double-clean is a
+    /// clock no browser ships, in a loop the challenge times from inside the
+    /// worker.
     #[tokio::test(flavor = "current_thread")]
-    async fn worker_performance_now_step_carries_a_float32_quantum() {
+    async fn performance_now_step_lands_on_the_browser_ring_in_both_realms() {
+        // 0.09999996423721313, the ring's lower member this test pins.
+        const C8_BITS: u64 = 0x3fb9_9999_0000_0000;
+        // 0x3fb999999999999a, the double-clean 0.1; pinned separately so a
+        // clean-shaped step can never satisfy both assertions.
+        const CLEAN_BITS: u64 = 0.1f64.to_bits();
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
             "worker-clock-shape",
@@ -14688,7 +14695,7 @@ RequestRedirect value",
                     '    if (step > 0 && step < smallest) smallest = step;' +
                     '    previous = value;' +
                     '  }' +
-                    '  self.postMessage({ smallest: String(smallest) });' +
+                    '  self.postMessage(smallest);' +
                     '};';
                 const worker = new Worker(URL.createObjectURL(
                     new Blob([source], { type: 'text/javascript' })));
@@ -14698,28 +14705,44 @@ RequestRedirect value",
         )
         .unwrap();
         rt.run_event_loop_bounded(5000).await.unwrap();
-        let shape = rt.evaluate("globalThis.__clockShape").unwrap();
-        let smallest: f64 = shape["smallest"]
-            .as_str()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0.0);
-        assert!(smallest > 0.0, "worker reported no positive step: {shape}");
-        let drift = (smallest - 0.1).abs();
-        // float32 epsilon on a 0.1 quantum is 1.5e-8; a double-quantised step
-        // drifts 1e-13 and would read as a clock no browser ships.
+        let worker_smallest = rt
+            .evaluate("globalThis.__clockShape")
+            .unwrap()
+            .as_f64()
+            .unwrap_or(f64::NAN);
         assert!(
-            (1e-9..1e-6).contains(&drift),
-            "worker clock step {smallest} is not float32 shaped: drift {drift}",
+            worker_smallest > 0.0,
+            "worker reported no positive step: {worker_smallest}",
         );
-        // The document clock keeps the plain double quantum.
-        let document_step = rt
+        assert_eq!(
+            worker_smallest.to_bits(),
+            C8_BITS,
+            "worker smallest positive step {worker_smallest} is not the lower ring member",
+        );
+        assert_ne!(
+            worker_smallest.to_bits(),
+            CLEAN_BITS,
+            "worker smallest positive step is the double-clean 0.1",
+        );
+        // The document realm walks the same ring with the same steps, so its
+        // smallest positive step is the same double bit for bit.
+        let document_smallest = rt
             .evaluate(
                 "(function(){let s=Infinity,p=0;for(let i=0;i<20000;i++){const v=performance.now();const d=v-p;if(d>0&&d<s)s=d;p=v;}return s;})()",
             )
             .unwrap()
             .as_f64()
             .unwrap();
-        assert!((document_step - 0.1).abs() < 1e-9, "document step {document_step}");
+        assert_eq!(
+            document_smallest.to_bits(),
+            C8_BITS,
+            "document smallest positive step {document_smallest} is not the lower ring member",
+        );
+        assert_ne!(
+            document_smallest.to_bits(),
+            CLEAN_BITS,
+            "document smallest positive step is the double-clean 0.1",
+        );
     }
 
     /// `performance.timeOrigin` is when navigation started, so it is in the
