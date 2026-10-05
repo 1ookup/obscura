@@ -1810,7 +1810,15 @@ const _chromeInterfaceShells = new Set();
   if (statusConstructor) Object.defineProperty(
     PermissionStatus.prototype, 'constructor', statusConstructor);
 
+  // Receiver identity check first, like the WebIDL binding: a detached or
+  // forged `this` must reject with Illegal invocation before arity applies.
+  const permissionReceivers = new WeakSet();
+  permissionReceivers.add(permissions);
   const query = _markNative(function query(descriptor) {
+    if (!permissionReceivers.has(this)) {
+      return Promise.reject(new TypeError(
+        "Failed to execute 'query' on 'Permissions': Illegal invocation"));
+    }
     if (arguments.length === 0) {
       return Promise.reject(new TypeError(
         "Failed to execute 'query' on 'Permissions': 1 argument required, but only 0 present."));
@@ -1818,14 +1826,13 @@ const _chromeInterfaceShells = new Set();
     const name = descriptor && descriptor.name;
     if (_permissionUnsupportedName(name)) {
       return Promise.reject(new DOMException(
-        "Failed to execute 'query' on 'Permissions': The provided value '"
-        + String(name) + "' is not a supported permission name.",
+        "Failed to execute 'query' on 'Permissions': Push Permission without userVisibleOnly:true isn't supported yet.",
         'NotSupportedError'));
     }
     if (!_permissionKnownName(name)) {
       return Promise.reject(new TypeError(
-        "Failed to execute 'query' on 'Permissions': The provided value '"
-        + String(name) + "' is not a valid permission name."));
+        "Failed to execute 'query' on 'Permissions': Failed to read the 'name' property from 'PermissionDescriptor': The provided value '"
+        + String(name) + "' is not a valid enum value of type PermissionName."));
     }
     const result = Object.create(PermissionStatus.prototype);
     statusState.set(result, {

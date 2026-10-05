@@ -16983,6 +16983,12 @@ RequestRedirect value",
                         empty: await attempt({}),
                         unsupported: await attempt({ name: 'push' }),
                         denied: await attempt({ name: 'periodic-background-sync' }),
+                        brand: await (async () => {
+                            try {
+                                await Permissions.prototype.query.call({}, { name: 'geolocation' });
+                                return 'resolved';
+                            } catch (error) { return 'rejected:' + error.name; }
+                        })(),
                     };
                 })()"#,
                 true,
@@ -17003,6 +17009,7 @@ RequestRedirect value",
                 "empty": { "name": "TypeError" },
                 "unsupported": { "name": "NotSupportedError" },
                 "denied": { "value": ["denied", "periodic_background_sync"] },
+                "brand": "rejected:TypeError",
             })
         );
     }

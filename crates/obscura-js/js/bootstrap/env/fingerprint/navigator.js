@@ -145,10 +145,10 @@ globalThis.navigator = _bootstrapObject('navigator', () => ({
     }
     var n = params && params.name;
     if (_permissionUnsupportedName(n)) {
-      return Promise.reject(new DOMException("Failed to execute 'query' on 'Permissions': The provided value '" + String(n) + "' is not a supported permission name.", 'NotSupportedError'));
+      return Promise.reject(new DOMException("Failed to execute 'query' on 'Permissions': Push Permission without userVisibleOnly:true isn't supported yet.", 'NotSupportedError'));
     }
     if (!_permissionKnownName(n)) {
-      return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': The provided value '" + String(n) + "' is not a valid permission name."));
+      return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': Failed to read the 'name' property from 'PermissionDescriptor': The provided value '" + String(n) + "' is not a valid enum value of type PermissionName."));
     }
     return Promise.resolve({state: _permissionState(n), onchange: null});
   } })),
