@@ -1349,9 +1349,9 @@ mod tests {
             wire_header_names(&raw),
             vec![
                 "sec-ch-ua-platform",
+                "user-agent",
                 "sec-ch-ua",
                 "sec-ch-ua-mobile",
-                "user-agent",
                 "accept",
                 "origin",
                 "sec-fetch-site",
@@ -1369,9 +1369,10 @@ mod tests {
     }
 
     /// A scripted POST body puts `content-length` first and `content-type`
-    /// after the client-hint block, which is Chromium 154's insertion order
-    /// and not the order a list built by hand would produce. The length must
-    /// also be the one the transport sent, not a second copy appended.
+    /// between `sec-ch-ua` and `sec-ch-ua-mobile`, which is Chromium 154's
+    /// insertion order and not the order a list built by hand would produce.
+    /// The length must also be the one the transport sent, not a second copy
+    /// appended.
     #[tokio::test]
     async fn stealth_scripted_post_puts_the_body_headers_in_chromes_slots() {
         let (url, request) = header_fixture().await;
@@ -1400,10 +1401,10 @@ mod tests {
             vec![
                 "content-length",
                 "sec-ch-ua-platform",
-                "sec-ch-ua",
-                "sec-ch-ua-mobile",
                 "user-agent",
+                "sec-ch-ua",
                 "content-type",
+                "sec-ch-ua-mobile",
                 "accept",
                 "origin",
                 "sec-fetch-site",

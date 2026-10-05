@@ -90,30 +90,41 @@ pub(crate) const NAVIGATION_ORDER: &[&str] = &[
     "priority",
 ];
 
-/// Chrome's wire order for a subresource (scripted fetch/XHR, image, script).
+/// Chrome's wire order for a subresource (scripted fetch/XHR, image, script),
+/// in the low-entropy state production runs in: no `Accept-CH` has been
+/// processed, so none of the high-entropy hints are sent.
 ///
-/// Re-measured against Chrome 154.0.8037.93 over HTTP/2 on the Turnstile
-/// platform's `/fo/` POST: `content-length` comes first, the client-hint
-/// block opens with `full-version-list` / `platform` / `sec-ch-ua` /
-/// `bitness`, `cf-chl-ra` lands between the hint runs, `user-agent` and
-/// `content-type` sit after the hints, `cf-chl` lands before the tail hint,
-/// and `priority` closes the list. The two `cf-chl*` names are Cloudflare
-/// challenge headers: they get a slot here so a page that sets them lands
+/// Measured over HTTP/2 against Chrome 154.0.8037.93, twice: on the Turnstile
+/// platform's `/fo/` POST and on a loopback fetch/XHR observatory.
+/// `content-length` comes first on a body, `sec-ch-ua-platform` leads,
+/// `user-agent` follows it, then `sec-ch-ua`, `content-type`, the two
+/// Cloudflare challenge headers, and `sec-ch-ua-mobile`; `priority` closes
+/// the list. The `cf-chl*` names get a slot so a page that sets them lands
 /// them where Chrome does, and they are skipped on every other request.
+///
+/// The six high-entropy slots hold the positions the hint mechanism fills
+/// once an origin has accepted them; they are empty in the low-entropy state
+/// and do not affect the wire order. An earlier re-measurement (384171d)
+/// pinned the hints-accepted order in this table instead: its observatory
+/// presented a trusted certificate, which is what makes Chrome process
+/// `Accept-CH` at all, while production connections are untrusted and stay
+/// low-entropy. The two states place `user-agent` and `cf-chl-ra`
+/// differently and cannot share one table; production is low-entropy, so
+/// that is what is pinned here.
 pub(crate) const SUBRESOURCE_ORDER: &[&str] = &[
     "content-length",
     "sec-ch-ua-full-version-list",
     "sec-ch-ua-platform",
+    "user-agent",
     "sec-ch-ua",
     "sec-ch-ua-bitness",
+    "content-type",
+    "cf-chl",
     "cf-chl-ra",
     "sec-ch-ua-mobile",
     "sec-ch-ua-model",
     "sec-ch-ua-arch",
     "sec-ch-ua-full-version",
-    "user-agent",
-    "content-type",
-    "cf-chl",
     "sec-ch-ua-platform-version",
     "accept",
     "origin",
@@ -406,9 +417,9 @@ mod tests {
             names(&build_chrome_headers(&plan)),
             vec![
                 "sec-ch-ua-platform",
+                "user-agent",
                 "sec-ch-ua",
                 "sec-ch-ua-mobile",
-                "user-agent",
                 "accept",
                 "origin",
                 "sec-fetch-site",
@@ -423,9 +434,9 @@ mod tests {
         );
     }
 
-    // A body moves `content-length` to the front; `content-type` stays in its
-    // table slot after the client-hint block, which is where Chromium 154
-    // puts them and where no hand-rolled list would guess.
+    // A body moves `content-length` to the front; `content-type` sits between
+    // `sec-ch-ua` and `sec-ch-ua-mobile`, which is where Chromium 154 puts it
+    // and where no hand-rolled list would guess.
     #[test]
     fn a_body_puts_content_length_first_and_content_type_in_chromes_slot() {
         let fingerprint = fingerprint();
@@ -449,16 +460,16 @@ mod tests {
             [
                 "content-length",
                 "sec-ch-ua-platform",
-                "sec-ch-ua",
-                "sec-ch-ua-mobile",
                 "user-agent",
+                "sec-ch-ua",
+                "content-type",
             ],
         );
         assert_eq!(value(&build_chrome_headers(&plan), "content-length"), Some("5"));
         let names = names(&build_chrome_headers(&plan));
         let ua = names.iter().position(|name| name == "user-agent").unwrap();
         let ct = names.iter().position(|name| name == "content-type").unwrap();
-        assert_eq!(ct, ua + 1);
+        assert_eq!(ct, ua + 2);
     }
 
     // A form-submission navigation is the same shape as a GET navigation with
