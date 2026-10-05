@@ -471,3 +471,14 @@ run covers are then removed.
   navigator getter returns the constant 3 with no SecureContext gate, and the
   flipped test pins number/true/3 in both the main and the frame realm; full
   gate deferred to the next backfill
+
+- realm key tables realigned to the Chrome 154 census (10-05):
+  scoped: obscura-js 751/751; _chromeWindowKeyOrder,
+  _chromeDocumentKeyOrder, _chromeScreenKeyOrder and
+  _chromeScreenOrientationKeyOrder were regenerated from a fresh
+  frame/top census of the local Chrome 154 (window 1236 entries
+  including the ten removed invented tokens and eleven added 154 names,
+  document 250, screen 16, orientation 10), the difflib against the
+  census now reads zero order edits in all four tables, and the stale
+  screen.orientation order assertion flipped to angle-first; full gate
+  deferred to the next backfill

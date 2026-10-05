@@ -17244,7 +17244,7 @@ RequestRedirect value",
         assert_eq!(
             result,
             serde_json::json!([
-                "type", "angle", "onchange", "lock", "unlock",
+                "angle", "type", "onchange", "lock", "unlock",
                 "addEventListener", "dispatchEvent", "removeEventListener",
             ])
         );
