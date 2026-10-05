@@ -16962,6 +16962,51 @@ RequestRedirect value",
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn permissions_query_rejects_unknown_names_and_maps_status_names() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const attempt = async descriptor => {
+                        try {
+                            const status = await navigator.permissions.query(descriptor);
+                            return { value: [status.state, status.name] };
+                        } catch (error) { return { name: error.name }; }
+                    };
+                    return {
+                        known: await attempt({ name: 'notifications' }),
+                        mapped: await attempt({ name: 'persistent-storage' }),
+                        sensors: await attempt({ name: 'accelerometer' }),
+                        wakeLock: await attempt({ name: 'screen-wake-lock' }),
+                        unknown: await attempt({ name: 'xxxbadxxx' }),
+                        empty: await attempt({}),
+                        unsupported: await attempt({ name: 'push' }),
+                        denied: await attempt({ name: 'periodic-background-sync' }),
+                    };
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "known": { "value": ["prompt", "notifications"] },
+                "mapped": { "value": ["prompt", "durable_storage"] },
+                "sensors": { "value": ["granted", "sensors"] },
+                "wakeLock": { "value": ["granted", "screen_wake_lock"] },
+                "unknown": { "name": "TypeError" },
+                "empty": { "name": "TypeError" },
+                "unsupported": { "name": "NotSupportedError" },
+                "denied": { "value": ["denied", "periodic_background_sync"] },
+            })
+        );
+    }
+
     #[test]
     fn link_elements_use_their_own_interface_and_resolve_urls() {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");

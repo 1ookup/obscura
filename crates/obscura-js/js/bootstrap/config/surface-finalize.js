@@ -1816,6 +1816,17 @@ const _chromeInterfaceShells = new Set();
         "Failed to execute 'query' on 'Permissions': 1 argument required, but only 0 present."));
     }
     const name = descriptor && descriptor.name;
+    if (_permissionUnsupportedName(name)) {
+      return Promise.reject(new DOMException(
+        "Failed to execute 'query' on 'Permissions': The provided value '"
+        + String(name) + "' is not a supported permission name.",
+        'NotSupportedError'));
+    }
+    if (!_permissionKnownName(name)) {
+      return Promise.reject(new TypeError(
+        "Failed to execute 'query' on 'Permissions': The provided value '"
+        + String(name) + "' is not a valid permission name."));
+    }
     const result = Object.create(PermissionStatus.prototype);
     statusState.set(result, {
       name: _permissionStatusName(name), state: _permissionState(name), onchange: null,

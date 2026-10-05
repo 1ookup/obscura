@@ -123,12 +123,29 @@ function _permissionPolicyAllows(name) {
 const _PERMISSION_DEFAULT_PROMPT = new Set([
   'geolocation', 'notifications', 'camera', 'microphone', 'midi',
   'clipboard-read', 'persistent-storage', 'idle-detection', 'local-fonts',
-  'window-management',
+  'window-management', 'display-capture', 'captured-surface-control',
 ]);
 const _PERMISSION_DEFAULT_GRANTED = new Set([
   'clipboard-write', 'background-sync', 'storage-access', 'accelerometer',
   'gyroscope', 'magnetometer', 'payment-handler', 'screen-wake-lock',
 ]);
+const _PERMISSION_DEFAULT_DENIED = new Set(['periodic-background-sync']);
+
+// Chrome rejects unknown permission names with a TypeError and names backed
+// by no implementation with a NotSupportedError. `push` is the one name in
+// that second group a desktop page can reach.
+const _PERMISSION_UNSUPPORTED = new Set(['push']);
+
+function _permissionKnownName(name) {
+  name = String(name);
+  return _PERMISSION_DEFAULT_PROMPT.has(name)
+    || _PERMISSION_DEFAULT_GRANTED.has(name)
+    || _PERMISSION_DEFAULT_DENIED.has(name);
+}
+
+function _permissionUnsupportedName(name) {
+  return _PERMISSION_UNSUPPORTED.has(String(name));
+}
 
 function _permissionState(name) {
   name = String(name || '');
@@ -137,14 +154,28 @@ function _permissionState(name) {
     const permission = globalThis.Notification && Notification.permission;
     return permission === 'granted' || permission === 'denied' ? permission : 'prompt';
   }
+  if (_PERMISSION_DEFAULT_DENIED.has(name)) return 'denied';
   if (_PERMISSION_DEFAULT_GRANTED.has(name)) return 'granted';
   if (_PERMISSION_DEFAULT_PROMPT.has(name)) return 'prompt';
   return 'prompt';
 }
 
+// Chrome reports several public permission names under a different internal
+// name in PermissionStatus, and folds the three motion sensors into one.
 function _permissionStatusName(name) {
   name = String(name || '');
   if (name === 'camera') return 'video_capture';
   if (name === 'microphone') return 'audio_capture';
+  if (name === 'persistent-storage') return 'durable_storage';
+  if (name === 'screen-wake-lock') return 'screen_wake_lock';
+  if (name === 'display-capture') return 'display_capture';
+  if (name === 'background-sync') return 'background_sync';
+  if (name === 'accelerometer' || name === 'gyroscope' || name === 'magnetometer') return 'sensors';
+  if (name === 'clipboard-read') return 'clipboard_read';
+  if (name === 'clipboard-write') return 'clipboard_write';
+  if (name === 'local-fonts') return 'local_fonts';
+  if (name === 'idle-detection') return 'idle_detection';
+  if (name === 'payment-handler') return 'payment_handler';
+  if (name === 'periodic-background-sync') return 'periodic_background_sync';
   return name;
 }

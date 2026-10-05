@@ -140,7 +140,16 @@ globalThis.navigator = _bootstrapObject('navigator', () => ({
   mediaDevices: undefined,
   clipboard: _bootstrapObject('navigator.clipboard', () => ({ writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} })),
   permissions: _bootstrapObject('navigator.permissions', () => ({ query(params){
+    if (arguments.length === 0) {
+      return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': 1 argument required, but only 0 present."));
+    }
     var n = params && params.name;
+    if (_permissionUnsupportedName(n)) {
+      return Promise.reject(new DOMException("Failed to execute 'query' on 'Permissions': The provided value '" + String(n) + "' is not a supported permission name.", 'NotSupportedError'));
+    }
+    if (!_permissionKnownName(n)) {
+      return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': The provided value '" + String(n) + "' is not a valid permission name."));
+    }
     return Promise.resolve({state: _permissionState(n), onchange: null});
   } })),
   getBattery() { return Promise.resolve(_batteryManagerInstance); },
