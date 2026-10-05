@@ -1114,18 +1114,6 @@ impl ObscuraJsRuntime {
             let scope = &mut self.deno_runtime_mut().handle_scope();
             let context_local = v8::Local::new(scope, &context);
             drop_realm_deno_global(scope, context_local);
-        } else if crate::tracelog::enabled() {
-            // Template-restored realms skipped the bootstrap, so the
-            // snapshot-baked tracelog installer was defined but never called
-            // (the snapshot is built with no destination). Install it here.
-            // Best-effort: a failed install must not fail frame creation.
-            if let Err(error) = self.execute_in_context(
-                &context,
-                "<obscura:frame-realm-tracelog>",
-                TRACELOG_INSTALL_SRC,
-            ) {
-                tracing::warn!("frame realm tracelog install failed: {error}");
-            }
         }
         if timing {
             realm_phase_print("bootstrap_core", t_phase.elapsed());
@@ -1161,6 +1149,28 @@ impl ObscuraJsRuntime {
         )?;
         if timing {
             realm_phase_print("fingerprint_seed", t_phase.elapsed());
+        }
+        // Template-restored realms skipped the bootstrap, so the
+        // snapshot-baked tracelog installer was defined but never called
+        // (the snapshot is built with no destination). Install it here.
+        // Best-effort: a failed install must not fail frame creation.
+        //
+        // Keep this after the fingerprint seeding above: in a template-restored
+        // realm the bootstrap branch is skipped, so this is the realm's first
+        // `execute_in_context`, and the hydration it triggers is what runs
+        // `<obscura:init>` (page init). Ahead of the seeding, that page init
+        // read the fallback identity (outerWidth 1920 / screenX 0). The seeding
+        // runs through `run_in_realm_before_hydration`, a bare run_script that
+        // does not hydrate, so it has to precede every execute. The relative
+        // order (page init, tracelog install, REALM_INIT) is unchanged.
+        if template_restored && crate::tracelog::enabled() {
+            if let Err(error) = self.execute_in_context(
+                &context,
+                "<obscura:frame-realm-tracelog>",
+                TRACELOG_INSTALL_SRC,
+            ) {
+                tracing::warn!("frame realm tracelog install failed: {error}");
+            }
         }
         self.execute_in_context(&context, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
         if timing {
