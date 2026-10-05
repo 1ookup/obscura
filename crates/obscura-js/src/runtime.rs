@@ -13520,11 +13520,13 @@ RequestRedirect value",
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn navigator_has_no_cpu_performance_anywhere() {
-        // navigator.cpuPerformance was an invented member (Step 300): the
-        // Chrome 151 renderer trace and the passing Chrome 149 census both
-        // report zero occurrences. Pinned absent in the top document and in a
-        // cross-origin frame realm alike.
+    async fn navigator_cpu_performance_matches_the_chrome_154_reference() {
+        // `cpuPerformance` is the constant number 3 on the reference Chrome
+        // 154 (live direct reads: typeof=number, `in`=true, value=3, in the
+        // top document and in a cross-origin frame alike; the reference dec
+        // bucket carries n.cpuPerformance). The earlier "invented member"
+        // removal came from a Chrome 151 trace that had it too but was read
+        // as absent. Locked present with value 3 in both realms.
         let mut rt = setup_runtime("<html><body><iframe id=f></iframe></body></html>");
         let script = format!(r#"(() => {{
             {FRAME_OPS_PRELUDE}
@@ -13535,14 +13537,14 @@ RequestRedirect value",
         rt.ensure_frame_realm("test-frame", 1, root, "https://widget.example/frame").unwrap();
         let result = rt.evaluate_in_frame_realm_for_cdp(
             "test-frame", 1, crate::realm::MAIN_WORLD,
-            "[typeof navigator.cpuPerformance, 'cpuPerformance' in navigator, typeof SharedArrayBuffer]",
+            "[typeof navigator.cpuPerformance, 'cpuPerformance' in navigator, navigator.cpuPerformance, typeof SharedArrayBuffer]",
             true, true, 1_000,
         ).await.unwrap().value.unwrap();
-        assert_eq!(result, serde_json::json!(["undefined", false, "function"]));
+        assert_eq!(result, serde_json::json!(["number", true, 3, "function"]));
         assert_eq!(
-            rt.evaluate("[typeof navigator.cpuPerformance, 'cpuPerformance' in navigator]")
+            rt.evaluate("[typeof navigator.cpuPerformance, 'cpuPerformance' in navigator, navigator.cpuPerformance]")
                 .unwrap(),
-            serde_json::json!(["undefined", false])
+            serde_json::json!(["number", true, 3])
         );
     }
 
