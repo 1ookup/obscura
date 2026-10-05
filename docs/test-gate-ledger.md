@@ -449,3 +449,16 @@ run covers are then removed.
   value 64 and maxSubgroupSize still null, intel reads 64 from the
   pre-existing _GPU_LIMITS row, null control still has no adapter;
   probe-check all green. Full gate deferred to the next backfill
+
+- stealth identity sync to the Chrome 154 reference (10-05, bd9737f): scoped:
+  obscura-js + obscura-cdp + obscura-browser 1074/1074 (3 skipped,
+  --no-fail-fast); the default identity moves to Chrome/154.0.0.0 with
+  fullVersionList 154.0.8037.93 and the Chromium-first brands order carrying
+  the "Not A(Brand";v="99" grease, and navigator.languages gains the
+  base-language fallback (["zh-CN","zh"]) the Accept-Language header already
+  serialized; one real expectation drift in obscura-js (the
+  fingerprint_language realm test pinned the old one-entry list), everything
+  else green; acceptance on the gold-config round: the decrypted widget
+  payload byte-equal to the reference Chrome capture (Yyepi7 UA-CH triple,
+  PlZqY9 languages) and the sec-ch-ua header byte-equal on both the
+  navigation GET and the fo POST; full gate deferred to the next backfill
