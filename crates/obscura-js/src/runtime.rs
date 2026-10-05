@@ -16989,6 +16989,14 @@ RequestRedirect value",
                                 return 'resolved';
                             } catch (error) { return 'rejected:' + error.name; }
                         })(),
+                        // Native methods own no `prototype` and refuse `new`.
+                        methodShape: ['prototype' in Permissions.prototype.query,
+                            (() => {
+                                try { new (Permissions.prototype.query)({}); return 'constructed'; }
+                                catch (error) { return error.name; }
+                            })()],
+                        getterShape: Object.getOwnPropertyNames(
+                            Object.getOwnPropertyDescriptor(PermissionStatus.prototype, 'name').get),
                     };
                 })()"#,
                 true,
@@ -17010,6 +17018,8 @@ RequestRedirect value",
                 "unsupported": { "name": "NotSupportedError" },
                 "denied": { "value": ["denied", "periodic_background_sync"] },
                 "brand": "rejected:TypeError",
+                "methodShape": [false, "TypeError"],
+                "getterShape": ["length", "name"],
             })
         );
     }

@@ -1793,12 +1793,22 @@ const _chromeInterfaceShells = new Set();
     if (!state) throw new TypeError('Illegal invocation @config/surface-finalize.js:1793');
     return state;
   };
-  const nameGetter = _markNative(function name() { return status(this).name; });
-  const stateGetter = _markNative(function state() { return status(this).state; });
-  const onchangeGetter = _markNative(function onchange() { return status(this).onchange; });
-  const onchangeSetter = _markNative(function onchange(value) {
-    status(this).onchange = typeof value === 'function' ? value : null;
-  });
+  // Native accessors and methods are not constructors and own no
+  // `prototype`; mint them from accessor/method literals so that
+  // `'prototype' in getter` and `new query()` refuse like Chrome's.
+  const accessors = {
+    get name() { return status(this).name; },
+    get state() { return status(this).state; },
+    get onchange() { return status(this).onchange; },
+    set onchange(value) {
+      status(this).onchange = typeof value === 'function' ? value : null;
+    },
+  };
+  const nameGetter = _markNative(Object.getOwnPropertyDescriptor(accessors, 'name').get);
+  const stateGetter = _markNative(Object.getOwnPropertyDescriptor(accessors, 'state').get);
+  const onchangeAccessor = Object.getOwnPropertyDescriptor(accessors, 'onchange');
+  const onchangeGetter = _markNative(onchangeAccessor.get);
+  const onchangeSetter = _markNative(onchangeAccessor.set);
   const statusConstructor = Object.getOwnPropertyDescriptor(
     PermissionStatus.prototype, 'constructor');
   delete PermissionStatus.prototype.constructor;
@@ -1814,32 +1824,34 @@ const _chromeInterfaceShells = new Set();
   // forged `this` must reject with Illegal invocation before arity applies.
   const permissionReceivers = new WeakSet();
   permissionReceivers.add(permissions);
-  const query = _markNative(function query(descriptor) {
-    if (!permissionReceivers.has(this)) {
-      return Promise.reject(new TypeError(
-        "Failed to execute 'query' on 'Permissions': Illegal invocation"));
-    }
-    if (arguments.length === 0) {
-      return Promise.reject(new TypeError(
-        "Failed to execute 'query' on 'Permissions': 1 argument required, but only 0 present."));
-    }
-    const name = descriptor && descriptor.name;
-    if (_permissionUnsupportedName(name)) {
-      return Promise.reject(new DOMException(
-        "Failed to execute 'query' on 'Permissions': Push Permission without userVisibleOnly:true isn't supported yet.",
-        'NotSupportedError'));
-    }
-    if (!_permissionKnownName(name)) {
-      return Promise.reject(new TypeError(
-        "Failed to execute 'query' on 'Permissions': Failed to read the 'name' property from 'PermissionDescriptor': The provided value '"
-        + String(name) + "' is not a valid enum value of type PermissionName."));
-    }
-    const result = Object.create(PermissionStatus.prototype);
-    statusState.set(result, {
-      name: _permissionStatusName(name), state: _permissionState(name), onchange: null,
-    });
-    return Promise.resolve(result);
-  });
+  const query = _markNative({
+    query(descriptor) {
+      if (!permissionReceivers.has(this)) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'query' on 'Permissions': Illegal invocation"));
+      }
+      if (arguments.length === 0) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'query' on 'Permissions': 1 argument required, but only 0 present."));
+      }
+      const name = descriptor && descriptor.name;
+      if (_permissionUnsupportedName(name)) {
+        return Promise.reject(new DOMException(
+          "Failed to execute 'query' on 'Permissions': Push Permission without userVisibleOnly:true isn't supported yet.",
+          'NotSupportedError'));
+      }
+      if (!_permissionKnownName(name)) {
+        return Promise.reject(new TypeError(
+          "Failed to execute 'query' on 'Permissions': Failed to read the 'name' property from 'PermissionDescriptor': The provided value '"
+          + String(name) + "' is not a valid enum value of type PermissionName."));
+      }
+      const result = Object.create(PermissionStatus.prototype);
+      statusState.set(result, {
+        name: _permissionStatusName(name), state: _permissionState(name), onchange: null,
+      });
+      return Promise.resolve(result);
+    },
+  }.query);
   const permissionsConstructor = Object.getOwnPropertyDescriptor(
     Permissions.prototype, 'constructor');
   delete Permissions.prototype.constructor;
