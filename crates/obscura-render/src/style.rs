@@ -352,14 +352,14 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         if tag == "th" {
             style.font_weight = Some("bold".to_string());
         }
-    } else if tag == "img" {
-        // Images are inline-level replaced elements by default. Replacement
-        // already makes the box atomic; `is_inline_block` is reserved for an
-        // authored inline-block outer display and native controls. Chromium's
-        // UA sheet does not impose a responsive max-width: author/reset CSS
-        // must opt into that. A synthetic `max-width:100%` here distorts
-        // deliberately oversized art whose height and intrinsic ratio
-        // establish its width.
+    } else if tag == "img" || tag == "canvas" {
+        // Images and canvases are inline-level replaced elements by default.
+        // Replacement already makes the box atomic; `is_inline_block` is
+        // reserved for an authored inline-block outer display and native
+        // controls. Chromium's UA sheet does not impose a responsive
+        // max-width: author/reset CSS must opt into that. A synthetic
+        // `max-width:100%` here distorts deliberately oversized art whose
+        // height and intrinsic ratio establish its width.
         style.display = Display::Inline;
     }
     style

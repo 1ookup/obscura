@@ -3257,8 +3257,19 @@ fn resolve_atomic_percentage_heights(
                     _ => None,
                 })
             });
+            // An atomic inline-level child, inline-block or replaced (e.g. a
+            // canvas inside a fixed overlay), resolves percentage heights
+            // against a definite ordinary block's used content height.
+            // Replaced children carry is_inline_block = false, so the
+            // float/inline-block branch below cannot identify them by itself.
+            let child_is_atomic_inline = styles.get(&dom_id).is_some_and(|style| {
+                style.is_inline_block || style.has_replaced_sizing || style.is_replaced_box
+            });
             let parent_is_definite_atomic = styles.get(&parent_id).is_some_and(|style| {
-                (style.float.is_some() || style.is_inline_block)
+                (style.float.is_some()
+                    || style.is_inline_block
+                    || (child_is_atomic_inline
+                        && !matches!(style.display, crate::Display::Flex | crate::Display::Grid)))
                     && definite_height_nodes.contains(&parent_id)
                     && style.size_expressions[1].is_none()
             });
@@ -8250,6 +8261,12 @@ fn layout_dom_once(
                         style.height,
                         crate::Dimension::Px(_) | crate::Dimension::Percent(_)
                     );
+                    // The inset stretch above can turn an Auto height definite
+                    // (fixed inset:0). The earlier check ran before the
+                    // stretch, so record the definite height here too.
+                    if child_cb_height_definite {
+                        definite_height_nodes.insert(id);
+                    }
                 }
                 let computed_weight = crate::style::computed_font_weight(
                     style.font_weight.as_deref(),
@@ -16252,6 +16269,47 @@ fn build(
                     .get_attribute("src")
                     .is_some_and(|value| !value.trim().is_empty()),
         ) {
+            // A default-sized canvas is a replaced box like an image: seed its
+            // preferred width before handing the leaf to taffy, or block layout
+            // passes the containing-block width as a known dimension and
+            // stretches the 300x150 default canvas to the viewport. The guard
+            // mirrors the img/video measured leaf below; the `ratio_only`
+            // clause is omitted because a canvas always carries a concrete
+            // 300x150 intrinsic, so it could never fire.
+            if _name.local.as_ref() == "canvas" {
+                let has_definite_constraint = [
+                    style.min_width,
+                    style.min_height,
+                    style.max_width,
+                    style.max_height,
+                ]
+                .into_iter()
+                .any(|dimension| matches!(dimension, crate::Dimension::Px(_)));
+                let has_percentage_constraint = [
+                    style.min_width,
+                    style.min_height,
+                    style.max_width,
+                    style.max_height,
+                ]
+                .into_iter()
+                .any(|dimension| matches!(dimension, crate::Dimension::Percent(_)))
+                    || style.size_expressions[2..=5]
+                        .iter()
+                        .flatten()
+                        .any(|expression| expression.contains('%'));
+                if matches!(style.width, crate::Dimension::Auto)
+                    && matches!(style.height, crate::Dimension::Auto)
+                    && !has_percentage_constraint
+                    && !is_in_flow_grid_item(tree, id, style, styles)
+                {
+                    let constrained =
+                        crate::inline::constrained_auto_replaced_size(width, height, style);
+                    taffy_style.size.width = taffy::Dimension::length(constrained.width);
+                    if has_definite_constraint {
+                        taffy_style.size.height = taffy::Dimension::length(constrained.height);
+                    }
+                }
+            }
             let context = engine.register_replaced(width, height, style);
             let leaf = taffy_tree
                 .new_leaf_with_context(taffy_style, context)
