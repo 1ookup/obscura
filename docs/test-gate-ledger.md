@@ -462,3 +462,12 @@ run covers are then removed.
   payload byte-equal to the reference Chrome capture (Yyepi7 UA-CH triple,
   PlZqY9 languages) and the sec-ch-ua header byte-equal on both the
   navigation GET and the fo POST; full gate deferred to the next backfill
+
+- navigator.cpuPerformance restored as the constant 3 (10-05, 69b4d28):
+  scoped: obscura-js 751/751; the Step 300 removal read a Chrome 151 renderer
+  trace as absent, but a live Chrome 154 direct read answers typeof=number,
+  `in`=true, value=3 in the top document and in a cross-origin frame alike,
+  and the reference dec bucket carries n.cpuPerformance in its '3' slot; the
+  navigator getter returns the constant 3 with no SecureContext gate, and the
+  flipped test pins number/true/3 in both the main and the frame realm; full
+  gate deferred to the next backfill
