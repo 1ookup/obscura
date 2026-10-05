@@ -75,6 +75,22 @@ class HTMLImageElement extends Element {
   }
 
   get width() {
+    // A rendered image reports the used content-box width, like Chrome's
+    // width IDL. The padding box from layout minus the resolved inline
+    // padding is exactly that content box. Only an unrendered image (no
+    // layout geometry) falls back to the width attribute, then the natural
+    // width.
+    const geometry = this._renderBoxGeometry ? this._renderBoxGeometry() : null;
+    if (geometry && Number.isFinite(geometry.clientWidth)) {
+      try {
+        const computed = getComputedStyle(this);
+        const left = Number.parseFloat(computed.getPropertyValue("padding-left"));
+        const right = Number.parseFloat(computed.getPropertyValue("padding-right"));
+        if (Number.isFinite(left) && Number.isFinite(right)) {
+          return Math.round(Math.max(0, geometry.clientWidth - left - right));
+        }
+      } catch (_error) {}
+    }
     const value = Number.parseInt(this.getAttribute("width") || "", 10);
     return Number.isFinite(value) && value >= 0 ? value : this._imageNaturalWidth;
   }
