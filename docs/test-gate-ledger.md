@@ -403,3 +403,49 @@ run covers are then removed.
 - system-ui advance tables from the Chrome 154 canvas probe (10-05, f642d7f): scoped: obscura-render 637/637 (1 skipped) + obscura-js 750/750 (one timer flake on the first parallel run, timers_keep_their_deadline_after_an_interrupted_event_loop_poll: the 100ms timer fired at 160.1ms against the +35ms tolerance; standalone green and the no-fail-fast rerun 750/750); both system-ui identity tables regenerate at upem 4096 with integer advances and re-probed kern pairs (bold latin1 filled from empty, both bundled ttf hmtx rewritten to match), and the element advance now ceils onto the 1/64 LayoutUnit grid instead of rounding to nearest (51-point 14px probe: 51/51 ceil, 38 distinguishing; regular 's' element 7.1875 while canvas stays 7.177734375); three-way 164-leaf compare: 39 in-scope = 25 aligned + 14 known low-priority family, 25 residual = 11 pre-existing + 14 of the same family, zero regressions (both WORSE labels are 1/64-level artifacts); t2-spot 16/16 CLEAN against the canvas model and both element references, adsorption laws hold on both sides; full gate deferred to the next backfill
 - WebGPU D3D12 adapter feature order (10-05, 516132a): scoped: obscura-js 751/751 (two timer flakes under parallel loads, self_requeueing_animation_frame_yields_to_timer_tasks and intersection_observer_tracks_viewport_threshold_crossings, standalone green, third run 751/751); the intel list replays the reference capture order minus the Apple-only trio (texture-compression-astc-sliced-3d, texture-compression-astc, texture-compression-etc2), residual [] on the subsequence check; runtime probes on the rebuilt binary: apple profile 20/20 reference order, intel override 17/17 target order, negative control null-adapter; full gate deferred to the next backfill
 - WebGPU apple feature and WGSL table sizes (10-05, 566de56): scoped: obscura-js 751/751 (one timing flake on the first parallel run, standalone 3/3 green; the adapter consistency test was a real expectation drift, its wgslCount moved 9 -> 13 with the table); the apple profile now replays 21 adapter features and 13 WGSL language features in reference order, residual [] on both positional checks; runtime probes on the rebuilt binary navigate an https page first (an about:blank target never hydrates the deferred surface, so navigator.gpu reads undefined there): apple 21/21 and 13/13, intel override 17/17 and 13/13 (the intel override needs the full gpu object, vendor and renderer are required fields), negative control null adapter; full gate deferred to the next backfill
+
+- reference feature-order drift note (10-05): the two Chrome 154 dec captures
+  differ from each other in two adjacent swaps, elem[2] features 21 (13:15
+  reads clip-distances,texture-formats-tier2,shader-f16; 228-3 reads
+  clip-distances,shader-f16,texture-formats-tier2) and elem[4] WGSL 13 (13:15
+  subgroup_id,linear_indexing; 228-3 linear_indexing,subgroup_id), while the
+  other seven lDUiR4 elements are byte-equal (node md5 13:15 65ce7f80f392,
+  228-3 0a3f8117a1b6); our 21-item set equals both captures and its order is a
+  third arrangement, so set alignment stays the working criterion and the
+  order itself is a reference-side non-stable quantity
+
+- live order readings without stored samples (10-05): the earlier order
+  comparisons also cite two live Chrome machines (9712 tail sf16,tier2,clip;
+  9273 tail tier2,clip,sf16) that exist only as session reports, no stored
+  capture artifact, so they are ledger context and not independent samples;
+  the two dec files above remain the replayable references
+
+- rehang three-profile probe runbook (10-05): scripts in
+  /private/tmp/cf-parity-1002/ (run-rehang.sh starts all three). Profiles:
+  obscura serve --port 9522 --stealth --storage-dir /tmp/obs-storage-rehang-a
+  (apple); --port 9524 --stealth --storage-dir /tmp/obs-storage-rehang-i with
+  OBSCURA_FINGERPRINT_JSON carrying the full gpu object (vendor and renderer
+  required, else the whole override is silently dropped) (intel); --port 9526
+  --storage-dir /tmp/obs-storage-rehang-n without --stealth (null control).
+  Probe per port: uv run --no-project --with websockets python
+  cdp_eval_fix4.py PORT expr-gpu-kick.js expr-gpu-read.js https://example.com,
+  then uv run python probe-check.py. The probe must Page.navigate to an https
+  page first (about:blank never hydrates the deferred surface), and a freshly
+  built binary cold-exec can exceed the 3s startup wait, poll /json/version
+  before the first probe
+
+- WebGPU apple limits maxImmediateSize sync (10-05, 03a546f): _GPU_APPLE.limits
+  gains maxImmediateSize 64 at position 33 (37 -> 38 keys, one insertion);
+  scoped: obscura-js 751/751 on the third run. The first parallel run carried
+  one real expectation drift on top of four timer flakes: the tier test still
+  pinned the old single-tier maxImmediateSize (adapter None, device 64), so
+  both tiers now sit in the ADAPTER_VERSUS_DEVICE_LIMITS pair table as 64/64
+  and the stale single-field assertions are gone; the four flakes (posted
+  task timer floor, image lifecycle cors, intersection observer clip, timing
+  edits pause) were standalone green, and a second run left one throughput
+  flake, also standalone green. Oracle checks against the lDUiR4 node of dec
+  13:15: names 38/38 positional-diffs 0, values 38/38 value-diffs 0. Rebuilt
+  binary probes on all three profiles: apple maxImmediateSize present with
+  value 64 and maxSubgroupSize still null, intel reads 64 from the
+  pre-existing _GPU_LIMITS row, null control still has no adapter;
+  probe-check all green. Full gate deferred to the next backfill
