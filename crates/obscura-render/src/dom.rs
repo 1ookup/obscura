@@ -11838,13 +11838,21 @@ fn resolve_named_placement(
 /// CSSOM View can only ever report multiples of 1/64. Measured on Chrome 153
 /// (headless, 1x): a `width:123.4px` box reports 123.390625 = 7897/64 and
 /// `width:12.12px` reports 12.109375 = 775/64, i.e. the authored length is
-/// floored onto the grid rather than rounded to nearest. Taffy stores f32, so
-/// the raw unrounded layout has to be floored onto the same grid before it is
-/// exposed: otherwise the exposed value is off-grid and differs from Chrome in
-/// the low bits (12.119999885559082 where Chrome reports 12.109375).
+/// snapped toward zero onto the grid rather than rounded to nearest. Taffy
+/// stores f32, so the raw unrounded layout has to be snapped onto the same
+/// grid before it is exposed: otherwise the exposed value is off-grid and
+/// differs from Chrome in the low bits (12.119999885559082 where Chrome
+/// reports 12.109375).
+///
+/// For negative lengths it is truncation toward zero, not floor. Measured on
+/// Chrome 154 (headless, 1x): `margin-top:-0.51px` lays out at -0.5 (-32/64),
+/// `-0.49px` at -0.484375 (-31/64) and `-350.552px` at -350.546875 (-22435/64);
+/// floor would land one 1/64 lower in each case. Truncation matches every
+/// non-negative measurement above too, so one trunc toward zero covers both
+/// signs.
 #[inline]
 pub(crate) fn snap_to_layout_unit(value: f32) -> f32 {
-    (value * 64.0).floor() / 64.0
+    (value * 64.0).trunc() / 64.0
 }
 
 /// Used padding is resolved onto the same LayoutUnit grid, at every place a
