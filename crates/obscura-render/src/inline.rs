@@ -695,7 +695,7 @@ fn identity_line(item: &InlineItem, run: &cosmic_text::LayoutRun, line_w: f32) -
 /// says 948.8671875 -- each exactly the canvas value rounded to the nearest
 /// 1/64. The canvas channel keeps the unrounded value, which is why this is
 /// applied on the element side only.
-fn snap_layout_unit(value: f32) -> f32 {
+pub(crate) fn snap_layout_unit(value: f32) -> f32 {
     (value * 64.0).round() / 64.0
 }
 

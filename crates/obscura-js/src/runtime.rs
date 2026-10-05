@@ -6501,10 +6501,9 @@ mod tests {
                         // Sub-pixel on both channels: the canvas answers the
                         // face's own fraction (780.2578125, the reference's
                         // value too, which is on no grid at all) and the
-                        // element width is a fraction as well -- the reference
-                        // snaps it to Blink's LayoutUnit grid first (780.265625)
-                        // where this engine reports it unsnapped, one LayoutUnit
-                        // below. Neither is an integer pixel.
+                        // element width is a fraction as well, snapped to
+                        // Blink's LayoutUnit grid (780.265625) like the
+                        // reference. Neither is an integer pixel.
                         subpixel: probe % 1 !== 0 && mono % 1 !== 0
                             && elementWidth("72px monospace") % 1 !== 0,
                         positive: mono > 0 && sans > 0,
@@ -25580,9 +25579,9 @@ RequestRedirect value",
                     return [rect, probe.offsetWidth, canvas,
                         // The reference answers 72.9375 here while its own
                         // canvas says 72.9296875: it snaps element widths to
-                        // the 1/64 LayoutUnit grid and this engine's inline
-                        // block reports the unsnapped value, one LayoutUnit
-                        // below. Both are subpixel; the canvas channels agree.
+                        // the 1/64 LayoutUnit grid (ties away from zero), so
+                        // the inline block matches the reference and the
+                        // canvas channels agree.
                         Math.abs(rect - 72.9375) <= 1 / 64,
                         Math.abs(rect - canvas) <= 1 / 64];
                 })()"#,
@@ -25590,7 +25589,7 @@ RequestRedirect value",
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!([72.9296875, 73, 72.9296875, true, true])
+            serde_json::json!([72.9375, 73, 72.9296875, true, true])
         );
     }
 

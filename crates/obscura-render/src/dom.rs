@@ -10406,7 +10406,11 @@ fn layout_dom_once(
                     + style.border.right;
                 let rounded = rects.get(&nid).map(|value| value.width).unwrap_or(rect.width);
                 if (rounded - (advance.ceil() + edges)).abs() <= 0.01 {
-                    rect.width = advance + edges;
+                    // Blink puts the shaped advance through `LayoutUnit`
+                    // (nearest 1/64, ties away from zero) before adding
+                    // the grid-snapped padding and border, so the element
+                    // reads 72.9375 for a canvas advance of 72.9296875.
+                    rect.width = crate::inline::snap_layout_unit(advance) + edges;
                 }
             }
             let prof_cssom_advance = prof_cssom_advance.map(|t| t.elapsed());
