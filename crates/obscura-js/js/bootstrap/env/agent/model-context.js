@@ -1,17 +1,13 @@
 // ModelContext and WebMCPEvent (WebMCP).
 //
-// Chrome's window carries both as non-enumerable own properties, and
-// Navigator.prototype carries a `modelContext` accessor whose value is a
-// ModelContext instance; the engine answered none of the three, so a census of
-// the global and of the navigator prototype came up short. Shapes measured on
-// the local Chrome oracle (149): ModelContext extends EventTarget with
-// ontoolchange/getTools/registerTool, WebMCPEvent extends Event with a
-// `toolName` getter and a one-argument constructor.
-//
-// What the tools themselves would do is not implemented. getTools answers an
-// empty list and registerTool records nothing: this is the shape a feature
-// probe sees, not a working agent surface.
+// Retired on the Chrome 154 evidence: the top document, a secure origin and
+// the cross-origin widget frame all answer `typeof ModelContext` with
+// undefined, and the 154 payload census carries neither name. The shapes
+// below were measured against the 149 oracle and one 09-28 reference dump;
+// they stay as reference, and the installer returns before touching the
+// global or Navigator.prototype.
 (function installModelContextSurface() {
+  return;
   if (typeof globalThis.ModelContext === 'undefined') {
     const define = (target, name, value) => Object.defineProperty(target, name, {
       value, writable: true, enumerable: true, configurable: true,

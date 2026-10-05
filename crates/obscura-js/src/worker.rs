@@ -1048,6 +1048,11 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     'moveBy', 'resizeTo', 'resizeBy',
     'requestAnimationFrame', 'cancelAnimationFrame',
     'requestIdleCallback', 'cancelIdleCallback',
+    // The 154 surface additions are Window-only as well. The worker keeps a
+    // held copy of FontFaceSet for `self.fonts` above, so the scope binding
+    // goes with the rest of the browsing-context surface.
+    'FontFaceSet', 'HTMLUserMediaElement', 'InteractionContentfulPaint',
+    'PerformanceSoftNavigation',
     'devicePixelRatio', 'innerWidth', 'innerHeight', 'outerWidth',
     'outerHeight', 'screenX', 'screenY', 'screenLeft', 'screenTop',
     'scrollX', 'scrollY', 'pageXOffset', 'pageYOffset',

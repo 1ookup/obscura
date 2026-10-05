@@ -500,3 +500,16 @@ run covers are then removed.
   census now reads zero order edits in all four tables, and the stale
   screen.orientation order assertion flipped to angle-first; full gate
   deferred to the next backfill
+
+- Chrome 154 surface realignment (10-05): scoped: obscura-js 751/751;
+  the WebMCP/SharedStorage family (ten names) is removed from every realm
+  (the storage and agent installers return early, the origin-gated extras
+  block is gone, the surface and navigator-order lists drop their entries),
+  and the eleven 154 names (PermissionsPolicy, FontFaceSet, XSLTProcessor,
+  the camera/microphone element pair, NodeRange/OpaqueRange, the paint
+  timeline entries, window.requestResize) join the surface as
+  native-shaped stubs; the stale non-isolated hidden-name gate is emptied
+  (Chrome 154 carries the four on a plain localhost page) with the worker
+  scope strip extended instead; the census, persona, webidl and screen
+  orientation tests flip to the 154 answers; full gate deferred to the
+  next backfill

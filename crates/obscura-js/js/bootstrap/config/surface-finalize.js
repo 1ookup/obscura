@@ -251,7 +251,7 @@
       'MIDIAccess', 'MIDIConnectionEvent', 'MIDIInput', 'MIDIInputMap',
       'MIDIMessageEvent', 'MIDIOutput', 'MIDIOutputMap', 'MIDIPort',
       'MediaDeviceInfo', 'MediaDevices', 'MediaKeyMessageEvent', 'MediaKeySession',
-      'MediaKeyStatusMap', 'MediaKeySystemAccess', 'MediaKeys', 'ModelContext',
+      'MediaKeyStatusMap', 'MediaKeySystemAccess', 'MediaKeys',
       'NavigationPreloadManager', 'NavigatorLogin', 'NavigatorManagedData', 'OTPCredential',
       'OrientationSensor', 'PasswordCredential', 'PaymentAddress', 'PaymentManager',
       'PaymentMethodChangeEvent', 'PaymentRequest', 'PaymentRequestUpdateEvent', 'PaymentResponse',
@@ -283,7 +283,7 @@
       'XRWebGLDepthInformation', 'XRWebGLLayer', 'XRWebGLSubImage', 'caches',
       'cookieStore', 'documentPictureInPicture', 'fetchLater', 'getScreenDetails',
       'ondevicemotion', 'ondeviceorientation', 'ondeviceorientationabsolute', 'onpointerrawupdate',
-      'queryLocalFonts', 'sharedStorage', 'showDirectoryPicker', 'showOpenFilePicker',
+      'queryLocalFonts', 'showDirectoryPicker', 'showOpenFilePicker',
       'showSaveFilePicker'
     ]) _remove(globalThis, name);
     for (const name of [
@@ -1680,46 +1680,41 @@ const _chromeInterfaceShells = new Set();
     Object.defineProperty(globalThis, 'clientInformation',
       { get() { return globalThis.navigator; }, enumerable: true, configurable: true });
   }
+  // Chrome 154 carries a fresh interface set on both the top document and the
+  // frame realm census: PermissionsPolicy, FontFaceSet, XSLTProcessor, the
+  // camera/microphone element pair, the Range split (NodeRange/OpaqueRange),
+  // the paint timeline entries, and the window.requestResize method. The
+  // engine implements none of them; the challenge census only enumerates
+  // presence, so these are native-shaped stubs that keep name and
+  // @@toStringTag honest and construct like an illegal-constructor builtin.
+  for (const name of ['PermissionsPolicy', 'FontFaceSet', 'XSLTProcessor',
+                      'HTMLCameraElement', 'HTMLMicrophoneElement',
+                      'HTMLUserMediaElement', 'InteractionContentfulPaint',
+                      'PerformanceSoftNavigation', 'NodeRange', 'OpaqueRange']) {
+    if (typeof globalThis[name] !== 'undefined') continue;
+    const ctor = _markNative(function() {
+      throw new TypeError('Illegal constructor');
+    });
+    try { Object.defineProperty(ctor, 'name', { value: name, configurable: true }); } catch (_e) {}
+    Object.defineProperty(ctor.prototype, Symbol.toStringTag,
+      { value: name, configurable: true });
+    Object.defineProperty(globalThis, name,
+      { value: ctor, writable: true, enumerable: false, configurable: true });
+  }
+  if (typeof globalThis.requestResize === 'undefined') {
+    const requestResize = function requestResize() {};
+    Object.defineProperty(globalThis, 'requestResize',
+      { value: _markNative(requestResize), writable: true, enumerable: true, configurable: true });
+  }
   // `sharedStorage` used to be installed here next to its enumerable-object
-  // siblings on the strength of the Chrome 151 renderer trace. Both the local
-  // Chrome 153 window and the 0926 remote reference census answer
-  // `'sharedStorage' in window` with false -- the SharedStorage family is
-  // origin-gated off in every shape we can observe -- so it is gone, and with
-  // it the SharedStorage* constructors and ModelContext/WebMCPEvent.
-  // The SharedStorage family, ModelContext and WebMCPEvent are origin-trial
-  // surfaces on the reference build: absent from the top census, present in
-  // the challenges.cloudflare.com widget realm the challenge enumerates. Keep
-  // that split instead of a global install, which would read as extra keys on
-  // every other origin.
-  (function _installChallengeOriginTrialSurfaces() {
-    let origin = null;
-    try {
-      origin = _scopeOrigin(_callingFrameRoot())
-        || _inheritedDocumentOrigin()
-        || _scopeOrigin(0);
-    } catch (_error) { return; }
-    if (origin !== 'https://challenges.cloudflare.com') return;
-    if (typeof globalThis.sharedStorage === 'undefined') {
-      const sharedStorage = {};
-      Object.defineProperty(sharedStorage, Symbol.toStringTag,
-        { value: 'SharedStorage', configurable: true });
-      Object.defineProperty(globalThis, 'sharedStorage',
-        { get() { return sharedStorage; }, enumerable: true, configurable: true });
-    }
-    for (const name of ['ModelContext', 'WebMCPEvent',
-                        'SharedStorage', 'SharedStorageWorklet',
-                        'SharedStorageAppendMethod', 'SharedStorageClearMethod',
-                        'SharedStorageDeleteMethod', 'SharedStorageModifierMethod',
-                        'SharedStorageSetMethod']) {
-      if (typeof globalThis[name] !== 'undefined') continue;
-      const ctor = _markNative(function() {
-        throw new TypeError('Illegal constructor');
-      });
-      try { Object.defineProperty(ctor, 'length', { value: 0, configurable: true }); } catch (_e) {}
-      Object.defineProperty(globalThis, name,
-        { value: ctor, writable: true, enumerable: false, configurable: true });
-    }
-  })();
+  // siblings, and a 151-era round later kept the family as origin-gated
+  // extras on the strength of a widget-realm sighting. The Chrome 154
+  // evidence is uniform the other way: the top document, a secure origin and
+  // the cross-origin widget frame all answer `'sharedStorage' in window` with
+  // false, `navigator.modelContext` is absent in every shape, and the 154
+  // payload census lists none of the SharedStorage* constructors,
+  // ModelContext or WebMCPEvent. Installing any of them would read as
+  // invented keys.
   for (const name of ['cookieStore', 'crashReport', 'documentPictureInPicture',
                       'viewport', 'launchQueue']) {
     if (typeof globalThis[name] !== 'undefined') continue;
@@ -2646,7 +2641,7 @@ const _chromeNavigatorKeyOrder = [
   'webkitPersistentStorage', 'windowControlsOverlay', 'hardwareConcurrency',
   'cookieEnabled', 'appCodeName', 'appName', 'appVersion', 'platform',
   'product', 'userAgent', 'language', 'languages', 'onLine', 'webdriver',
-  'plugins', 'mimeTypes', 'pdfViewerEnabled', 'connection', 'modelContext',
+  'plugins', 'mimeTypes', 'pdfViewerEnabled', 'connection',
   'getGamepads',
   'javaEnabled', 'sendBeacon', 'vibrate', 'constructor',
   'deprecatedRunAdAuctionEnforcesKAnonymity', 'protectedAudience', 'bluetooth',
