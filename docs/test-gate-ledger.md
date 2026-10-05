@@ -450,6 +450,24 @@ run covers are then removed.
   pre-existing _GPU_LIMITS row, null control still has no adapter;
   probe-check all green. Full gate deferred to the next backfill
 
+- img.width returns the rendered content-box width (10-05, 10aca8f): scoped:
+  obscura-js 751/751 plus obscura image_shim 5/5. The two worker-filtered
+  sweeps before the full run each left one digest single-fail
+  (worker_dense_digest_loop_keeps_its_throughput, a throughput threshold
+  test reading 11057 per 100ms against the 63000-66000 normal band,
+  standalone reruns 2/2 green) under load 28.68/70.27/44.08 on a 6-core
+  host = load jitter; the full sweep at load 3.10 ran 751/751 zero
+  failures. The image_shim red was a disk-full stub: the 16:29 ENOSPC link
+  left a 2240-byte non-executable unit-hash stub (plus its .d) that nextest
+  still selected and failed EACCES on, fixed by deleting the stub pair plus
+  two stale test bins (~213M) and relinking (101.7MB), then 5/5. Probe
+  triple check: A) fix4 -> fix5 full-field diff changes exactly one value,
+  H.bw 500 -> 250; B) fix5 vs the Chrome image row bw/bh/csw/csh
+  value-equal, only the four pre-existing E/F/G/H_o csw 1280-vs-1185
+  viewport artifacts left (unrelated to the image IDL); C) fix4 vs Chrome
+  carried exactly those 5 mismatches, fix5 removes the target one with
+  zero new; height side untouched. Full gate deferred to the next backfill
+
 - stealth identity sync to the Chrome 154 reference (10-05, bd9737f): scoped:
   obscura-js + obscura-cdp + obscura-browser 1074/1074 (3 skipped,
   --no-fail-fast); the default identity moves to Chrome/154.0.0.0 with
