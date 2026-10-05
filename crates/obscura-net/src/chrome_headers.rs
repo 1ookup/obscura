@@ -53,6 +53,12 @@ pub(crate) enum ChromeRequestShape {
 /// exactly where the POST measurement put them. On the GET they are absent, so
 /// the same table yields the GET order Chrome sent.
 ///
+/// Re-measured against Chrome 154.0.8037.93 over HTTP/2 through a MITM
+/// observatory: the client-hint block is a fixed enumeration order (mobile,
+/// full-version, arch, platform, platform-version, model, bitness,
+/// full-version-list), not a sorted one, and every high-entropy name sits in
+/// its own slot now that the hint set is table-driven.
+///
 /// `referer` is absent from both measurements because neither driving
 /// navigation carried one; its slot is the one Chrome uses on the subresource
 /// shape, which is the only place it could be observed.
@@ -61,7 +67,13 @@ pub(crate) const NAVIGATION_ORDER: &[&str] = &[
     "cache-control",
     "sec-ch-ua",
     "sec-ch-ua-mobile",
+    "sec-ch-ua-full-version",
+    "sec-ch-ua-arch",
     "sec-ch-ua-platform",
+    "sec-ch-ua-platform-version",
+    "sec-ch-ua-model",
+    "sec-ch-ua-bitness",
+    "sec-ch-ua-full-version-list",
     "upgrade-insecure-requests",
     "content-type",
     "user-agent",
@@ -80,21 +92,29 @@ pub(crate) const NAVIGATION_ORDER: &[&str] = &[
 
 /// Chrome's wire order for a subresource (scripted fetch/XHR, image, script).
 ///
-/// `content-length` really does come before the client hints and
-/// `content-type` really does land between `sec-ch-ua` and
-/// `sec-ch-ua-mobile`: that interleaving was reproduced across `fetch`,
-/// `XMLHttpRequest`, an explicit `Content-Type`, a `URLSearchParams` body and
-/// a five-fold repeat, and is Chromium's own insertion order for a request
-/// with a body. A control client that sent a deliberately scrambled POST
-/// through the same endpoint came back with its order intact, so it is not an
-/// artifact of the observatory.
+/// Re-measured against Chrome 154.0.8037.93 over HTTP/2 on the Turnstile
+/// platform's `/fo/` POST: `content-length` comes first, the client-hint
+/// block opens with `full-version-list` / `platform` / `sec-ch-ua` /
+/// `bitness`, `cf-chl-ra` lands between the hint runs, `user-agent` and
+/// `content-type` sit after the hints, `cf-chl` lands before the tail hint,
+/// and `priority` closes the list. The two `cf-chl*` names are Cloudflare
+/// challenge headers: they get a slot here so a page that sets them lands
+/// them where Chrome does, and they are skipped on every other request.
 pub(crate) const SUBRESOURCE_ORDER: &[&str] = &[
     "content-length",
+    "sec-ch-ua-full-version-list",
     "sec-ch-ua-platform",
-    "user-agent",
     "sec-ch-ua",
-    "content-type",
+    "sec-ch-ua-bitness",
+    "cf-chl-ra",
     "sec-ch-ua-mobile",
+    "sec-ch-ua-model",
+    "sec-ch-ua-arch",
+    "sec-ch-ua-full-version",
+    "user-agent",
+    "content-type",
+    "cf-chl",
+    "sec-ch-ua-platform-version",
     "accept",
     "origin",
     "sec-fetch-site",
@@ -158,16 +178,8 @@ pub(crate) struct ChromeHeaderPlan<'a> {
 /// moves between requests on one connection, so there is no fixed slot to
 /// match.
 pub(crate) fn build_chrome_headers(plan: &ChromeHeaderPlan<'_>) -> Vec<(String, String)> {
-    let fingerprint = plan.fingerprint;
     let mut out: Vec<(String, String)> = Vec::with_capacity(order_for(plan.shape).len() + 4);
     let mut emitted: HashSet<&'static str> = HashSet::new();
-
-    // Whether the high-entropy hints have been placed yet. They follow the
-    // low-entropy trio, which sits at a different offset in each shape.
-    let hints_after = match plan.shape {
-        ChromeRequestShape::Navigation => "sec-ch-ua-platform",
-        ChromeRequestShape::Subresource => "sec-ch-ua-mobile",
-    };
 
     for name in order_for(plan.shape) {
         let value = plan
@@ -178,25 +190,6 @@ pub(crate) fn build_chrome_headers(plan: &ChromeHeaderPlan<'_>) -> Vec<(String, 
         if let Some(value) = value {
             out.push(((*name).to_string(), value));
             emitted.insert(*name);
-        }
-        if *name == hints_after {
-            // Sorted here rather than at the call sites so no caller can
-            // reintroduce a shuffle. The set these come from used to be
-            // iterated directly, which put them on the wire in hash order.
-            let mut hints: Vec<&String> = plan
-                .accepted_hints
-                .iter()
-                .filter(|hint| !emitted.contains(hint.as_str()))
-                .collect();
-            hints.sort();
-            for hint in hints {
-                if emitted.contains(hint.as_str()) {
-                    continue;
-                }
-                if let Some(value) = client_hint_value(hint, fingerprint) {
-                    out.push((hint.clone(), value));
-                }
-            }
         }
     }
 
@@ -236,6 +229,19 @@ fn browser_default(plan: &ChromeHeaderPlan<'_>, name: &str) -> Option<String> {
         }
         "sec-ch-ua-platform" if !fingerprint.brands.is_empty() => {
             Some(fingerprint.sec_ch_ua_platform())
+        }
+        // High-entropy hints are sent only after the origin asked through
+        // `Accept-CH`; each keeps its own slot in the table so the emitted
+        // order does not depend on the accepted set.
+        "sec-ch-ua-full-version"
+        | "sec-ch-ua-arch"
+        | "sec-ch-ua-bitness"
+        | "sec-ch-ua-model"
+        | "sec-ch-ua-platform-version"
+        | "sec-ch-ua-full-version-list"
+            if plan.accepted_hints.iter().any(|hint| hint.as_str() == name) =>
+        {
+            client_hint_value(name, fingerprint)
         }
         // Navigation only. Chrome sends `Upgrade-Insecure-Requests` on a
         // navigation, and only when the destination is not already secure or
@@ -375,7 +381,7 @@ mod tests {
         assert_eq!(value(&build_chrome_headers(&plan), "sec-fetch-user"), Some("?1"));
     }
 
-    // The subresource shape, as Chrome 153 put it on the wire for a page
+    // The subresource shape, as Chrome 154 put it on the wire for a page
     // `fetch()` to a cross-site origin with credentials. `content-length` is
     // absent because this request carries no body.
     #[test]
@@ -400,9 +406,9 @@ mod tests {
             names(&build_chrome_headers(&plan)),
             vec![
                 "sec-ch-ua-platform",
-                "user-agent",
                 "sec-ch-ua",
                 "sec-ch-ua-mobile",
+                "user-agent",
                 "accept",
                 "origin",
                 "sec-fetch-site",
@@ -417,9 +423,9 @@ mod tests {
         );
     }
 
-    // A body moves `content-length` to the front and `content-type` between the
-    // two client-hint groups, which is where Chromium puts them and where no
-    // hand-rolled list would guess.
+    // A body moves `content-length` to the front; `content-type` stays in its
+    // table slot after the client-hint block, which is where Chromium 154
+    // puts them and where no hand-rolled list would guess.
     #[test]
     fn a_body_puts_content_length_first_and_content_type_in_chromes_slot() {
         let fingerprint = fingerprint();
@@ -443,12 +449,16 @@ mod tests {
             [
                 "content-length",
                 "sec-ch-ua-platform",
-                "user-agent",
                 "sec-ch-ua",
-                "content-type"
+                "sec-ch-ua-mobile",
+                "user-agent",
             ],
         );
         assert_eq!(value(&build_chrome_headers(&plan), "content-length"), Some("5"));
+        let names = names(&build_chrome_headers(&plan));
+        let ua = names.iter().position(|name| name == "user-agent").unwrap();
+        let ct = names.iter().position(|name| name == "content-type").unwrap();
+        assert_eq!(ct, ua + 1);
     }
 
     // A form-submission navigation is the same shape as a GET navigation with
@@ -637,11 +647,11 @@ mod tests {
         assert_eq!(value(&build_chrome_headers(&plan), "sec-fetch-user"), None);
     }
 
-    // An accepted high-entropy hint is emitted once, in the slot after the
-    // low-entropy trio, and never duplicated by a caller header of the same
-    // name. The set it came from used to be iterated directly.
+    // An accepted high-entropy hint is emitted once, in its own table slot,
+    // and never duplicated by a caller header of the same name. The set it
+    // came from used to be iterated directly.
     #[test]
-    fn accepted_client_hints_are_sorted_and_not_duplicated() {
+    fn accepted_client_hints_keep_their_table_slots_and_are_not_duplicated() {
         let fingerprint = fingerprint();
         let url = Url::parse("https://example.com/").unwrap();
         let request = ResourceRequest::navigation();
@@ -670,8 +680,10 @@ mod tests {
         assert_eq!(hint_names, ["sec-ch-ua-arch", "sec-ch-ua-platform-version"]);
         assert_eq!(built.iter().filter(|(name, _)| name == "sec-ch-ua").count(), 1);
         assert_eq!(value(&built, "sec-ch-ua"), Some("caller-owned"));
-        // The trio still precedes the high-entropy hints.
-        assert!(names(&built).iter().position(|name| name == "sec-ch-ua-platform").unwrap()
-            < names(&built).iter().position(|name| name == "sec-ch-ua-arch").unwrap());
+        // Chrome 154 enumerates the hint block mobile, full-version, arch,
+        // platform, ... so `arch` precedes `platform`, and every hint keeps
+        // that slot regardless of which ones the origin accepted.
+        assert!(names(&built).iter().position(|name| name == "sec-ch-ua-arch").unwrap()
+            < names(&built).iter().position(|name| name == "sec-ch-ua-platform").unwrap());
     }
 }

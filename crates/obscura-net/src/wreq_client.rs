@@ -1349,9 +1349,9 @@ mod tests {
             wire_header_names(&raw),
             vec![
                 "sec-ch-ua-platform",
-                "user-agent",
                 "sec-ch-ua",
                 "sec-ch-ua-mobile",
+                "user-agent",
                 "accept",
                 "origin",
                 "sec-fetch-site",
@@ -1369,7 +1369,7 @@ mod tests {
     }
 
     /// A scripted POST body puts `content-length` first and `content-type`
-    /// between the two client-hint groups, which is Chromium's insertion order
+    /// after the client-hint block, which is Chromium 154's insertion order
     /// and not the order a list built by hand would produce. The length must
     /// also be the one the transport sent, not a second copy appended.
     #[tokio::test]
@@ -1400,10 +1400,10 @@ mod tests {
             vec![
                 "content-length",
                 "sec-ch-ua-platform",
-                "user-agent",
                 "sec-ch-ua",
-                "content-type",
                 "sec-ch-ua-mobile",
+                "user-agent",
+                "content-type",
                 "accept",
                 "origin",
                 "sec-fetch-site",
