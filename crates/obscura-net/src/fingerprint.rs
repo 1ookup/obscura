@@ -103,14 +103,14 @@ pub struct FingerprintOverrides {
 }
 
 pub const DEFAULT_USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36";
 
 fn default_language() -> String {
     host_language()
 }
 
 fn default_languages() -> Vec<String> {
-    vec![default_language()]
+    authored_languages(&default_language())
 }
 
 /// Chrome reports the machine's preferred language, so the default identity
@@ -259,6 +259,7 @@ pub const MACOS_MENUBAR_INSET: u32 = 33;
 /// produce, and it is trivially checkable. Majors absent from this table keep
 /// the User-Agent token, because a wrong specific build is no better.
 const CHROME_BUILDS: &[(&str, &str)] = &[
+    ("154", "154.0.8037.93"),
     ("151", "151.0.7922.76"),
     ("149", "149.0.7827.0"),
     ("146", "146.0.7680.80"),
@@ -283,13 +284,20 @@ fn resolve_browser_version(token: String) -> String {
         .unwrap_or(token)
 }
 
-/// `navigator.languages` is exactly the authored preference list: a `zh-CN`
-/// session reports `["zh-CN"]` (passing Chrome census, Step 300). The
-/// base-language fallback lives in the Accept-Language header only, where
-/// Chrome's serializer synthesizes it (`accept_language` below). The two
-/// surfaces used to share one expanded list, which leaked the header shape
-/// into the property.
+/// `navigator.languages` is the authored preference list plus the
+/// base-language fallback Chrome reports for a regional variant: a `zh-CN`
+/// session reads `["zh-CN", "zh"]`, byte for byte the reference capture of
+/// 2026-10-05 (an older census claim that it stays one entry lost to the
+/// direct byte comparison). The Accept-Language header serializes the same
+/// pair, so the property and the header stay one list; the lone-entry
+/// synthesis in `accept_language` only covers a directly supplied single
+/// tag.
 fn authored_languages(language: &str) -> Vec<String> {
+    if let Some((base, _)) = language.split_once('-') {
+        if !base.is_empty() && base != language {
+            return vec![language.to_string(), base.to_string()];
+        }
+    }
     vec![language.to_string()]
 }
 
@@ -564,10 +572,11 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
     /// request header. The first entry is unweighted; later entries use
     /// Chrome's conventional descending q-values.
     ///
-    /// Chrome's header serializer synthesizes the base language of a lone
-    /// regional variant (`zh-CN` preference -> `zh-CN,zh;q=0.9` header) while
-    /// `navigator.languages` stays the authored one-entry list. A list with
-    /// more than one authored entry serializes verbatim.
+    /// The authored list carries the base-language fallback for a regional
+    /// variant (`zh-CN` -> `["zh-CN", "zh"]`), which serializes verbatim; a
+    /// lone regional variant supplied directly still gets the base
+    /// synthesized here, matching Chrome's serializer (`zh-CN` preference ->
+    /// `zh-CN,zh;q=0.9` header).
     pub fn accept_language(&self) -> String {
         let authored = if self.languages.is_empty() {
             std::slice::from_ref(&self.language)
@@ -726,14 +735,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_a_macos_chrome_149_apple_silicon_identity() {
+    fn default_is_a_macos_chrome_154_apple_silicon_identity() {
         let fingerprint = BrowserFingerprint::from_user_agent(DEFAULT_USER_AGENT);
         // The language is the host's, not a constant: the surfaces must agree
         // with whichever locale this machine reports (header synthesis
         // included), which is the property the census reads.
         let language = default_language();
         assert_eq!(fingerprint.language, language);
-        assert_eq!(fingerprint.languages, vec![language.clone()]);
+        let mut expected_languages = vec![language.clone()];
+        if let Some((base, _)) = language.split_once('-') {
+            expected_languages.push(base.to_string());
+        }
+        assert_eq!(fingerprint.languages, expected_languages);
         let expected_header = if language.contains('-') {
             let base = language.split('-').next().unwrap();
             format!("{language},{base};q=0.9")
@@ -888,17 +901,17 @@ mod tests {
     }
 
     #[test]
-    fn language_property_is_the_authored_list_and_header_adds_the_fallback() {
+    fn language_property_carries_the_same_base_fallback_as_the_header() {
         let fingerprint = BrowserFingerprint::default().with_overrides(&FingerprintOverrides {
             language: Some("zh-CN".to_string()),
             ..FingerprintOverrides::default()
         });
         assert_eq!(fingerprint.language, "zh-CN");
-        // navigator.languages is the authored one-entry preference (passing
-        // Chrome census hits the bare "zh-CN" bucket). The base-language
-        // fallback is a header-side synthesis only: Accept-Language still
-        // reads zh-CN,zh;q=0.9.
-        assert_eq!(fingerprint.languages, vec!["zh-CN"]);
+        // navigator.languages carries the authored regional variant plus its
+        // base-language fallback, matching the reference Chrome capture of
+        // 2026-10-05 (["zh-CN", "zh"]). The header serializes the same pair,
+        // so Accept-Language still reads zh-CN,zh;q=0.9.
+        assert_eq!(fingerprint.languages, vec!["zh-CN", "zh"]);
         assert_eq!(fingerprint.accept_language(), "zh-CN,zh;q=0.9");
 
         let languages = BrowserFingerprint::default().with_overrides(&FingerprintOverrides {
@@ -933,7 +946,9 @@ mod tests {
         let value = serde_json::to_value(BrowserFingerprint::default()).unwrap();
         assert_eq!(value["navigatorPlatform"], "MacIntel");
         assert_eq!(value["screen"]["deviceScaleFactor"], 2.0);
-        assert_eq!(value["brands"][0]["brand"], "Google Chrome");
+        // The 154 major seeds the [2, 0, 1] permutation, so the serialized
+        // list leads with Chromium (the reference capture's order).
+        assert_eq!(value["brands"][0]["brand"], "Chromium");
         assert_eq!(value["gpu"]["webgpuProfile"], "apple");
     }
 

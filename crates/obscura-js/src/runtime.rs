@@ -22506,13 +22506,13 @@ RequestRedirect value",
                 })()"#,
             )
             .unwrap();
-        // navigator.languages is the authored one-entry preference list, in
-        // the main realm and in a frame realm alike (passing Chrome census:
-        // bare "zh-CN" bucket). The Accept-Language header keeps the
-        // base-language fallback; the two surfaces are decoupled.
+        // navigator.languages is the authored regional variant plus its
+        // base-language fallback, in the main realm and in a frame realm
+        // alike (byte-equal to the reference Chrome capture of 2026-10-05).
+        // The Accept-Language header serializes the same pair.
         assert_eq!(
             values,
-            serde_json::json!(["zh-CN", ["zh-CN"], "zh-CN", ["zh-CN"]])
+            serde_json::json!(["zh-CN", ["zh-CN", "zh"], "zh-CN", ["zh-CN", "zh"]])
         );
     }
 
