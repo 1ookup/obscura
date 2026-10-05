@@ -687,16 +687,19 @@ fn identity_line(item: &InlineItem, run: &cosmic_text::LayoutRun, line_w: f32) -
     (line, units, size)
 }
 
-/// Snap a width to Blink's `LayoutUnit` grid, 1/64 px, ties away from zero.
+/// Snap a width to Blink's `LayoutUnit` grid, 1/64 px, rounding up.
 ///
-/// Every element width a browser reports goes through this: the reference
-/// answers `getBoundingClientRect()` for a 16px Arial `Cloudflare` as 72.9375
-/// where its own `measureText` says 72.9296875, and 948.875 where the canvas
-/// says 948.8671875 -- each exactly the canvas value rounded to the nearest
-/// 1/64. The canvas channel keeps the unrounded value, which is why this is
-/// applied on the element side only.
+/// Every element width a browser reports goes through this. Chrome's element
+/// widths are the canvas advance ceiled to the 1/64 grid, not rounded to
+/// nearest: across 51 characters and strings at 14px system-ui, all 51 match
+/// the ceiling and 38 of them discriminate against round-to-nearest (a
+/// regular `s` has canvas 7.177734375 and reads 7.1875 on the element, where
+/// nearest gives 7.171875). The older Arial examples agree: 72.9296875 ->
+/// 72.9375 and 948.8671875 -> 948.875 are both ceilings, their 64ths landing
+/// on .5 where the two rules coincide. The canvas channel keeps the
+/// unrounded value, which is why this is applied on the element side only.
 pub(crate) fn snap_layout_unit(value: f32) -> f32 {
-    (value * 64.0).round() / 64.0
+    (value * 64.0).ceil() / 64.0
 }
 
 /// Pixel width of a scaled unit count, zero when the line had no covered text
@@ -5790,10 +5793,11 @@ fn buffer_size(item: &InlineItem) -> (f32, f32, bool) {
     let clamped = item.line_clamp.is_some_and(|limit| nonempty_lines > limit);
     (
         // This is the paragraph IFC's intrinsic width. Chrome reports span
-        // widths on the 1/64 LayoutUnit grid (measured live: a 16px
-        // sans-serif "M" answers 14.125 = 904/64 immediately and settled,
-        // never the ceiled 15 nor the canvas f32 14.112): the same snap the
-        // word path applies, not the historical whole-pixel ceiling.
+        // widths on the 1/64 LayoutUnit grid, rounding up (measured live: a
+        // 16px sans-serif "M" answers 14.125 = 904/64 immediately and
+        // settled, which is ceil64 of its canvas 14.112, not the round's
+        // 14.109375 and not the historical whole-pixel 15): the same snap
+        // the word path applies.
         snap_layout_unit(
             w * item.advance_scale + identity_width(emoji_units, emoji_size),
         ),

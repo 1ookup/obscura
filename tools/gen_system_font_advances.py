@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Rewrite the bundled system fonts' ASCII advances to the reference values.
+"""Rewrite the bundled system fonts' advances to the reference values.
 
 The DOM's `system-ui` face shapes from `assets/dejavu-sans.ttf` (and its bold
 companion), and cosmic-text's wrap decisions read those glyph advances before
 any identity-table correction runs, so a stand-in advance that differs from
 macOS Chrome's SF makes "tttt hhhh" wrap onto two lines whenever the cell is
 sized to the corrected width. Rewriting the hmtx advances to the measured
-SF values (font-advances-ascii95-systemui14.json, produced by
-cf-validator's Chrome probe) makes shaping, wrapping and the identity table
-agree on one set of numbers.
+SF values makes shaping, wrapping and the identity table agree on one set of
+numbers.
+
+Input: the spanW JSON `tools/gen_font_tables.py --spanw-out` writes (ASCII +
+Latin-1, both weights, from the same Chrome canvas probe that generates
+font_tables.rs). Characters the stand-in lacks a glyph for are skipped; a
+zero advance (soft hyphen) is not emitted, keeping the stand-in's own value.
 
 Usage:
-  uv run --with fonttools python tools/gen_system_font_advances.py <ascii95.json>
+  uv run --with fonttools python tools/gen_system_font_advances.py <spanw.json>
 
 Glyph outlines are untouched; only advance widths change. Run from the repo
 root; the bundled ttf files are rewritten in place.
