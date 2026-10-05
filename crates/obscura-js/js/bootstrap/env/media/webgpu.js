@@ -74,11 +74,11 @@ const _GPU_DEFAULT_LIMITS = {
 // An Intel part on D3D12: BC compression, no ASTC or ETC2, which are the
 // mobile and Apple formats.
 const _GPU_ADAPTER_FEATURES = [
-  'depth32float-stencil8', 'rg11b10ufloat-renderable', 'bgra8unorm-storage',
-  'texture-formats-tier1', 'texture-compression-bc', 'dual-source-blending',
+  'depth32float-stencil8', 'rg11b10ufloat-renderable', 'texture-formats-tier1',
+  'bgra8unorm-storage', 'texture-compression-bc', 'dual-source-blending',
   'core-features-and-limits', 'float32-filterable', 'indirect-first-instance',
   'float32-blendable', 'depth-clip-control', 'texture-compression-bc-sliced-3d',
-  'texture-formats-tier2', 'shader-f16', 'clip-distances',
+  'texture-formats-tier2', 'clip-distances', 'shader-f16',
   'texture-component-swizzle', 'subgroups',
 ];
 // The Apple/Metal adapter a macOS fingerprint claims. Feature order is the
