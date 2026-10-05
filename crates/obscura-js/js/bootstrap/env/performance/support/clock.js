@@ -38,14 +38,23 @@ const _PERF_RING_OFF = [0, _PERF_RING_C8];
 _PERF_RING_OFF.push(_PERF_RING_OFF[1] + _PERF_RING_D0);
 _PERF_RING_OFF.push(_PERF_RING_OFF[2] + _PERF_RING_D0);
 _PERF_RING_OFF.push(_PERF_RING_OFF[3] + _PERF_RING_C8);
-// A cross-origin isolated worker keeps the float32 rounding its 5 microsecond
-// quantum always carried: the quantum is rounded through f32 so the smallest
-// step sits in that class at every magnitude. Realms are seeded from the
-// startup snapshot, so the realm-level check has to be deferred to the first
-// reading: WORKER_PREP_TEMPLATE defines the marker in the worker before any
-// worker script runs, but after this module has already been evaluated.
-const _PERF_CLAMP_ISOLATED_MS_F32 = Math.fround(_PERF_CLAMP_ISOLATED_MS);
-var _perfWorkerQuantumIsolated = null;
+// A cross-origin isolated realm steps at 5 microseconds, and its readings
+// walk the same kind of lattice one scale down: a 0.125 ms macro anchor
+// whose 25 slots mix 23 steps of 83886*2^-24 with 2 steps of 83887*2^-24,
+// so the superblock closes on 0.125 exactly and the smallest step is the
+// lower member L = 83886*2^-24 = 0.004999995231628418 bit for bit. The two
+// wider steps sit a 12/13-step gap apart (Chrome 154, page and worker both,
+// dense probe run); the absolute slot phase differs per realm and is not
+// modelled, only the gap. Both realms ship this table: their measured walks
+// are the same cycle at a 15-slot rotation.
+const _PERF_ISO_L = 83886 * Math.pow(2, -24);
+const _PERF_ISO_H = 83887 * Math.pow(2, -24);
+const _PERF_ISO_OFF = [0];
+for (var _perfIsoSlot = 0; _perfIsoSlot < 25; _perfIsoSlot++) {
+  var _perfIsoStep =
+    (_perfIsoSlot === 5 || _perfIsoSlot === 18) ? _PERF_ISO_H : _PERF_ISO_L;
+  _PERF_ISO_OFF.push(_PERF_ISO_OFF[_perfIsoSlot] + _perfIsoStep);
+}
 globalThis.__obscura_rebasePerformanceOrigin = function(timeOrigin) {
   var elapsed = Date.now() - timeOrigin;
   _perfOriginMono = _monoMs() - (elapsed > 0 ? elapsed : 0);
@@ -64,31 +73,23 @@ var _performanceNowImpl = (function() {
   // The isolation state lives on a getter the surface finalize installs, so
   // it is read per call: this module runs before that finalize, and a page
   // can flip nothing here afterwards. The read is one memory-backed getter.
-  // Cross-origin isolated realms keep the 5 microsecond floor with the f32
-  // quantum; every other realm walks the ring below, so the clamp returns
-  // null there.
-  function _isolatedClamp() {
-    var isolated = false;
-    try { isolated = globalThis.crossOriginIsolated === true; } catch (e) {}
-    if (!isolated) return null;
-    if (_perfWorkerQuantumIsolated === null) {
-      _perfWorkerQuantumIsolated =
-        typeof globalThis.__obscuraIsWorker !== 'undefined'
-          ? _PERF_CLAMP_ISOLATED_MS_F32 : _PERF_CLAMP_ISOLATED_MS;
-    }
-    return [_PERF_CLAMP_ISOLATED_MS, _perfWorkerQuantumIsolated];
+  // Cross-origin isolated realms walk the 25-slot 5 microsecond lattice;
+  // every other realm walks the 0.1 ms ring. Both realms of a context share
+  // their table, so no worker marker is consulted.
+  function _isIsolated() {
+    try { return globalThis.crossOriginIsolated === true; } catch (e) { return false; }
   }
   return function() {
     var mono = _monoMs();
     if (_perfOriginMono === null) _perfOriginMono = mono;
     var ms = mono - _perfOriginMono;
     if (!(ms > 0)) ms = 0;
-    var clamp = _isolatedClamp();
-    if (clamp === null) {
+    if (!_isIsolated()) {
       var ticks = Math.floor(ms / _PERF_CLAMP_MS);
       ms = Math.floor(ticks / 5) * 0.5 + _PERF_RING_OFF[ticks % 5];
     } else {
-      ms = Math.floor(ms / clamp[0]) * clamp[1];
+      var iticks = Math.floor(ms / _PERF_CLAMP_ISOLATED_MS);
+      ms = Math.floor(iticks / 25) * 0.125 + _PERF_ISO_OFF[iticks % 25];
     }
     if (ms < _last) return _last;
     _last = ms;

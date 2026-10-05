@@ -14601,17 +14601,20 @@ RequestRedirect value",
         );
     }
 
-    /// A DOMHighResTimeStamp carries sub-millisecond precision, floored to
-    /// 100 microseconds. Deriving it from `Date.now()` makes every reading a
-    /// whole millisecond, and a page that times two consecutive calls reads a
-    /// A cross-origin isolated realm opens the clock to Chrome's 5
-    /// microsecond floor: the smallest step between two readings sits on the
-    /// 0.005 grid (with the double error of the derivation), where the plain
-    /// realm keeps the 0.1 step. The challenge times this resolution in both
-    /// of its realms, so the isolation state has to move the clock, not just
-    /// the boolean.
+    /// A cross-origin isolated realm steps at 5 microseconds, and its
+    /// readings walk a 25-slot 0.125 ms lattice: 23 steps of 83886*2^-24
+    /// plus 2 of 83887*2^-24 per superblock, closing exactly. The smallest
+    /// step is the lower member 0.004999995231628418 bit for bit, never the
+    /// float32 rounding of the nominal 0.005, which is a clock no browser
+    /// ships; the challenge reads exactly this step out of an isolated
+    /// worker, so a coarsely right resolution still fails the fingerprint.
     #[test]
     fn performance_now_opens_to_five_microseconds_when_isolated() {
+        // The lower member of the isolated lattice, this test's pin.
+        const L_BITS: u64 = 0x3F74_7AE0_0000_0000;
+        // 0x3f747ae140000000, the float32-rounded 0.005; pinned separately
+        // so the retired quantum shape can never satisfy both assertions.
+        const OLD_BITS: u64 = 0x3F74_7AE1_4000_0000;
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html("<html><body></body></html>"));
         rt.set_url("https://isolated.example/page");
@@ -14632,9 +14635,15 @@ RequestRedirect value",
             .unwrap()
             .as_f64()
             .unwrap();
-        assert!(
-            (smallest_step - 0.005).abs() < 1e-6,
-            "isolated smallest step was {smallest_step}, expected ~0.005"
+        assert_eq!(
+            smallest_step.to_bits(),
+            L_BITS,
+            "isolated smallest step {smallest_step} is not the lower lattice member",
+        );
+        assert_ne!(
+            smallest_step.to_bits(),
+            OLD_BITS,
+            "isolated smallest step is the float32-rounded 0.005",
         );
     }
 
