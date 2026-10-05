@@ -521,3 +521,11 @@ run covers are then removed.
   requestStorageAccess and hasStorageAccess both answer true, so the name
   leaves the Document prototype and its behavior test pins the absence;
   full gate deferred to the next backfill
+
+- all six high-entropy client hints pinned in the scripted fetch test
+  (10-06, 8ee8b3d): test-only, no behaviour change; scoped:
+  cargo nextest run --release -p obscura-net --config vendor/v8-source.toml =
+  137/137 (obscura-net carries no render feature, stealth rides default); the
+  new scripted_accept_ch_sends_all_six_high_entropy_hints seeds the accepted
+  set with the full nine names and asserts each of the six high-entropy hints
+  is sent exactly once; full gate deferred to the next backfill
