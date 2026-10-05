@@ -2480,6 +2480,53 @@ const _navigatorMemberLengths = {
     }
   }
 
+  // Ink ships one operation, and Chrome 154's navigator.ink prototype
+  // carries it ahead of the constructor; a call resolves a
+  // DelegatedInkTrailPresenter-shaped object. The challenge's navigator
+  // probe reads this member, so the interface must not stay a bare stub.
+  (function installInkRequestPresenter() {
+    const inkProto = prototypeFor('Ink');
+    if (!inkProto
+        || Object.prototype.hasOwnProperty.call(inkProto, 'requestPresenter')) return;
+    const presenterProto = prototypeFor('DelegatedInkTrailPresenter');
+    if (presenterProto) {
+      // Chrome's presenter prototype reads presentationArea (a getter) and
+      // updateInkTrailStartPoint ahead of its constructor.
+      if (!Object.prototype.hasOwnProperty.call(presenterProto, 'presentationArea')) {
+        const presentationArea = _markNativeAs(function () { return null; },
+          'function get presentationArea() { [native code] }');
+        Object.defineProperty(presenterProto, 'presentationArea', {
+          get: presentationArea, enumerable: true, configurable: true,
+        });
+      }
+      if (!Object.prototype.hasOwnProperty.call(presenterProto, 'updateInkTrailStartPoint')) {
+        const updateInkTrailStartPoint = _markNative(function updateInkTrailStartPoint() {});
+        Object.defineProperty(presenterProto, 'updateInkTrailStartPoint', {
+          value: updateInkTrailStartPoint, writable: true, enumerable: true, configurable: true,
+        });
+      }
+      const presenterCtor = Object.getOwnPropertyDescriptor(presenterProto, 'constructor');
+      if (presenterCtor && presenterCtor.configurable) {
+        delete presenterProto.constructor;
+        Object.defineProperty(presenterProto, 'constructor', presenterCtor);
+      }
+    }
+    const requestPresenter = function requestPresenter() {
+      return Promise.resolve(presenterProto ? Object.create(presenterProto) : {});
+    };
+    _markNative(requestPresenter);
+    Object.defineProperty(requestPresenter, 'length', { value: 0, configurable: true });
+    Object.defineProperty(inkProto, 'requestPresenter', {
+      value: requestPresenter, writable: true, enumerable: true, configurable: true,
+    });
+    // The constructor trails the members in Chrome's key order.
+    const ctorDesc = Object.getOwnPropertyDescriptor(inkProto, 'constructor');
+    if (ctorDesc && ctorDesc.configurable) {
+      delete inkProto.constructor;
+      Object.defineProperty(inkProto, 'constructor', ctorDesc);
+    }
+  })();
+
   // Runs last: it reorders members that are already on the prototype.
   for (const interfaceName of Object.keys(memberOrder)) {
     const proto = prototypeFor(interfaceName) || syntheticPrototypes.get(interfaceName);
