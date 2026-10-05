@@ -130,10 +130,10 @@ const _GPU_APPLE = {
     'texture-formats-tier1', 'bgra8unorm-storage', 'texture-compression-bc',
     'dual-source-blending', 'core-features-and-limits', 'float32-filterable',
     'indirect-first-instance', 'texture-compression-astc-sliced-3d',
-    'float32-blendable', 'texture-compression-astc', 'texture-compression-etc2',
-    'depth-clip-control', 'texture-compression-bc-sliced-3d',
-    'texture-formats-tier2', 'clip-distances', 'shader-f16',
-    'texture-component-swizzle', 'subgroups',
+    'float32-blendable', 'subgroup-size-control', 'texture-compression-astc',
+    'texture-compression-etc2', 'depth-clip-control',
+    'texture-compression-bc-sliced-3d', 'texture-formats-tier2', 'clip-distances',
+    'shader-f16', 'texture-component-swizzle', 'subgroups',
   ],
 };
 function _gpuAdapterProfile() {
@@ -143,9 +143,11 @@ function _gpuAdapterProfile() {
 }
 // A property of the Chrome build, not of the adapter.
 const _GPU_WGSL_FEATURES = [
-  'packed_4x8_integer_dot_product', 'subgroup_uniformity', 'subgroup_id',
-  'linear_indexing', 'readonly_and_readwrite_storage_textures',
-  'unrestricted_pointer_parameters', 'pointer_composite_access',
+  'packed_4x8_integer_dot_product', 'subgroup_uniformity',
+  'immediate_address_space', 'subgroup_id', 'linear_indexing',
+  'readonly_and_readwrite_storage_textures', 'swizzle_assignment',
+  'unrestricted_pointer_parameters', 'buffer_view',
+  'pointer_composite_access', 'texture_formats_tier1',
   'texture_and_sampler_let', 'uniform_buffer_standard_layout',
 ];
 
