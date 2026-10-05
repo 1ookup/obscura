@@ -3999,11 +3999,21 @@ fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate:
     if let Some(bgcolor) = node.get_attribute("bgcolor") {
         crate::style::apply_inline(style, &format!("background-color: {}", bgcolor));
     }
-    if let Some(width) = node.get_attribute("width") {
-        if width.chars().all(|c| c.is_ascii_digit()) {
-            crate::style::apply_inline(style, &format!("width: {}px", width));
-        } else {
-            crate::style::apply_inline(style, &format!("width: {}", width));
+    // A canvas `width`/`height` attribute is its intrinsic content size, not a
+    // presentational CSS hint like an image's: Chrome keeps it out of the
+    // cascade and derives the box from the replaced-size rules plus the
+    // attribute ratio below. Injecting it here sized `canvas width=500` with
+    // `style="width:250px"` at 250x250 instead of 250x125.
+    let is_canvas = node
+        .as_element()
+        .is_some_and(|element| element.local.as_ref() == "canvas");
+    if !is_canvas {
+        if let Some(width) = node.get_attribute("width") {
+            if width.chars().all(|c| c.is_ascii_digit()) {
+                crate::style::apply_inline(style, &format!("width: {}px", width));
+            } else {
+                crate::style::apply_inline(style, &format!("width: {}", width));
+            }
         }
     }
     if let Some(align) = node.get_attribute("align") {
@@ -4017,11 +4027,13 @@ fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate:
             crate::style::apply_inline(style, &format!("border-spacing: {}px", cellspacing));
         }
     }
-    if let Some(height) = node.get_attribute("height") {
-        if height.chars().all(|c| c.is_ascii_digit()) {
-            crate::style::apply_inline(style, &format!("height: {}px", height));
-        } else {
-            crate::style::apply_inline(style, &format!("height: {}", height));
+    if !is_canvas {
+        if let Some(height) = node.get_attribute("height") {
+            if height.chars().all(|c| c.is_ascii_digit()) {
+                crate::style::apply_inline(style, &format!("height: {}px", height));
+            } else {
+                crate::style::apply_inline(style, &format!("height: {}", height));
+            }
         }
     }
     if style.aspect_ratio.is_none() {
@@ -16293,6 +16305,25 @@ fn build(
                     .get_attribute("src")
                     .is_some_and(|value| !value.trim().is_empty()),
         ) {
+            // A canvas width/height attribute is its intrinsic size, not a CSS
+            // hint: the cascade above no longer injects it, so the shared
+            // default table would always say 300x150. Read the attributes here
+            // rather than changing the table for every replaced tag. Invalid or
+            // non-positive values fall back to the HTML defaults.
+            let (width, height) = if _name.local.as_ref() == "canvas" {
+                let attribute_axis = |name: &str, fallback: f32| {
+                    node.get_attribute(name)
+                        .and_then(|value| value.trim().parse::<f32>().ok())
+                        .filter(|value| *value > 0.0)
+                        .unwrap_or(fallback)
+                };
+                (
+                    attribute_axis("width", 300.0),
+                    attribute_axis("height", 150.0),
+                )
+            } else {
+                (width, height)
+            };
             // A default-sized canvas is a replaced box like an image: seed its
             // preferred width before handing the leaf to taffy, or block layout
             // passes the containing-block width as a known dimension and
