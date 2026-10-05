@@ -1674,6 +1674,53 @@ mod tests {
         }
     }
 
+    // The challenge platform's Accept-CH list carries all six high-entropy
+    // hints, and run2's serve log shows the accepted set at the full seventeen
+    // names before the first challenge POST. A same-origin scripted fetch must
+    // therefore put all six on the wire; this pins the emission side to six of
+    // six, platform-version included.
+    #[tokio::test]
+    async fn scripted_accept_ch_sends_all_six_high_entropy_hints() {
+        let (url, request) = header_fixture().await;
+        let fingerprint = crate::fingerprint::BrowserFingerprint::from_user_agent(super::STEALTH_USER_AGENT);
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()), None, true, fingerprint,
+        );
+        client.accepted_client_hints.write().await.insert(
+            super::client_hint_origin(&url),
+            std::collections::HashSet::from([
+                "sec-ch-ua".to_string(),
+                "sec-ch-ua-mobile".to_string(),
+                "sec-ch-ua-platform".to_string(),
+                "sec-ch-ua-arch".to_string(),
+                "sec-ch-ua-bitness".to_string(),
+                "sec-ch-ua-full-version".to_string(),
+                "sec-ch-ua-full-version-list".to_string(),
+                "sec-ch-ua-model".to_string(),
+                "sec-ch-ua-platform-version".to_string(),
+            ]),
+        );
+        client
+            .send_single("GET", &url, &HashMap::new(), "", false, false, true)
+            .await
+            .expect("fixture must be reachable");
+        let request = request.await.unwrap().to_ascii_lowercase();
+        for name in [
+            "sec-ch-ua-arch",
+            "sec-ch-ua-bitness",
+            "sec-ch-ua-full-version",
+            "sec-ch-ua-full-version-list",
+            "sec-ch-ua-model",
+            "sec-ch-ua-platform-version",
+        ] {
+            assert_eq!(
+                request.matches(&format!("\r\n{name}:")).count(),
+                1,
+                "{name} must be sent exactly once: {request}"
+            );
+        }
+    }
+
     // A frame that is not same-origin with the top-level document does not
     // inherit the client-hints delegation: the six high-entropy fields the
     // origin published in Accept-CH stay off the wire, and only the
