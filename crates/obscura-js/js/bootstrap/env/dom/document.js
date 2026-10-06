@@ -463,8 +463,12 @@ var Document = _swappableInterface('Document', class extends Node {
     const nid = globalThis.__currentScriptNid;
     return nid ? _wrapEl(+nid) : null;
   }
-  get hidden() { return false; }
-  get visibilityState() { return "visible"; }
+  // The visibility slot mirrors the document's rendering state: a frame
+  // whose host iframe has no layout box (display:none, 0x0, not yet laid
+  // out) is hidden, exactly as Chrome reports for the challenge widget
+  // iframe. Unset on top-level documents, which stay visible.
+  get hidden() { return (globalThis.__documentVisibilityState__ || 'visible') === 'hidden'; }
+  get visibilityState() { return globalThis.__documentVisibilityState__ || 'visible'; }
   get webkitVisibilityState() { return this.visibilityState; }
   get webkitHidden() { return this.hidden; }
   getElementById(id) {

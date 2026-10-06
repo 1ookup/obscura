@@ -604,3 +604,20 @@ run covers are then removed.
   replay of the uach_probe.js fixture on the challenge origin (two-entry
   lists through getHighEntropyValues). Scoped: obscura-js 754/754
   (--features render). Full gate deferred to the next backfill
+
+- hidden documents fire no animation frames (10-06): the engine pumped
+  requestAnimationFrame at a fixed 16ms in every document, and
+  document.hidden/visibilityState were hardcoded false/visible even for a
+  frame whose host iframe has no rendering box -- where the live 149
+  payload reads the challenge widget's document as hidden and the
+  reference browser fires no rAF callbacks at all, which is exactly the
+  oHIQ6 family's shape (71 paired readings at a 16ms cadence here, empty
+  on every reference round). A frame now derives its visibility slot from
+  the same layout answer innerWidth already uses (rendered=false ->
+  hidden), the getters read the slot, and the rAF pump holds its pending
+  callbacks while hidden, re-arming on visibilitychange. Rendered frames
+  and top-level documents stay visible; Pdbt7's Lcfc8 count was checked
+  against this first -- performance.measure buffers correctly, so that
+  count is challenge-call-volume, not a dropped-entry bug. Scoped:
+  obscura-js 755/755 (--features render, one new two-frame probe test).
+  Full gate deferred to the next backfill

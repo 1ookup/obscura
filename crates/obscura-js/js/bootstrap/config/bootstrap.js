@@ -190,7 +190,7 @@ for (const name of [
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts',
     '__obscura_nextPendingTimeoutDelay',
-    '__documentReadyState__', '__currentUrl',
+    '__documentReadyState__', '__documentVisibilityState__', '__currentUrl',
     '__obscura_document_all', '__obscura_document_all_resolve',
     '_installDocumentAll', '_documentAllElements', '_documentAllNamed',
     '_HTML_ALL_OWN_KEYS',

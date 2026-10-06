@@ -36101,4 +36101,81 @@ mod secure_context_navigator_gate_probe {
             rt.evaluate("window.__uach").unwrap()
         );
     }
+
+    /// A frame whose host iframe has no rendering box is a hidden document
+    /// (the challenge widget is a 0x0 hidden iframe, and the live 149 payload
+    /// reads its document as hidden), and hidden documents fire no animation
+    /// callbacks -- a fixed-tick pump answered them where the reference
+    /// stays empty. A rendered frame stays visible with a working pump.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unrendered_frame_is_hidden_and_fires_no_animation_frames() {
+        let dom = parse_html(
+            r#"<html><body>
+                <iframe id=hiddenf style="display:none"></iframe>
+                <iframe id=shownf style="display:block;width:300px;height:65px;border:0"></iframe>
+            </body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(400.0, 300.0);
+        rt.run_page_init();
+        rt.install_internal_namespace();
+        let setup = |name: &str, id: &str| {
+            let tpl = r#"(() => {
+                const op = (cmd, a1) =>
+                    Deno.core.ops.op_dom(cmd, String(a1 ?? ""), "");
+                const host = document.getElementById("@id@")[Symbol.for('obscura.nid')];
+                const created = JSON.parse(op("create_iframe_content_document", host));
+                op("set_document_scope", created.root, JSON.stringify({
+                    url: "https://widget.example/frame",
+                    originUrl: "https://widget.example/frame",
+                    frameId: "@name@",
+                    documentGeneration: 1,
+                    csp: null,
+                }));
+                op("parse_into_subtree", created.root, "<html><body></body></html>");
+                return created.root;
+            })()"#;
+            tpl.replace("@name@", name).replace("@id@", id)
+        };
+        for (name, id) in [("hidden-frame", "hiddenf"), ("shown-frame", "shownf")] {
+            let root = rt.evaluate(&setup(name, id)).unwrap().as_f64().unwrap() as u32;
+            rt.ensure_frame_realm(name, 1, root, "https://widget.example/frame")
+                .unwrap();
+        }
+        async fn probe(
+            rt: &mut ObscuraJsRuntime,
+            name: &str,
+        ) -> Result<serde_json::Value, String> {
+            rt.evaluate_in_frame_realm_for_cdp(
+                name,
+                1,
+                crate::realm::MAIN_WORLD,
+                r#"(() => {
+                    return new Promise(resolve => {
+                        let fired = false;
+                        requestAnimationFrame(() => { fired = true; });
+                        setTimeout(() => resolve([document.visibilityState, document.hidden, fired]), 120);
+                    });
+                })()"#,
+                true,
+                true,
+                2_000,
+            )
+            .await
+            .map(|remote| remote.value.unwrap())
+        }
+        let hidden = probe(&mut rt, "hidden-frame").await.unwrap();
+        assert_eq!(
+            hidden,
+            serde_json::json!(["hidden", true, false]),
+            "unrendered frame: hidden document, no animation callbacks"
+        );
+        let shown = probe(&mut rt, "shown-frame").await.unwrap();
+        assert_eq!(
+            shown,
+            serde_json::json!(["visible", false, true]),
+            "rendered frame: visible document, animation pump runs"
+        );
+    }
 }

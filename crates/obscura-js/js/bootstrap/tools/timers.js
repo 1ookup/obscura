@@ -172,8 +172,35 @@ function _runRenderingOpportunity() {
   }
 }
 
+function _rafDocumentVisibility() {
+  try {
+    return globalThis.document ? String(globalThis.document.visibilityState) : 'visible';
+  } catch (_e) { return 'visible'; }
+}
+
+// A hidden document renders no frames, and Chrome never fires its animation
+// callbacks there. The challenge widget runs inside a 0x0 hidden iframe,
+// whose rAF-driven probes answer empty on the reference browser -- a fixed
+// 16ms pump answered them here. The callbacks stay pending; a
+// visibilitychange to visible re-arms the pump.
+function _onRafVisibilityChange() {
+  if (_rafDocumentVisibility() !== 'hidden') {
+    document.removeEventListener('visibilitychange', _onRafVisibilityChange);
+    _rafVisibilityWatch = false;
+    _scheduleAnimationFrame();
+  }
+}
+let _rafVisibilityWatch = false;
+
 function _scheduleAnimationFrame() {
   if (_rafFrameScheduled || _rafRunningFrame || _rafPending.size === 0) return;
+  if (_rafDocumentVisibility() === 'hidden') {
+    if (!_rafVisibilityWatch && typeof document.addEventListener === 'function') {
+      _rafVisibilityWatch = true;
+      document.addEventListener('visibilitychange', _onRafVisibilityChange);
+    }
+    return;
+  }
   _rafFrameScheduled = true;
   _scheduleRenderingOpportunity();
 }

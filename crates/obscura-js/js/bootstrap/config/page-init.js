@@ -378,6 +378,12 @@ globalThis.__obscura_init = function() {
           globalThis.innerWidth = zeroViewport ? 0 : parsed.clientWidth;
           globalThis.innerHeight = zeroViewport ? 0 : parsed.clientHeight;
         }
+        // The visibility slot rides the same layout answer: a frame with no
+        // rendering box is a hidden document (Chrome reports the challenge
+        // widget's document as hidden), and hidden frames fire no animation
+        // callbacks. Top-level documents keep the visible default.
+        globalThis.__documentVisibilityState__ =
+          parsed.rendered === false ? 'hidden' : 'visible';
       }
       // A frame viewport can change without recreating its realm (responsive
       // iframe CSS, display toggles, animation, or an embedder resize). Keep
