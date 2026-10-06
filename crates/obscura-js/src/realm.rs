@@ -65,7 +65,7 @@ fn realm_init_src() -> String {
 /// injection) a no-op.
 const DIAG_TOSTRING_FRAME: &str = r#"
 (function () {
-  if (Object.prototype.toString.__obscuraDiag) return;
+  if (!globalThis.__obscura_diag_tostring__) return;
   try { console.warn("[tostring-diag] armed realm=" +
     String(globalThis.location && globalThis.location.origin || "frame")); } catch (_e0) {}
   const _origToString = Object.prototype.toString;
@@ -1203,19 +1203,13 @@ impl ObscuraJsRuntime {
             .map_err(|error| format!("realm fingerprint serialization: {error}"))?;
         let stealth = self.stealth;
         let webgl_enabled = self.gpu_profile_enabled();
-        // The toString diagnosis arms per realm: each frame realm carries its
-        // own Object.prototype.toString, and the widget's collector runs in
-        // the frame -- an un-armed frame would report nothing.
-        let diag_tostring = std::env::var_os("OBSCURA_DEBUG_TOSTRING").is_some();
         self.run_in_realm_before_hydration(
             &context,
             "<obscura:frame-fingerprint>",
             &format!(
                 "globalThis.__obscura_set_fingerprint({fingerprint_json}); \
                  globalThis.__obscura_stealth = {stealth}; \
-                 globalThis.__obscura_webgl_enabled = {webgl_enabled}; \
-                 globalThis.__obscura_diag_tostring__ = {diag_tostring}; \
-                 {DIAG_TOSTRING_FRAME}"
+                 globalThis.__obscura_webgl_enabled = {webgl_enabled};"
             ),
         )?;
         if timing {
