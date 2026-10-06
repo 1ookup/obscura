@@ -667,3 +667,18 @@ run covers are then removed.
   per-element bound, because absolute milliseconds move with parallel
   test load. Scoped: obscura-js 759/759 (--features render). Full gate
   deferred to the next backfill
+
+- OjmeV1[118] diagnosis hook landed (10-06): OBSCURA_DEBUG_TOSTRING arms
+  (runtime run_page_init for the main realm, frame hydration injection for
+  every frame realm) a wrap of Object.prototype.toString that reports any
+  page object stringifying to the default "[object Object]" tag --
+  constructor name, own keys, caller stack -- through console.warn into
+  the trace-op channel, deduplicated by stack head and capped at 300.
+  First live round hit: the mystery object is ctor=Object keys=[] (a bare
+  empty instance), produced inside the widget runner's mQ.Gp/mQ.my
+  methods; the stack offsets move per session with the runner's rch path
+  segment. The runner source itself needs a response-body capture on the
+  script load path (diag_capture covers only scripted /fo/ fetches) or a
+  verdict-round body dump to read the String(X) expression. Scoped:
+  obscura-js 759/759 (--features render, arm is env-gated and inert when
+  unset). Full gate deferred to the next backfill

@@ -138,6 +138,87 @@ globalThis.__obscura_init = function() {
   // First: the document URL is known now, and the gating below removes APIs
   // that later init steps would otherwise hand out on an insecure origin.
   try { _applySecureContextGating?.(); } catch (_e) {}
+  // OBSCURA_DEBUG_TOSTRING one-shot diagnosis (see run_page_init in
+  // runtime.rs for the arm, which runs before this init): wrap
+  // Object.prototype.toString so a page object stringifying to the default
+  // "[object Object]" tag prints its constructor name, own keys and caller
+  // stack to stderr. Only armed when the environment variable is set --
+  // unset, nothing here runs and the visible surface is untouched. Output
+  // is deduplicated by caller-stack head and hard-capped, because the tag
+  // is hit constantly by engine internals too.
+  if (globalThis.__obscura_diag_tostring__ && !Object.prototype.toString.__obscuraDiag) {
+    (function () {
+      const _origToString = Object.prototype.toString;
+      const seenStacks = new Set();
+      let printed = 0;
+      const wrapped = function toString() {
+        const result = _origToString.call(this);
+        if (result === "[object Object]" && printed < 300) {
+          try {
+            const stack = String(new Error().stack || "").replace(/\s+/g, " ");
+            const stackHead = stack.slice(0, 200);
+            if (!seenStacks.has(stackHead)) {
+              seenStacks.add(stackHead);
+              printed++;
+              let ctor = "null-proto";
+              try {
+                const proto = Object.getPrototypeOf(this);
+                ctor = (proto && proto.constructor && proto.constructor.name) || "null-proto";
+              } catch (_e) {}
+              let keys = "?";
+              try { keys = Object.keys(this).slice(0, 10).join(","); } catch (_e2) {}
+              // Dump the source of the very functions in the stack: they are
+              // same-realm values, reachable by scanning the frame's global
+              // for members whose function name matches a stack entry.
+              if (!globalThis.__tostringDiagDumped) {
+                globalThis.__tostringDiagDumped = true;
+                try {
+                  const stackNames = [...stack.matchAll(/at ([\w$.]+) \(/g)]
+                    .map(m => m[1]);
+                  const wanted = new Set();
+                  for (const full of stackNames) {
+                    const parts = full.split(".");
+                    wanted.add(parts[parts.length - 1]);
+                  }
+                  const sink = (globalThis.__tostringDiag =
+                    globalThis.__tostringDiag || []);
+                  for (const gk of Object.getOwnPropertyNames(globalThis)) {
+                    let gv;
+                    try { gv = globalThis[gk]; } catch (_eg) { continue; }
+                    if (!gv || (typeof gv !== "object" && typeof gv !== "function")) continue;
+                    let members;
+                    try { members = Object.getOwnPropertyNames(gv); } catch (_em) { continue; }
+                    for (const mk of members) {
+                      if (!wanted.has(mk)) continue;
+                      try {
+                        const mv = gv[mk];
+                        if (typeof mv === "function") {
+                          sink.push("FN " + gk + "." + mk + " (name=" +
+                            mv.name + ") = " + String(mv).slice(0, 2500));
+                        }
+                      } catch (_ev) {}
+                    }
+                  }
+                } catch (_eScan) {}
+              }
+              const line = "ctor=" + ctor + " keys=[" + keys + "] stack=" + stack.slice(0, 400);
+              // Frame realms cannot share a buffer with the main realm
+              // (cross-origin), and Deno.core.print is swallowed by the
+              // fetch pipeline: emit through console.warn, which the
+              // --trace-op-file channel records, and buffer locally as a
+              // fallback for same-realm eval reads.
+              try { console.warn("[tostring-diag] " + line); } catch (_e3) {}
+              (globalThis.__tostringDiag = globalThis.__tostringDiag || []).push(line);
+            }
+          } catch (_e) {}
+        }
+        return result;
+      };
+      Object.defineProperty(wrapped, "name", { value: "toString", configurable: true });
+      Object.defineProperty(wrapped, "__obscuraDiag", { value: true, configurable: true });
+      Object.prototype.toString = wrapped;
+    })();
+  }
   // The synthetic-fingerprint seed stays constant across pages and sessions:
   // the values it drives (audio latency, compression thresholds, the heap
   // readings, geo jitter) answer from hardware or settings on a real browser

@@ -1138,13 +1138,18 @@ impl ObscuraJsRuntime {
             .map_err(|error| format!("realm fingerprint serialization: {error}"))?;
         let stealth = self.stealth;
         let webgl_enabled = self.gpu_profile_enabled();
+        // The toString diagnosis arms per realm: each frame realm carries its
+        // own Object.prototype.toString, and the widget's collector runs in
+        // the frame -- an un-armed frame would report nothing.
+        let diag_tostring = std::env::var_os("OBSCURA_DEBUG_TOSTRING").is_some();
         self.run_in_realm_before_hydration(
             &context,
             "<obscura:frame-fingerprint>",
             &format!(
                 "globalThis.__obscura_set_fingerprint({fingerprint_json}); \
                  globalThis.__obscura_stealth = {stealth}; \
-                 globalThis.__obscura_webgl_enabled = {webgl_enabled};"
+                 globalThis.__obscura_webgl_enabled = {webgl_enabled}; \
+                 globalThis.__obscura_diag_tostring__ = {diag_tostring};"
             ),
         )?;
         if timing {

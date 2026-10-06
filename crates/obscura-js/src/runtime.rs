@@ -2159,6 +2159,18 @@ impl ObscuraJsRuntime {
         // Before __obscura_init, which is where the bootstrap picks the
         // collection up and hangs it off Document.prototype.
         self.install_document_all();
+        // One-shot diagnosis arm (OBSCURA_DEBUG_TOSTRING): wraps
+        // Object.prototype.toString so a page object that stringifies to the
+        // default "[object Object]" tag prints its constructor name, own
+        // keys and caller stack to stderr. Gate is read per page-init; with
+        // the variable unset nothing is wrapped and the surface is
+        // untouched.
+        if std::env::var_os("OBSCURA_DEBUG_TOSTRING").is_some() {
+            let _ = self.runtime.execute_script(
+                "<obscura:diag-tostring-arm>",
+                "globalThis.__obscura_diag_tostring__ = true;".to_string(),
+            );
+        }
         let _ = self.runtime.execute_script(
             "<obscura:page-init>",
             "globalThis.__obscura_init();".to_string(),
