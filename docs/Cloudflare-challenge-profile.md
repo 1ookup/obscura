@@ -2392,4 +2392,10 @@ r17-r21 **全部早死**（无测量相），同二进制无 env 的 r16 正常 
 
 **BKkj0/zXuvs9=68（任务 C，已落修）**：实锤=**speechSynthesis.getVoices().length**。参考 Chromium 149 本机 dump：68 语音（全 localService、婷婷 default、固定顺序）；mZLmS3=排序名字列表的 slice(0,32)（两侧早已一致）。我方旧表 32 行且**5 处语言错位**（Alva pt-BR→sv-SE、Amira ar-001→ms-MY、Daria sv-SE→bg-BG、Geeta en-IN→te-IN、Lana ru-RU→hr-HR——旧表像按错位排序构建）。已按实测 dump 扩表 32→68（speech-synthesis-behavior.js）；`say -v '?'`=72 但 Chrome 暴露 68（AVSpeechSynthesisVoice 集），表复刻 Chrome dump。夹具：我方现答 68。Scoped obscura-js 761/761 + release build；ledger 已记。
 
+**Step 367.2（主 Agent，计时维度新头号候选）**：首报告计时字段（ref-live-r1[0] vs r12[0]）：
+tZwbF3 1002/3198、wOvYJ5 995/2963、eaaP6 979/2928——**init 三相我方 3 倍慢**，就在服务端最先
+可见的报告里；结合 B4（参考+6s 必败）⇒ 慢本身升为判据级候选（伞根候选之二，与分支伞并列）。
+ZMSOw0/twvE0 我方反而快（219 vs 1122，api.js 资源计时族，不同物）。r29 侧证：chl_page→fo#1
+=6.0s。待办：2s 差额的环节分解与优化。
+
 **Step 367.1（A 的现场增量，r30）**：环境面全量对比（batt2，双端 /1.txt 同页）主文档侧**无任何读数=611、我方也无对应 {}**（几何/counts/perf/storage 全对比；唯一结构差=ref 窗口 756×469 vs 我方 1280×720、ref 有 eventCounts.size=36 我方缺——后者记为待修小项）。配合 apicom 无 EBlFw4 ⇒ 611 不是主文档环境量、不是服务端明文参数。r30 用 `--trace-api-file --trace-api-calls --trace-api-filter XMLHttpRequest.responseText,...` 抓到**下行密文响应两条**（chl_page 3:33308 处与 widget rch:7436:31 处，各 4098B base64 形密文，页面不可见的原生属性追踪）⇒ widget 的配置/参数通道端到端加密，611（若来自下行）需 VM 内解密后才可见。产出物：/tmp/cf-runs/apitrace-r30.jsonl、batt2-{ref,ours}.json、net_capture2.py（注意：obscura CDP **不发** Network.responseReceived 给外接客户端——被动抓体在引擎侧是能力缺口，trace-api 是现役替代面）。A 的判定升级：611 数值上落在本代确定性测量族（oHIQ6 族 517-757 同区间），「参考有值/我方兜底 {}」与「我方多记录/参考空」是**同一分支分歧的两个投影**，伞根=Step 360 的分支选择问题。
