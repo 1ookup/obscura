@@ -7697,6 +7697,79 @@ mod tests {
         page
     }
 
+    /// Chrome's DOMContentLoaded never waits for a child iframe's content:
+    /// with a 2s-slow subframe the parent's DCL lands within milliseconds of
+    /// parsing (measured 87ms on Chromium 149 against this exact fixture,
+    /// first-paint 128ms; only the load event waits). The engine currently
+    /// awaits each child frame's full navigation inline during main-document
+    /// setup (`load_child_frames` → `navigate_frame(...).await`), so DCL and
+    /// first paint inherit the slowest subframe's latency — on the Cloudflare
+    /// interstitial that pushes the widget-visibility flip seconds late and
+    /// with it every boot timer onto the background clamp. This test pins the
+    /// Chrome truth; it is ignored until the navigation pipeline moves child
+    /// frame loads off the parent's DCL/paint critical path.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "known bug: DCL/paint await child-frame navigations (page.rs load_child_frames); fix pending"]
+    async fn dom_content_loaded_does_not_wait_for_a_slow_child_frame() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _addr)) = listener.accept().await else { break; };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut req = String::new();
+                    loop {
+                        let Ok(n) = stream.read(&mut buf).await else { return; };
+                        if n == 0 { return; }
+                        req.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        if req.contains("\r\n\r\n") { break; }
+                    }
+                    let slow = req.starts_with("GET /slow");
+                    if slow {
+                        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                    }
+                    let body: &str = if slow {
+                        "<html><body>slow</body></html>"
+                    } else {
+                        "<!doctype html><html><head><title>pt</title></head><body><h1>t</h1><iframe src=\"/slow\"></iframe></body></html>"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "dcl-slow-frame".to_string(), None, true, None, None, true,
+        ));
+        let mut page = super::Page::new("dcl-slow-frame".to_string(), context);
+        let url = format!("http://{address}/");
+        tokio::time::timeout(std::time::Duration::from_secs(8), page.navigate(&url))
+            .await
+            .expect("navigation completes")
+            .unwrap();
+
+        let dcl = page.evaluate(
+            "(() => { const n = performance.getEntriesByType('navigation')[0]; return n ? n.domContentLoadedEventEnd : -1; })()",
+        );
+        let dcl_ms = dcl.as_f64().unwrap_or(-1.0);
+        server.abort();
+        // Chrome fires DCL while the 2s subframe is still in flight; the
+        // engine's current inline await lands it after ~2.1s.
+        assert!(
+            dcl_ms >= 0.0 && dcl_ms < 900.0,
+            "DCL waited {dcl_ms}ms for a 2s child frame; Chrome truth is <900ms"
+        );
+    }
+
     #[cfg(feature = "stealth")]
     #[tokio::test(flavor = "current_thread")]
     async fn stealth_pages_reuse_connections_without_sharing_request_overrides() {
