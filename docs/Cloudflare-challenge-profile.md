@@ -2346,3 +2346,27 @@ soft-navigation——verifier 的对照数据 vfix-pA-perf.json 实锤）。
 **轮 16 现值**（仍被加时 brunhild=3）：OjmeV1[118] 仍 '[object Object]'（[75]=13/[79]=true 有
 抖动）、oHIQ6 仍 71、IGBuA2 仍 7、Pdbt7 9/13、sAMar8 仍 false。X118 追捕转 ov2.js 定制插桩
 路线（VM concat 钩子，goal 授权；注意 3h 自动轮换窗口）。
+
+### Step 366：**X118 现场抓获（ov2.js 一次性钩子）**——X=裸 {}，产出者未定；引擎侧钩子路线正式烧毁（2026-10-06 18:3x）
+
+**工具**：`/tmp/cf-runs/make_x118_patch.py`——给部署件 `__OV2T_HELPER_END__` 后原子注入
+Object.prototype.toString 包装（结果 '[object Object]' 时 tracelog `x118hit`{ctor,keys,stack}），
+`--restore` 从备份还原（md5 71c6f5ec 已核）。**当轮未被挑战识破**（测量相照跑、OjmeV1 照发）——
+该面在 ov2 侧包装在本代挑战下未被 tRta4 类探测拦截（样本 n=1，勿当规律）。
+
+**抓获**（r22/r23/r24，各 2 hit）：X=**裸空对象 {}**（ctor=Object、own keys 空）；强转点两处：
+- `qi.A (rch:7020:1182)`：VM 寄存器拼接 `hV[hZ^hg] = hX + hb` ——'EBlFw4'+X 的 '+' 本体；
+- `qi.qU (rch:7683:198)`：`hC[hj]` 属性读 + `hX.call(hC)` 方法调用路径。
+栈：Object.toString ← qi.A/qi.qU ← qi.run ← qS ← Object.GobbI（widget VM 全链）。
+
+**排除**（夹具双侧对照全数值）：document.timeline.currentTime（顶+隐藏帧）、measureText().width、
+getBBox().width、getBoundingClientRect().width。op-trace 相关性：强转前 1.1s **无 DOM op**
+（最近为 api.js 的 query_selector×2+set_attribute）⇒ {} 非 DOM op 产物 ⇒ 来自非 DOM 面 API
+（timers/storage/performance/console/crypto 族）或挑战自身代码分岔。
+
+**引擎侧 toString 钩子路线烧毁实证**：bf187cf 修复后带 `OBSCURA_DEBUG_TOSTRING=1` 的
+r17-r21 **全部早死**（无测量相），同二进制无 env 的 r16 正常 ⇒ 该包装即使"正确安装"也被挑战
+识破短臂。**以后凡要碰原生面的诊断一律走 ov2 侧**（挑战自己的文件、当轮验证、用完即还原）。
+
+**对照数据增量**（r24 双钩同轮）：`/tmp/cf-runs/ops-r24.tsv` + `obs-trace-r24.jsonl` 可做
+时序 join（offset 由 payloadJSON t − 首个 POST op us 求得）。
