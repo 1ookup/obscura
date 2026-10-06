@@ -36229,6 +36229,13 @@ mod secure_context_navigator_gate_probe {
                         handlerRound: typeof u.onboundary,
                         isEventTarget: u instanceof EventTarget,
                         setHandlerToWeird: (u.onstart = 42, u.onstart),
+                        ctorLen: SpeechSynthesisUtterance.length,
+                        ovcInProto: 'onvoiceschanged' in SpeechSynthesis.prototype,
+                        ovcGet: speechSynthesis.onvoiceschanged,
+                        ovcSet: (speechSynthesis.onvoiceschanged = function vc() {},
+                            typeof speechSynthesis.onvoiceschanged),
+                        ovcOwnLeak: Object.keys(speechSynthesis)
+                            .includes('__obscuraOnVoicesChanged'),
                     };
                 })()"#,
             )
@@ -36247,6 +36254,15 @@ mod secure_context_navigator_gate_probe {
                 "handlerRound": "function",
                 "isEventTarget": true,
                 "setHandlerToWeird": null,
+                // The constructor takes no required argument (Chrome's
+                // optional DOMString text) -- length 0. The synthesis
+                // prototype carries onvoiceschanged as an accessor; the
+                // handler slot never leaks an own key onto the instance.
+                "ctorLen": 0,
+                "ovcInProto": true,
+                "ovcGet": null,
+                "ovcSet": "function",
+                "ovcOwnLeak": false,
             })
         );
     }

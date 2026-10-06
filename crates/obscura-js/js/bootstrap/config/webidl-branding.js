@@ -247,6 +247,27 @@
         && !(globalThis.speechSynthesis instanceof globalThis.SpeechSynthesis)) {
       Object.setPrototypeOf(globalThis.speechSynthesis, globalThis.SpeechSynthesis.prototype);
     }
+    // The synthesis interface prototype carries the voices-changed event
+    // handler as an accessor (`'onvoiceschanged' in SpeechSynthesis.prototype`
+    // is true on the reference; the sAMar8 boolean probe reads exactly this).
+    // Installed here -- after the interface shells exist -- because the
+    // media module that owns speechSynthesis runs before the shells do.
+    if (typeof globalThis.SpeechSynthesis === 'function'
+        && !Object.getOwnPropertyDescriptor(globalThis.SpeechSynthesis.prototype, 'onvoiceschanged')) {
+      Object.defineProperty(globalThis.SpeechSynthesis.prototype, 'onvoiceschanged', {
+        get() { return this.__obscuraOnVoicesChanged || null; },
+        set(value) {
+          // The handler slot stays non-enumerable: Chrome's instances carry
+          // no own key for it.
+          Object.defineProperty(this, '__obscuraOnVoicesChanged', {
+            value: typeof value === 'function' ? value : null,
+            writable: true, enumerable: false, configurable: true,
+          });
+        },
+        enumerable: true,
+        configurable: true,
+      });
+    }
   } catch (_e) {}
 })();
 

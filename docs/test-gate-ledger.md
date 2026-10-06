@@ -724,3 +724,17 @@ run covers are then removed.
   family remains a challenge-flow-branch reading; the engine has no
   wrong behavior to fix on it. Scoped: obscura-js 760/760 (--features
   render). Full gate deferred to the next backfill
+
+- sAMar8 candidates fixed (10-06, speech-family fixture on both sides of
+  the https page): `'onvoiceschanged' in SpeechSynthesis.prototype`
+  answered false against the reference's true -- the handler accessor now
+  installs on the interface prototype (in webidl-branding's late
+  compensation pass, because the media module that owns speechSynthesis
+  runs before the interface shells exist; the handler slot stays
+  non-enumerable so instances carry no own key), and
+  SpeechSynthesisUtterance.length answers 0 (the constructor reads
+  arguments[0]; Chrome's optional DOMString text carries no required
+  argument). The synth instance's own onvoiceschanged data property is
+  gone with it. Scoped: obscura-js 760/760 (--features render, the
+  utterance shape test extended with the ctor length and the handler
+  accessor assertions). Full gate deferred to the next backfill

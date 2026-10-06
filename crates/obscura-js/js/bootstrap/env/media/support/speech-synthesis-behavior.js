@@ -58,7 +58,9 @@ function _makeSpeechSynthesis() {
     resume() {},
     addEventListener() {},
     removeEventListener() {},
-    onvoiceschanged: null,
+    // onvoiceschanged is a SpeechSynthesis.prototype accessor (installed in
+    // speech-synthesis.js), not an own property -- the reference prototype
+    // answers `'onvoiceschanged' in SpeechSynthesis.prototype` with true.
   };
 }
 
