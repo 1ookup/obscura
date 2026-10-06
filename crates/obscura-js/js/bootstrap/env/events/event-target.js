@@ -31,6 +31,13 @@ function _eventParent(target, composed) {
   if (_isDomInstance(target, 'Document')) return target.defaultView || null;
   return _isDomInstance(target, 'Node') ? target.parentNode : null;
 }
+// Chrome's performance.eventCounts counts the distinct event types dispatched
+// on the document's tree (its PerformanceEventCounts map exposes size/get).
+// The engine dispatches every event through _eventTargetDispatchNow, so the
+// type ledger updates there for Node/document/window targets only; the
+// EventCounts view in env/performance/performance.js reads this map.
+const _documentEventTypes = new Map();
+globalThis.__obscura_document_event_types = _documentEventTypes;
 function _eventPathFor(target, composed) {
   const path = [];
   let adjustedTarget = target;
@@ -137,6 +144,10 @@ function _eventTargetDispatchNow(target, event) {
   const state = _eventData(event);
   if (state.dispatching) {
     throw new DOMException("The event is already being dispatched.", "InvalidStateError");
+  }
+  if (typeof target.nodeName === 'string' || target === globalThis.document || target === globalThis) {
+    const type = String(event.type);
+    _documentEventTypes.set(type, (_documentEventTypes.get(type) || 0) + 1);
   }
   state.dispatching = true;
   state.propagationStopped = false;

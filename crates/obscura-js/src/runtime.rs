@@ -14612,6 +14612,54 @@ RequestRedirect value",
         );
     }
 
+    /// Chrome's performance.eventCounts is a live PerformanceEventCounts map:
+    /// size answers the number of distinct event types dispatched on the
+    /// document's tree, get(type) answers that type's count, and dispatches
+    /// on non-document targets (bare EventTargets, XHR) do not enter it. The
+    /// challenge's first report reads exactly this size, so an absent member
+    /// (undefined) serializes the field away.
+    #[test]
+    fn event_counts_tracks_document_dispatched_event_types() {
+        let dom = parse_html("<html><body></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("https://example.com/test");
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const ec = performance.eventCounts;
+                    const before = ec.size;
+                    document.dispatchEvent(new Event('x118probe'));
+                    document.body.dispatchEvent(new Event('x118probe'));
+                    document.body.dispatchEvent(new Event('other'));
+                    const afterDoc = { size: ec.size, probe: ec.get('x118probe'), other: ec.get('other'),
+                                       has: ec.has('other'), missing: ec.get('never') };
+                    const bare = new EventTarget();
+                    bare.dispatchEvent(new Event('x118probe'));
+                    const xhr = new XMLHttpRequest();
+                    try { xhr.dispatchEvent(new Event('readystatechange')); } catch (e) {}
+                    const afterBare = ec.size;
+                    return {
+                        startsAtZero: before === 0,
+                        afterDoc,
+                        afterBare,
+                        tag: Object.prototype.toString.call(ec),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "startsAtZero": true,
+                "afterDoc": {"size": 2, "probe": 2, "other": 1, "has": true, "missing": 0},
+                "afterBare": 2,
+                "tag": "[object EventCounts]",
+            })
+        );
+    }
+
     /// A cross-origin isolated realm steps at 5 microseconds, and its
     /// readings walk a 25-slot 0.125 ms lattice: 23 steps of 83886*2^-24
     /// plus 2 of 83887*2^-24 per superblock, closing exactly. The smallest

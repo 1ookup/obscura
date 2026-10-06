@@ -756,3 +756,17 @@ run covers are then removed.
   voice_table_matches_the_reference_host_dump pins count 68, the head and
   tail rows, all-local, and the single default). Full gate deferred to the
   next backfill
+
+- performance.eventCounts.size/get/has landed (10-06 evening): the
+  PerformanceEventCounts view was an empty frozen object, so .size answered
+  undefined and the first-report field serialized away (the reference's
+  first 47-key report carries size=36; ours carried nothing). The dispatch
+  choke point (_eventTargetDispatchNow) now keeps a type ledger for
+  Node/document/window targets only, and the view answers live size/get/has
+  off that ledger through _markNative-wrapped members (the premark surface
+  census rejects unmarked mint-site functions). Counts are flow-dependent
+  truth, not a pinned 36: the bare-interstitial fixture answers 5. Scoped:
+  obscura-js 762/762 (--features render, new
+  event_counts_tracks_document_dispatched_event_types pins size growth,
+  per-type counts, bare-EventTarget exclusion, and the [object EventCounts]
+  tag). Full gate deferred to the next backfill

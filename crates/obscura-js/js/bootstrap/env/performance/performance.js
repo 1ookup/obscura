@@ -133,13 +133,38 @@ Object.defineProperty(Performance.prototype, 'onresourcetimingbufferfull', {
 
 // Chrome's Performance surface carries three members the behavior modules
 // above never installed: the serializer, and the two read-only views the
-// spec hangs off the singleton. The engine tracks no event-type counters, so
-// an empty EventCounts shape is the truthful rendering of that state --
-// every lookup answers 0, exactly what an unobserved counter list means.
+// spec hangs off the singleton. EventCounts is a live map of the distinct
+// event types dispatched on the document's tree; the type ledger itself is
+// kept by the dispatch choke point in env/events/event-target.js
+// (__obscura_document_event_types), so size and get answer what the page
+// actually dispatched rather than a frozen zero.
 const _performanceEventCounts = (() => {
   const counts = Object.create(null);
   Object.defineProperty(counts, Symbol.toStringTag, {
     value: 'EventCounts', writable: false, enumerable: false, configurable: true,
+  });
+  Object.defineProperty(counts, 'size', {
+    get: _markNative(function size() {
+      const ledger = globalThis.__obscura_document_event_types;
+      return ledger ? ledger.size : 0;
+    }),
+    enumerable: true, configurable: true,
+  });
+  Object.defineProperty(counts, 'get', {
+    value: _markNative(function get(type) {
+      const ledger = globalThis.__obscura_document_event_types;
+      if (!ledger) return 0;
+      const n = ledger.get(String(type));
+      return n === undefined ? 0 : n;
+    }),
+    writable: true, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(counts, 'has', {
+    value: _markNative(function has(type) {
+      const ledger = globalThis.__obscura_document_event_types;
+      return !!ledger && ledger.has(String(type));
+    }),
+    writable: true, enumerable: true, configurable: true,
   });
   return counts;
 })();
