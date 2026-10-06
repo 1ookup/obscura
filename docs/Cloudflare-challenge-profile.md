@@ -2239,3 +2239,35 @@ ray a46186e4）⇒ escalation 完全由 render 提交触发，与点击数据无
 **副产品（重要实验加速器）**：`grep -c brunhild serve.log` 成为**免点击的快速二元判据**——
 20s 一轮（`cdp_click_clean.py --click-after 999 --deadline 20 --settle 2` + debug serve），
 出现=render 仍被判可疑；消失=render 过关。环境假设的二分/回归不再依赖点击与服务端终判。
+
+### Step 361：批次 2 落地（brands/WebGPU/utterance/secure-gate）——判据轮 5/6/7 全程仍被加时；两段插曲与两项新事实（2026-10-06 12:0x–13:0x）
+
+**已落地提交**：`1fe592a`（brands 两条目：Chromium/149 + Not)A;Brand/24，JS 面与 wire 头同源）、
+`f9e1227`（WebGPU 表重钉 149 活体——adapter limits 掉 maxImmediateSize 回 37 项、features 20 名
+captured 序、WGSL 九名剔除；SpeechSynthesisUtterance 恢复 EventTarget 面）、`b5253f1`（14 个
+[SecureContext] navigator 成员补门控，57→43）、`0ae79f5`（**回归修复**：1fe592a 曾把
+userAgentData 弄成整体缺失，轮 5 payload Yyepi7 无 brands 实锤；修后 secure/insecure 两侧行为
+均与参考一致）、`77df20a`（隐藏文档不发动画帧）、`e825de9`（utterance 原型 14 访问器面）。
+
+**插曲 1（假警报）**：我曾按 about:blank 夹具判「参考没有 userAgentData」——错，探针没等页面
+加载（Target.createTarget 后立即 evaluate，url 仍 about:blank）。真值：参考在 https 页
+brands=[{Chromium,149},{Not)A;Brand,24}] 与我方修复后逐字一致；insecure 页两侧都 undefined。
+**教训：夹具必须回读 location.href 证明页真加载了再采值。**
+
+**插曲 2（我方假分歧被修复 Agent 反证）**：我夹具测得 getVoices() 我方 32 vs 参考 0，判为分歧。
+修复 Agent 用活体 payload 反证：**mZLmS3 两侧同 32 名**（参考的 0 是 voices 异步未载完的早读）。
+裁决：保持 32 名表不动。**教训：夹具时点 ≠ 挑战读取时点，凡夹具读数必须与 payload 实读交叉。**
+
+**判据轮 5/6/7**（r5=中间坏档、r6/r7=修复后）：brunhild 恒 3 条=仍被加时。r7 残余（vs 活体）：
+- OjmeV1 全 120 项仅剩 2 项：[79] false/true、[118] 'EBlFw4611' vs 'EBlFw4[object Object]'
+  （同前缀，参考拼 '611'；119 项为 'EBlFw4/\\u0067\\u0075\\u006c\\u0065/'='/gule/' 的转义——
+  疑似对挑战内部函数/token 的 name-echo String 化探测）；
+- oHIQ6 恒 71 条**递增毫秒时标**（517→2790，~31/s，rAF/interval 节律型）vs 参考恒空；
+  IGBuA2 我方 [76,125,126,127,128,159,163] ⊇ 参考 [159,163]；
+- Pdbt7 performance entries 9 vs 13（Lcfc8 族仍少）；
+- sAMar8 仍 false（utterance instanceof 修复未翻转它——假设存疑）；
+- Ozfs8/UYbIv2='WoUrS0' vs 'UGOeP6'（六字符 token；taxonomy §372 判别法指向服务端探针配置回显族，
+  **值三轮恒定且 ov2 无读点 ⇒ 可能是服务端按客户端分发的变体，环境对齐不可达，暂列观察**）。
+
+**待办下批**：OjmeV1[118]/[79]（引擎侧 trace-api 诊断）、oHIQ6/IGBuA2 过量发射、Pdbt7 补条目、
+（观察）两-widget 换挂循环是否随值对齐自然出现。
