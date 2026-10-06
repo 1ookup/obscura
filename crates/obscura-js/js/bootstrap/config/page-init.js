@@ -506,8 +506,23 @@ globalThis.__obscura_init = function() {
         // rendering box is a hidden document (Chrome reports the challenge
         // widget's document as hidden), and hidden frames fire no animation
         // callbacks. Top-level documents keep the visible default.
+        // The snapshot is a FALLBACK only: at frame-realm init the main
+        // layout is not prepared yet, so op_layout_metrics answers
+        // rendered:false for every frame here -- freezing that reading kept a
+        // visible widget (a laid-out host box mounted after its script
+        // evaluated) hidden forever, which clamped its boot timers to the
+        // background minimum. The live reader below re-derives on every read
+        // (epoch-cached), so the widget flips visible as soon as its box
+        // exists while display:none frames stay hidden.
         globalThis.__documentVisibilityState__ =
           parsed.rendered === false ? 'hidden' : 'visible';
+        globalThis.__obscuraDocumentVisibility = function() {
+          try {
+            const m = readFrameMetrics();
+            if (m) return m.rendered === false ? 'hidden' : 'visible';
+          } catch (_e) {}
+          return globalThis.__documentVisibilityState__ || 'visible';
+        };
       }
       // A frame viewport can change without recreating its realm (responsive
       // iframe CSS, display toggles, animation, or an embedder resize). Keep

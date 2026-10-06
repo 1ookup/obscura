@@ -36453,6 +36453,110 @@ mod secure_context_navigator_gate_probe {
         );
     }
 
+    /// A frame realm inited while its host was unrendered (the exact moment
+    /// the frame-realm init snapshot reads layout: the main prepared render
+    /// is not built yet, so op_layout_metrics answers rendered:false) must
+    /// still flip visible once the host box exists, and its timers must
+    /// return to their authored cadence. Chrome mounts the challenge widget
+    /// this way: the script evaluates before the host has layout, and the
+    /// boot runs at full cadence -- a frozen hidden snapshot kept every
+    /// async boot stage on the one-second background minimum (three clamped
+    /// stages = the +2s init-window regression).
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_visibility_flips_live_when_the_host_gains_layout() {
+        let dom = parse_html(
+            r#"<html><body><iframe id=widget style="display:none"></iframe></body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(400.0, 300.0);
+        rt.run_page_init();
+        rt.install_internal_namespace();
+        let root = rt
+            .evaluate(
+                r#"(() => {
+                    const op = (cmd, a1) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), "");
+                    const host = document.getElementById("widget")[Symbol.for('obscura.nid')];
+                    const created = JSON.parse(op("create_iframe_content_document", host));
+                    op("set_document_scope", created.root, JSON.stringify({
+                        url: "https://widget.example/frame",
+                        originUrl: "https://widget.example/frame",
+                        frameId: "widget-frame",
+                        documentGeneration: 1,
+                        csp: null,
+                    }));
+                    op("parse_into_subtree", created.root, "<html><body></body></html>");
+                    return created.root;
+                })()"#,
+            )
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("widget-frame", 1, root, "https://widget.example/frame")
+            .unwrap();
+        let initial = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "widget-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                r#"document.visibilityState"#,
+                true,
+                true,
+                2_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        // The init snapshot caught the pre-layout (or display:none) moment.
+        assert_eq!(initial, serde_json::json!("hidden"));
+        // The host gains a rendered box after realm init, exactly as the
+        // widget mount does.
+        rt.evaluate(
+            r#"document.getElementById("widget").style.display = "block""#,
+        )
+        .unwrap();
+        let flipped = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "widget-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                r#"(() => {
+                    window.__ticks = 0;
+                    setInterval(() => { window.__ticks++; }, 16);
+                    return document.visibilityState + '|' + document.hidden;
+                })()"#,
+                true,
+                true,
+                2_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(flipped, serde_json::json!("visible|false"));
+        rt.run_event_loop_bounded(400).await.unwrap();
+        let ticks = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "widget-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                r#"String(window.__ticks)"#,
+                true,
+                true,
+                2_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        // Full cadence: ~25 opportunities in 400ms; the background minimum
+        // would allow exactly one tick. Load-tolerant lower bound.
+        let ticks: u32 = ticks.as_str().unwrap().parse().unwrap();
+        assert!(ticks >= 8, "visible-frame interval ticked only {ticks} times in 400ms");
+    }
+
     /// The SVG font-fingerprint probe shape (~23 text elements x 3
     /// attribute writes, per the r10 op-trace cluster) against every
     /// observable event source in a hidden frame: which source still fires
