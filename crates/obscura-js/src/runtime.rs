@@ -14882,8 +14882,10 @@ RequestRedirect value",
 
     /// The published list is a page-visible surface: the challenge snapshots
     /// `PerformanceObserver.supportedEntryTypes` wholesale, so a missing type or
-    /// a reordered one is as readable as a missing entry type. Order is
-    /// Chrome 153 (2026-09-26 oracle).
+    /// a reordered one is as readable as a missing entry type. Order is the
+    /// live 149 reference (13 types -- the interaction-contentful-paint and
+    /// soft-navigation entries of the 10-05 154 alignment are 154-only and
+    /// left with it).
     #[test]
     fn supported_entry_types_match_chromes_list_and_order() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -14892,9 +14894,9 @@ RequestRedirect value",
             .unwrap();
         assert_eq!(
             result.as_str().unwrap(),
-            "element,event,first-input,interaction-contentful-paint,\
+            "element,event,first-input,\
              largest-contentful-paint,layout-shift,long-animation-frame,longtask,\
-             mark,measure,navigation,paint,resource,soft-navigation,visibility-state",
+             mark,measure,navigation,paint,resource,visibility-state",
         );
     }
 

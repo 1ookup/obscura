@@ -807,7 +807,6 @@ const _chromeInterfaceTable = [
   ["InputDeviceCapabilities",0,1,"Object","InputDeviceCapabilities",0],
   ["InputDeviceInfo",0,0,"MediaDeviceInfo","",0],
   ["InputEvent",0,2,"UIEvent","",1],
-  ["InteractionContentfulPaint",0,0,"PerformanceEntry","InteractionContentfulPaint",0],
   ["Int16Array",0,1,"TypedArray","Int16Array",3],
   ["Int32Array",0,1,"TypedArray","Int32Array",3],
   ["Int8Array",0,1,"TypedArray","Int8Array",3],
@@ -942,7 +941,6 @@ const _chromeInterfaceTable = [
   ["PerformanceObserverEntryList",0,0,"Object","",0],
   ["PerformancePaintTiming",0,0,"PerformanceEntry","",0],
   ["PerformanceResourceTiming",0,0,"PerformanceEntry","",0],
-  ["PerformanceSoftNavigation",0,0,"PerformanceEntry","PerformanceSoftNavigation",0],
   ["PerformanceScriptTiming",0,0,"PerformanceEntry","",0],
   ["PerformanceServerTiming",0,0,"Object","",0],
   ["PerformanceTiming",0,0,"Object","",0],
@@ -1775,23 +1773,9 @@ const _chromeInterfaceShells = new Set();
     for (const name of ['error', 'onstream', 'oncancel', 'onerror', 'stream']) getter(proto, name);
     method(proto, 'setConstraints', 0, function setConstraints() {});
   }
-  if (typeof InteractionContentfulPaint === 'function') {
-    const proto = InteractionContentfulPaint.prototype;
-    getter(proto, 'largestContentfulPaint');
-    getter(proto, 'interactionId');
-    method(proto, 'toJSON', 0, function toJSON() { return {}; });
-    getter(proto, 'paintTime');
-    getter(proto, 'presentationTime');
-  }
-  if (typeof PerformanceSoftNavigation === 'function') {
-    const proto = PerformanceSoftNavigation.prototype;
-    getter(proto, 'navigationType');
-    getter(proto, 'interactionId');
-    method(proto, 'getLargestInteractionContentfulPaint', 0,
-      function getLargestInteractionContentfulPaint() {});
-    getter(proto, 'paintTime');
-    getter(proto, 'presentationTime');
-  }
+  // InteractionContentfulPaint and PerformanceSoftNavigation are 154-only
+  // interfaces: the 149 reference carries neither the constructors nor their
+  // entry types, so both the interface rows and these member shims are gone.
 })();
 
 // Permissions are realm-sensitive: a cross-origin iframe does not inherit

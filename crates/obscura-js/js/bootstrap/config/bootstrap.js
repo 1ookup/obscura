@@ -636,12 +636,13 @@ let _crossOriginIsolatedValue = false;
 // This used to be gated to cross-origin child frames, because the frame's
 // WindowProxy shape was the only census taken. The challenge page's own top
 // window answers the same way (Chrome 153, 2026-09-28): FontFaceSet,
-// HTMLUserMediaElement, InteractionContentfulPaint and
-// PerformanceSoftNavigation are not own properties there either, so the gate
+// HTMLUserMediaElement are not own properties there either, so the gate
 // follows the document's isolation, not its position in the frame tree.
+// InteractionContentfulPaint and PerformanceSoftNavigation left this list
+// with the 154 surface removal: the 149 reference has neither the
+// constructors nor the entry types, so there is nothing to hide.
 const _nonIsolatedHiddenNames = new Set([
-  'FontFaceSet', 'HTMLUserMediaElement', 'InteractionContentfulPaint',
-  'PerformanceSoftNavigation',
+  'FontFaceSet', 'HTMLUserMediaElement',
 ]);
 // V8's code-generation callback reads this realm-local flag to enforce the
 // document's `script-src` `unsafe-eval` requirement without replacing the
