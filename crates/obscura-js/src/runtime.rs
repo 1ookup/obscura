@@ -36545,5 +36545,121 @@ mod secure_context_navigator_gate_probe {
              {first_total}ms -- the geometry heat path cache is not holding"
         );
     }
+
+    /// Pdbt7's Lcfc8 family reads as long-animation-frame entries: the
+    /// verifier measured 7 LoAF entries inside the widget frame against our
+    /// 2, and the first suspect was the overlap-drop in the recorder eating
+    /// consecutive entries. It does not: seven independent ~60ms blocking
+    /// tasks (timer-scheduled) in a hidden frame record exactly seven LoAF
+    /// entries -- the recording side is healthy, and the live count
+    /// difference is how fast the challenge's own units run on the engine
+    /// (speed class, tracked separately).
+    #[tokio::test(flavor = "current_thread")]
+    async fn seven_blocking_tasks_record_seven_loafs_in_a_frame() {
+        let dom = parse_html(
+            r#"<html><body><iframe id=hiddenf style="display:none"></iframe></body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(400.0, 300.0);
+        rt.run_page_init();
+        rt.install_internal_namespace();
+        let root = rt
+            .evaluate(
+                r#"(() => {
+                    const op = (cmd, a1) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), "");
+                    const host = document.getElementById("hiddenf")[Symbol.for('obscura.nid')];
+                    const created = JSON.parse(op("create_iframe_content_document", host));
+                    op("set_document_scope", created.root, JSON.stringify({
+                        url: "https://widget.example/frame",
+                        originUrl: "https://widget.example/frame",
+                        frameId: "hidden-frame",
+                        documentGeneration: 1,
+                        csp: null,
+                    }));
+                    op("parse_into_subtree", created.root, "<html><body></body></html>");
+                    return created.root;
+                })()"#,
+            )
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("hidden-frame", 1, root, "https://widget.example/frame")
+            .unwrap();
+        rt.evaluate_in_frame_realm_for_cdp(
+            "hidden-frame",
+            1,
+            crate::realm::MAIN_WORLD,
+            r#"(() => {
+                window.__i = 0;
+                window.__durs = [];
+                let last = 0;
+                const step = () => {
+                    window.__i++;
+                    const t0 = performance.now();
+                    const spinUntil = t0 + 60;
+                    while (performance.now() < spinUntil) {}
+                    window.__durs.push(Math.round(performance.now() - last));
+                    last = performance.now();
+                    if (window.__i < 7) setTimeout(step, 10);
+                };
+                setTimeout(step, 10);
+            })()"#,
+            true,
+            true,
+            2_000,
+        )
+        .await
+        .unwrap();
+        rt.run_event_loop_bounded(500000).await.unwrap();
+        let result = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "hidden-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                "JSON.stringify({loaf: performance.getEntriesByType('long-animation-frame').map(e => [Math.round(e.startTime), Math.round(e.duration)]), i: window.__i, durs: window.__durs})",
+                true,
+                true,
+                2_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        println!("LOAF-FRAME={}", result);
+        let parsed = serde_json::from_str::<serde_json::Value>(result.as_str().unwrap())
+            .unwrap();
+        let loaf = parsed["loaf"].as_array().unwrap();
+        // Load-tolerant bounds: parallel test runners stretch the spin tasks,
+        // so the count can dip below 7 and durations can exceed 60ms without
+        // the recorder being wrong. What must never come back is the
+        // overlap-drop that collapsed seven tasks into one entry.
+        assert!(
+            loaf.len() >= 5,
+            "only {} LoAF entries from 7 blocking tasks -- the recorder is \
+             dropping consecutive entries again",
+            loaf.len()
+        );
+        let mut prev_start: Option<i64> = None;
+        for (index, entry) in loaf.iter().enumerate() {
+            let pair = entry.as_array().unwrap();
+            let start = pair[0].as_i64().unwrap();
+            let duration = pair[1].as_i64().unwrap();
+            assert!(
+                duration >= 50,
+                "LoAF {index} duration {duration}ms is under the threshold -- \
+                 the recorder is emitting sub-threshold entries"
+            );
+            if let Some(prev) = prev_start {
+                assert!(
+                    start > prev,
+                    "LoAF {index} overlaps its predecessor -- the recorder \
+                     started dropping consecutive entries again"
+                );
+            }
+            prev_start = Some(start);
+        }
+    }
 }
 // (temporary diagnostic kept adjacent to the gate probe module)

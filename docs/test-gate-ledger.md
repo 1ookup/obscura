@@ -708,3 +708,19 @@ run covers are then removed.
   hydration injection carries the arm flag only. Both frame tests pass
   again. Scoped: obscura-js 759/759 (--features render). Full gate
   deferred to the next backfill
+
+- LoAF recorder verified healthy at 7/7 (10-06): the Pdbt7 frame count
+  (widget LoAF 7 on the reference vs 2 here) was suspected to be the
+  recorder dropping consecutive entries through the overlap guard. A
+  seven-blocking-task probe in a hidden frame records exactly seven
+  entries (now pinned as a regression test with load-tolerant bounds --
+  count >= 5, monotonic starts, durations at/over threshold), so the
+  recording side is healthy and the live count difference is the
+  challenge's own task durations on the engine (speed class, already
+  tracked separately). Round-24 note: oHIQ6's shape changed with the
+  hidden-frame holds -- 243 readings at a 16ms cadence (11 -> 2795, the
+  main document's visible rAF, whose firing is correct behavior), IGBuA2
+  unchanged at the same 7 values, bLvQ6 gained a single [1043]. The
+  family remains a challenge-flow-branch reading; the engine has no
+  wrong behavior to fix on it. Scoped: obscura-js 760/760 (--features
+  render). Full gate deferred to the next backfill
