@@ -2399,3 +2399,17 @@ ZMSOw0/twvE0 我方反而快（219 vs 1122，api.js 资源计时族，不同物�
 =6.0s。待办：2s 差额的环节分解与优化。
 
 **Step 367.1（A 的现场增量，r30）**：环境面全量对比（batt2，双端 /1.txt 同页）主文档侧**无任何读数=611、我方也无对应 {}**（几何/counts/perf/storage 全对比；唯一结构差=ref 窗口 756×469 vs 我方 1280×720、ref 有 eventCounts.size=36 我方缺——后者记为待修小项）。配合 apicom 无 EBlFw4 ⇒ 611 不是主文档环境量、不是服务端明文参数。r30 用 `--trace-api-file --trace-api-calls --trace-api-filter XMLHttpRequest.responseText,...` 抓到**下行密文响应两条**（chl_page 3:33308 处与 widget rch:7436:31 处，各 4098B base64 形密文，页面不可见的原生属性追踪）⇒ widget 的配置/参数通道端到端加密，611（若来自下行）需 VM 内解密后才可见。产出物：/tmp/cf-runs/apitrace-r30.jsonl、batt2-{ref,ours}.json、net_capture2.py（注意：obscura CDP **不发** Network.responseReceived 给外接客户端——被动抓体在引擎侧是能力缺口，trace-api 是现役替代面）。A 的判定升级：611 数值上落在本代确定性测量族（oHIQ6 族 517-757 同区间），「参考有值/我方兜底 {}」与「我方多记录/参考空」是**同一分支分歧的两个投影**，伞根=Step 360 的分支选择问题。
+
+### Step 368：**init 相 3 倍慢分解（timeInitMs 主块 Δ1.9s=固定延迟非算力；编译假设被 15ms 实测否决；头号嫌疑=动态 iframe 的 host load 事件不触发——本地夹具实锤）**+ eventCounts.size 修复（2026-10-06 深夜）
+
+**三字段（tZwbF3 1002/3336、wOvYJ5 995/2918、eaaP6 979/2875）的窗口语义**（api.js 源码锚定）：三者都测「api.js 顶层 → extraParams 发出」的子窗；`timeInitMs = widgetInitStartTimeTsMs(收到 widget init 消息时) − widgetRenderEndTimeTsMs(appendChild 后)`。**主块=init 窗，Δ≈1.9s**。
+
+**同钟分解（apicom epoch，10+ 轮）**：widget realm 创建→init 恒 **2.0s**（r24 1.983 / r26 2.004 / r27 2.005 / r28 2.009 / r30 2.005 / r31 2.08）——realm 时刻从 2.24s 漂到 4.10s 而块长不动 ⇒ **固定延迟**。窗内：rch fetch 0.87s + 编译求值 **15.2ms**（把 ov2.js 全文内嵌双端 Runtime.evaluate 实测：ours 15.2 / ref 17.3ms——「470KB 编译慢」假设否决）+ 剩余 ~1.1s 未知等待。内部切分逐轮漂移（r24：realm→meow#1 73ms + meow→init 1.98s；r31：1.08s + 1.01s）但总长恒定 ⇒ 锚在 realm 创建，与看门猫心跳相位无关。
+
+**头号嫌疑（本地夹具实锤）**：动态插入 iframe 的 **host load 事件**。夹具（parent 插两个 iframe + 解析期 onload 属性 + child 含 470KB 内联脚本）：我方引擎 contentDocument 3 秒内 `complete`、title 就绪，但 **onload 4 秒内不触发**（无竞态形态）；Chrome 同夹具正常。引擎有 `dispatch_frame_load_event`（page.rs:6567，commit 后向 host 派发）与 `<frame-load-event>`（frame realm 窗口 load）两条路径，但快速提交的动态 iframe 走不到/迟到。api.js 若按经典模式等 host load ⇒ 被卡至兜底 ~2s。**修复形态明确**：判据=夹具 onload 于 commit 后立刻触发；活体判据=timeInitMs<1200ms。待办：OBSCURA_DEBUG_FRAMES=1 完整活体轮（r32 因代理慢未跑到 init）拿 frame-commit↔init 同钟差定案。
+
+**旁证**：r1–r7（旧引擎批次）alive→init 为 0/负值，r8（13:28 起）起恒 2.005s——块的出现与当日引擎批次时间线吻合，进一步支持引擎时序回归而非挑战逻辑。
+
+**次块**：load-init→renderStart 我方 ~418ms vs 参考 ~8ms（3336−2875−14−2−27 反推）——api.js 顶层到 render() 调用的间隙，属桥侧（cf5s fiddle-client）调度面，引擎外。尾块 Tief 27 vs 8ms（已从 315 修至 27）。ZMSOw0/twvE0 我方已快 3 倍（334 vs 1122），无动作。
+
+**eventCounts.size 修复（8a52bbc）**：原实现是空冻对象 ⇒ `.size`=undefined ⇒ 首报字段序列化蒸发（参考=36）。现 `_eventTargetDispatchNow` 对 Node/document/window 目标记类型台账，EventCounts 视图以 `_markNative` 包裹的 size/get/has 活应答（premark 台账拒绝未标记函数——首版红了两surface测试即此因）。计数=流依赖真值（裸 interstitial 夹具答 5，非钉 36）。Scoped obscura-js **762/762**（新测试 event_counts_tracks_document_dispatched_event_types）+ release build。
