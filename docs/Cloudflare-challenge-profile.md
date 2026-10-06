@@ -2392,6 +2392,22 @@ r17-r21 **全部早死**（无测量相），同二进制无 env 的 r16 正常 
 
 **BKkj0/zXuvs9=68（任务 C，已落修）**：实锤=**speechSynthesis.getVoices().length**。参考 Chromium 149 本机 dump：68 语音（全 localService、婷婷 default、固定顺序）；mZLmS3=排序名字列表的 slice(0,32)（两侧早已一致）。我方旧表 32 行且**5 处语言错位**（Alva pt-BR→sv-SE、Amira ar-001→ms-MY、Daria sv-SE→bg-BG、Geeta en-IN→te-IN、Lana ru-RU→hr-HR——旧表像按错位排序构建）。已按实测 dump 扩表 32→68（speech-synthesis-behavior.js）；`say -v '?'`=72 但 Chrome 暴露 68（AVSpeechSynthesisVoice 集），表复刻 Chrome dump。夹具：我方现答 68。Scoped obscura-js 761/761 + release build；ledger 已记。
 
+**Step 369（solo 收官段）**：① frame visibility 活读修复落地（251dd72）：init 快照冻结在
+pre-layout 时刻（op 注释亲证）→ widget 永久 hidden → 定时器全程 1s 钳；getter 改 epoch 缓存
+活读，vis 探针轮 r36 实证 widget 第 3 拍（~300ms）起 visible/iw300、100ms 探针全速；display:none
+帧保持钳制（旧测试仍钉）。**但 init 窗未缩（chl_page→fo#1 仍 +6.0s）⇒ Step 368.1 的"3 段钳制"
+归因不完整，+2s 另有来源，归因重开。** ② **r36 新发现（流程根因最新线索）**：apicom 首现
+`reloadApiJsRequest → reloadApiJsRejected`（同一毫秒，widget imuey）——widget 检测到 api.js
+mismatch 请求页面重载 api.js，被 api.js 侧按 4 道同步门拒绝（源码 turnstile-api.patched.js：
+kills 列表 / 待决重载 / 退避窗 / `ri()`=window.turnstile 完整性+`Qa()`=chlPageData 在场——
+**managed+orchestrate 模式下 chlPageData 常在 ⇒ 按设计必拒**）。对照：参考轮的 api.js×2 双载
++ rch W1→W2 换挂走的是**另一条 reloadRequest 路径（无门直换）**，其 widget 未发/未走到
+mismatch 分支。**真正问题=我们的 widget 为何检测到 mismatch**（参考同流程不触发）—— mism的
+判定在 widget VM 内部，追捕路径同 X118（需 runner 字节码/下行解密）。③ 顺带：api.js census
+（requestExtraParams 分支源码）里有 `vDeh/vDuh/vDhr/vDhp`（widget 隐藏期望追踪，
+**unexpectedHidden 是信号**）——修复前我方 widget 长期 frozen-hidden 可能命中 vDuh；修复后
+300ms 起 visible，该面应已随之收敛（下轮 payload 验证）。
+
 **Step 367.2（主 Agent，计时维度新头号候选）**：首报告计时字段（ref-live-r1[0] vs r12[0]）：
 tZwbF3 1002/3198、wOvYJ5 995/2963、eaaP6 979/2928——**init 三相我方 3 倍慢**，就在服务端最先
 可见的报告里；结合 B4（参考+6s 必败）⇒ 慢本身升为判据级候选（伞根候选之二，与分支伞并列）。
