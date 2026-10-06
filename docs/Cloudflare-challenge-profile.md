@@ -2392,6 +2392,17 @@ r17-r21 **全部早死**（无测量相），同二进制无 env 的 r16 正常 
 
 **BKkj0/zXuvs9=68（任务 C，已落修）**：实锤=**speechSynthesis.getVoices().length**。参考 Chromium 149 本机 dump：68 语音（全 localService、婷婷 default、固定顺序）；mZLmS3=排序名字列表的 slice(0,32)（两侧早已一致）。我方旧表 32 行且**5 处语言错位**（Alva pt-BR→sv-SE、Amira ar-001→ms-MY、Daria sv-SE→bg-BG、Geeta en-IN→te-IN、Lana ru-RU→hr-HR——旧表像按错位排序构建）。已按实测 dump 扩表 32→68（speech-synthesis-behavior.js）；`say -v '?'`=72 但 Chrome 暴露 68（AVSpeechSynthesisVoice 集），表复刻 Chrome dump。夹具：我方现答 68。Scoped obscura-js 761/761 + release build；ledger 已记。
 
+**Step 371（深夜二段：api.js↔widget 协议层定案=完全一致）**：出站载荷死投（patched api.js 的 Cr
+包装器 localStorage 'outq'，用后已还原 dd959f0a ✓）双端原文对比：**四条消息逐条同构**——init /
+extraParams(action:managed+完整 apiJsResourceTiming 含 initiatorType:'script') / **execute(=cs 错误
+报告，两侧同 ki:20122/ke:20253/Object.I:63854 栈!)** / reloadApiJsRejected。此前「我方缺
+OUT:execute」是 apicom 分类器的标签假象（按内容 'cs' 归类）。⇒ **页面侧协议层干净，排除**。
+剩余唯一流程分岔锁定：**参考在被拒后 ~8 心跳仍会换挂新 widget（双/三循环，api.js×2 重载），
+我方永不换挂**——决策在 orchestrate(chl_page) 的 render 循环语义：我方栈曾显示 JJ/run **嵌套
+两轮**（同一 widget 重渲），参考每轮换**新** widget（api.js 二次加载）。次日用攻击面：
+chl_page 循环的环境输入差（时序/事件/DOM），或直接 diff 参考与我们的 orchestrate 行为日志。
+另注：ov2 自动插桩器 19:06 与 22:06 两代均未插桩（payload 通道中断，等 ~01:06 下代恢复）。
+
 **Step 370（深夜收官实验：三个假设修正）**：① **reloadApiJsRequest 舞步=正常行为非分歧**——给
 patched api.js（链路把双方 api.js 都替换为 10-02 的 turnstile-api.patched.js，x-warm-fiddle-api:1
 实测确认）加消息队列死投后跑参考轮：**参考每轮也发 reloadApiJsRequest**（stale patched api.js 对
