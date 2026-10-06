@@ -318,9 +318,15 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
         let is_chrome = browser_major > 0;
-        let is_google_chrome = user_agent.contains("Chrome/")
-            || user_agent.contains("HeadlessChrome/")
-            || user_agent.contains("CriOS/");
+        // The branded-brand question is not readable from the UA: a Chromium
+        // build and a Google Chrome build ship the identical `Chrome/x.y.z`
+        // token. The default identity models the local baseline browser
+        // (Chromium.app, an unbranded build), whose wire carries the
+        // two-entry grease pair -- `{Chromium, Not)A;Brand}` for a major of
+        // 149, Chromium first -- so branded is false here and a Google
+        // Chrome persona is one explicit `brands` override away. The live
+        // 149 passing-round payload pins the two-entry shape.
+        let is_google_chrome = false;
 
         let mut fingerprint = if user_agent.contains("Android") {
             let version = token_after(&user_agent, "Android ")
@@ -751,6 +757,28 @@ mod tests {
         assert!(fingerprint.gpu.renderer.contains("ANGLE Metal Renderer"));
         assert_eq!(fingerprint.sec_ch_ua_platform(), "\"macOS\"");
         assert_eq!(fingerprint.sec_ch_ua_mobile(), "?0");
+        // The baseline browser is an unbranded Chromium build: the wire
+        // carries the two-entry grease pair, Chromium first, and the 149
+        // grease slot is `Not)A;Brand` v24 (chars at 149%11 and 150%11,
+        // version at 149%3). Google Chrome is absent from every brand list.
+        assert_eq!(
+            fingerprint.brands,
+            vec![
+                BrandVersion { brand: "Chromium".to_string(), version: "149".to_string() },
+                BrandVersion { brand: "Not)A;Brand".to_string(), version: "24".to_string() },
+            ]
+        );
+        assert_eq!(
+            fingerprint.full_version_list,
+            vec![
+                BrandVersion { brand: "Chromium".to_string(), version: "149.0.7827.0".to_string() },
+                BrandVersion { brand: "Not)A;Brand".to_string(), version: "24.0.0.0".to_string() },
+            ]
+        );
+        assert_eq!(
+            fingerprint.sec_ch_ua(),
+            "\"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\""
+        );
         // The default screen is the live Chromium 149 baseline host's desktop,
         // read from a passing-round gsLi5 reverse table: a 1720x1260 panel at
         // DPR 1 with a windowed (not maximized) window at y=51.
@@ -803,11 +831,15 @@ mod tests {
         // major % 6 == 5, 155: row [2, 1, 0]
         assert_eq!(brands(155), ["Google Chrome=155", "Chromium=155", "Not(A:Brand=24"]);
 
-        // The serialized header for the oracle row, verbatim.
+        // The serialized header for the oracle row, verbatim. The oracle is a
+        // branded Google Chrome, so build the list through the branded
+        // branch directly -- the default identity is the unbranded baseline.
+        let oracle: Vec<String> = chromium_brands(153, true, false, "")
+            .into_iter()
+            .map(|brand| format!("\"{}\";v=\"{}\"", brand.brand, brand.version))
+            .collect();
         assert_eq!(
-            BrowserFingerprint::from_user_agent(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")
-                .sec_ch_ua(),
+            oracle.join(", "),
             "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"");
     }
 
@@ -835,13 +867,14 @@ mod tests {
         assert_eq!(fingerprint.ua_platform_version, WINDOWS_UA_PLATFORM_VERSION);
         assert_eq!(fingerprint.architecture, "x86");
         assert_eq!(fingerprint.gpu.webgpu_profile, "intel");
+        // The default derivation is the unbranded two-entry shape on every
+        // platform; 149 (odd) puts Chromium first.
         assert_eq!(fingerprint.brands, vec![
-            BrandVersion { brand: "Google Chrome".to_string(), version: "149".to_string() },
             BrandVersion { brand: "Chromium".to_string(), version: "149".to_string() },
             BrandVersion { brand: "Not)A;Brand".to_string(), version: "24".to_string() },
         ]);
         assert_eq!(fingerprint.sec_ch_ua(),
-            "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"");
+            "\"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"");
     }
 
     #[test]
@@ -948,7 +981,10 @@ mod tests {
         let value = serde_json::to_value(BrowserFingerprint::default()).unwrap();
         assert_eq!(value["navigatorPlatform"], "MacIntel");
         assert_eq!(value["screen"]["deviceScaleFactor"], 1.0);
-        assert_eq!(value["brands"][0]["brand"], "Google Chrome");
+        // Two entries, Chromium first: the unbranded baseline shape.
+        assert_eq!(value["brands"][0]["brand"], "Chromium");
+        assert_eq!(value["brands"][1]["brand"], "Not)A;Brand");
+        assert_eq!(value["brands"].as_array().unwrap().len(), 2);
         assert_eq!(value["gpu"]["webgpuProfile"], "apple");
     }
 

@@ -2577,8 +2577,10 @@ mod ssrf_tests {
             "\r\nuser-agent: {}\r\n",
             fingerprint.user_agent.to_ascii_lowercase()
         )), "{request}");
+        // The default derivation is the unbranded Chromium shape: two brand
+        // entries, and an even major keeps the grease brand first.
         assert!(request.contains(
-            "\r\nsec-ch-ua: \"chromium\";v=\"146\", \"not-a.brand\";v=\"24\", \"google chrome\";v=\"146\"\r\n"
+            "\r\nsec-ch-ua: \"not-a.brand\";v=\"24\", \"chromium\";v=\"146\"\r\n"
         ), "{request}");
         assert!(request.contains("\r\nsec-ch-ua-mobile: ?0\r\n"), "{request}");
         assert!(request.contains("\r\nsec-ch-ua-platform: \"macos\"\r\n"), "{request}");
@@ -2619,8 +2621,9 @@ mod ssrf_tests {
         assert!(request.contains("\r\nsec-fetch-dest: document\r\n"), "{request}");
         assert!(request.contains("\r\nsec-fetch-site: none\r\n"), "{request}");
         assert!(request.contains("\r\nsec-fetch-user: ?1\r\n"), "{request}");
+        // Unbranded two-entry shape; an odd major puts Chromium first.
         assert!(request.contains(
-            "\r\nsec-ch-ua: \"google chrome\";v=\"153\", \"not_a brand\";v=\"8\", \"chromium\";v=\"153\"\r\n"
+            "\r\nsec-ch-ua: \"chromium\";v=\"153\", \"not_a brand\";v=\"8\"\r\n"
         ), "{request}");
     }
 
