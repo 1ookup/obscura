@@ -36236,4 +36236,90 @@ mod secure_context_navigator_gate_probe {
             })
         );
     }
+
+    /// Chromium's background timer throttling, pinned per source in a hidden
+    /// frame: no animation callbacks (the rendering pump holds), and timers
+    /// clamped to the one-second background minimum -- an interval ticks once
+    /// in the window and a nested timeout chain does not reach its first
+    /// authored step. This is the shape that keeps page-side heartbeat
+    /// collectors empty-or-sparse in a hidden widget frame.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hidden_frame_heartbeats_run_at_the_background_minimum() {
+        let dom = parse_html(
+            r#"<html><body><iframe id=hiddenf style="display:none"></iframe></body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(400.0, 300.0);
+        rt.run_page_init();
+        rt.install_internal_namespace();
+        let root = rt
+            .evaluate(
+                r#"(() => {
+                    const op = (cmd, a1) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), "");
+                    const host = document.getElementById("hiddenf")[Symbol.for('obscura.nid')];
+                    const created = JSON.parse(op("create_iframe_content_document", host));
+                    op("set_document_scope", created.root, JSON.stringify({
+                        url: "https://widget.example/frame",
+                        originUrl: "https://widget.example/frame",
+                        frameId: "hidden-frame",
+                        documentGeneration: 1,
+                        csp: null,
+                    }));
+                    op("parse_into_subtree", created.root, "<html><body></body></html>");
+                    return created.root;
+                })()"#,
+            )
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("hidden-frame", 1, root, "https://widget.example/frame")
+            .unwrap();
+        rt.evaluate_in_frame_realm_for_cdp(
+            "hidden-frame",
+            1,
+            crate::realm::MAIN_WORLD,
+            r#"(() => {
+                window.__matrix = {raf: 0, interval: 0, chain: 0};
+                requestAnimationFrame(() => { window.__matrix.raf++; });
+                setInterval(() => { window.__matrix.interval++; }, 16);
+                let chainDepth = 0;
+                const chainStep = () => {
+                    chainDepth++;
+                    window.__matrix.chain++;
+                    if (chainDepth < 200) setTimeout(chainStep, 16);
+                };
+                setTimeout(chainStep, 16);
+                return document.visibilityState;
+            })()"#,
+            true,
+            true,
+            2_000,
+        )
+        .await
+        .unwrap();
+        rt.run_event_loop_bounded(400).await.unwrap();
+        let matrix = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "hidden-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                "JSON.stringify(window.__matrix)",
+                true,
+                true,
+                2_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        println!("HIDDEN-FRAME-MATRIX={}", matrix);
+        assert_eq!(
+            matrix,
+            serde_json::json!(
+                "{\"raf\":0,\"interval\":1,\"chain\":0}"
+            )
+        );
+    }
 }

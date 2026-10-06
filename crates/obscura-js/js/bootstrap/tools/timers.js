@@ -38,6 +38,24 @@ function _clampNestedDelay(delay) {
     : delay;
 }
 
+// Chromium's background timer throttling: a hidden frame's timers run at
+// most once per second (`kBackgroundTimerMinimumInterval`), cross-origin
+// widget frames included. The challenge widget is a 0x0 hidden iframe, so a
+// page-side sampling loop that answers a heartbeat there reads empty-or-
+// sparse on the reference browser and would beat at full cadence here. The
+// clamp re-evaluates on every (re)schedule, so a frame that becomes visible
+// returns to its authored cadence.
+function _clampHiddenPageDelay(delay) {
+  if (delay >= 1000) return delay;
+  try {
+    if (globalThis.document
+        && String(globalThis.document.visibilityState) === 'hidden') {
+      return 1000;
+    }
+  } catch (_e) {}
+  return delay;
+}
+
 // Runs `f` at the nesting level its own timer scheduled, so timers it starts
 // nest deeper while unrelated work on the task queue keeps counting from zero.
 function _runAtNesting(level, f, args, invoker) {
@@ -69,7 +87,8 @@ _defineWindowValue('setTimeout', (fn, delay = 0, ...args) => {
   if (f === null) return ++_tid;
   const id = ++_tid;
   const nesting = _timerNesting + 1;
-  const normalizedDelay = _clampNestedDelay(Math.max(0, Number(delay) || 0));
+  const normalizedDelay = _clampHiddenPageDelay(
+    _clampNestedDelay(Math.max(0, Number(delay) || 0)));
   const nativeId = _scheduleAfter(normalizedDelay, () => {
     _nativeTimerIds.delete(id);
     __obscuraPendingTimeoutDeadlines.delete(id);
@@ -103,15 +122,19 @@ _defineWindowValue('setInterval', (fn, delay = 0, ...args) => {
   // repeats at that level -- so a sub-4ms interval started inside a timer is
   // floored the same way a nested timeout is.
   const nesting = _timerNesting + 1;
+  const authoredDelay = Math.max(0, Number(delay) || 0);
   const normalizedDelay = (nesting > _TIMER_NESTING_FLOOR_LEVEL
-      && Math.max(0, Number(delay) || 0) < _TIMER_NESTING_FLOOR_MS)
+      && authoredDelay < _TIMER_NESTING_FLOOR_MS)
     ? _TIMER_NESTING_FLOOR_MS
-    : Math.max(0, Number(delay) || 0);
+    : authoredDelay;
   const tick = () => {
     if (!_intervals.has(id)) return;
     _runAtNesting(nesting, f, args, 'TimerHandler:setInterval');
     if (!_intervals.has(id)) return;
-    const nativeId = _scheduleAfter(normalizedDelay, tick);
+    // The background clamp re-evaluates per tick: visibility is not frozen
+    // at the interval's creation.
+    const tickDelay = _clampHiddenPageDelay(normalizedDelay);
+    const nativeId = _scheduleAfter(tickDelay, tick);
     if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   };
   const nativeId = _scheduleAfter(normalizedDelay, tick);

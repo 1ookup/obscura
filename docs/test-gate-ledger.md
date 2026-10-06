@@ -637,3 +637,19 @@ run covers are then removed.
   browser state the verdict compares before the table changes. Scoped:
   obscura-js 756/756 (--features render, one new shape test). Full gate
   deferred to the next backfill
+
+- hidden-frame timers run at the background minimum (10-06): the rAF hold
+  of the previous entry did not reach the oHIQ6 heartbeat -- the round-7
+  readings are byte-identical across rounds (517,518,652,... on r2/r6/r7),
+  which rules out a live clock entirely, and a per-source matrix in a
+  display:none frame showed rAF at 0 but a 16ms interval at full cadence
+  (23 ticks in a 370ms window) with a nested chain right behind it. The
+  missing piece is Chromium's background timer throttling
+  (kBackgroundTimerMinimumInterval 1000ms for a hidden frame's timers):
+  setTimeout and every interval re-schedule now clamp to that minimum
+  while the document is hidden, re-evaluated per (re)schedule. The same
+  matrix after the clamp reads interval 1, chain 0, raf 0 -- matching the
+  reference shape (IGBuA2 sparse at ~1s, oHIQ6 empty because a
+  adjacent-sample-difference collector never sees a small gap). Scoped:
+  obscura-js 757/757 (--features render, the matrix pinned as a test).
+  Full gate deferred to the next backfill
