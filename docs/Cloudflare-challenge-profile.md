@@ -2271,3 +2271,19 @@ brands=[{Chromium,149},{Not)A;Brand,24}] 与我方修复后逐字一致；insecu
 
 **待办下批**：OjmeV1[118]/[79]（引擎侧 trace-api 诊断）、oHIQ6/IGBuA2 过量发射、Pdbt7 补条目、
 （观察）两-widget 换挂循环是否随值对齐自然出现。
+
+### Step 362：oHIQ6 三个观察者假设全部否掉；定位到 SVG 逐元素测量 9 倍慢（2026-10-06 15:0x）
+
+**方法**：修复 Agent 的 tmp 诊断测试（hidden 帧 SVG 探针形状 + MO/RO/rAF 计数）+ 主 Agent 独立夹具
+（同步 23 元素追加读 MO；23 元素逐个 getBoundingClientRect+getComputedStyle 计时），双盲互证。
+
+**结果**：
+- MO 批量语义正确（23 追加 → **1 次回调 24 records**，与 Chrome 同）；RO 同样 1 次 24 entries；
+  hidden 帧 rAF=0（77df20a 生效）。⇒ oHIQ6 的 71 条时标**不是**观察者逐元素触发。
+- SVG 逐元素测量耗时：**我方 3-6.6ms/元素（sum 84ms）vs 参考 0.35-1.5ms（sum 9ms）= 9 倍慢**，
+  且我方无热身收敛（全程 3-6ms）。71 ≈ 23 文本 × ~3 次测量的「慢测」自记录（阈值触发型），
+  Chrome 快到不触发。r10 op-trace 的 62-74 次 DOM 走查簇与此同相。
+- 顺带：r10 op-trace 画像——`iframe_content_document_state` 全程 **15162 次**（rch script 15K，
+  VM 轮询型），暂不动但记入画像。
+
+**下发**：SVG 文本测量热路径对齐（重复同参测量应亚毫秒级，配性能回归测试）。
