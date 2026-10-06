@@ -550,3 +550,27 @@ run covers are then removed.
   (--features render); a7254de (low-entropy header order) and 8ee8b3d
   (six-hint emission test, value-free) stay; the milestone-table brands(154)
   rows predate this batch and stay. Full gate deferred to the next backfill
+
+- unbranded two-entry brand lists (10-06): the baseline browser is an
+  unbranded Chromium build, whose wire carries the two-entry grease pair
+  (149 -> `{Chromium, Not)A;Brand}` v24, Chromium first) instead of the
+  three-entry Google Chrome set; the derivation drops the UA-based branded
+  guess (UA cannot distinguish a Chromium build) so every platform derives
+  the unbranded shape and a Google Chrome persona is a brands override.
+  Scoped: obscura-net 137/137, obscura-js 751/751 (--features render);
+  the branded permutation oracle stays as a direct chromium_brands(153,
+  true) call. Full gate deferred to the next backfill
+
+- WebGPU tables re-pinned to the live 149 baseline and the utterance gains
+  its event face (10-06): the apple adapter limits and the default limits
+  drop maxImmediateSize (37 entries on the live payload, the slot between
+  maxInterStageShaderVariables and maxColorAttachments is newer-build
+  only), the adapter features return to the captured 20-name order with no
+  subgroup-size-control, and the WGSL language list drops
+  immediate_address_space/swizzle_assignment/buffer_view/texture_formats_
+  tier1 (nine names, captured order); SpeechSynthesisUtterance extends
+  EventTarget with the Blink handler set and the real defaults (voice null,
+  lang "") -- `u instanceof EventTarget` was false on the engine against a
+  true on the reference, the strongest remaining sAMar8 candidate. Scoped:
+  obscura-js 751/751 (--features render). Full gate deferred to the next
+  backfill

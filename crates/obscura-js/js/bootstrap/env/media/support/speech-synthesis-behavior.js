@@ -63,9 +63,20 @@ function _makeSpeechSynthesis() {
 }
 
 function _speechUtteranceInitialize(utterance, text) {
-  utterance.text = text;
-  utterance.lang = 'en-US';
+  // The defaults a fresh `new SpeechSynthesisUtterance()` reports on the
+  // reference browser: voice null, lang "" (the locale resolution happens at
+  // speak() time, not at construction), 1/1/1 prosody, and every Blink event
+  // handler present and null.
+  utterance.voice = null;
+  utterance.lang = '';
+  utterance.text = text === undefined ? '' : String(text);
   utterance.rate = 1;
   utterance.pitch = 1;
   utterance.volume = 1;
+  for (const handler of _SPEECH_UTTERANCE_HANDLERS) {
+    utterance[handler] = null;
+  }
 }
+const _SPEECH_UTTERANCE_HANDLERS = [
+  'onstart', 'onend', 'onerror', 'onmark', 'onboundary', 'onpause', 'onresume',
+];

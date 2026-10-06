@@ -62,7 +62,6 @@ const _GPU_DEFAULT_LIMITS = {
   minStorageBufferOffsetAlignment: 256, maxVertexBuffers: 8,
   maxBufferSize: 268435456, maxVertexAttributes: 16,
   maxVertexBufferArrayStride: 2048, maxInterStageShaderVariables: 16,
-  maxImmediateSize: 64,
   maxColorAttachments: 8, maxColorAttachmentBytesPerSample: 32,
   maxComputeWorkgroupStorageSize: 16384, maxComputeInvocationsPerWorkgroup: 256,
   maxComputeWorkgroupSizeX: 256, maxComputeWorkgroupSizeY: 256,
@@ -71,6 +70,11 @@ const _GPU_DEFAULT_LIMITS = {
   maxStorageBuffersInFragmentStage: 8, maxStorageTexturesInFragmentStage: 4,
   maxStorageBuffersInVertexStage: 8, maxStorageTexturesInVertexStage: 4,
 };
+// `maxImmediateSize` is a property of newer builds only: the live Chromium
+// 149 adapter and default limit sets both answer 37 entries with no
+// immediate-size slot between maxInterStageShaderVariables and
+// maxColorAttachments, so neither table above carries it. The Intel D3D12
+// table keeps its copy until a Windows-side capture says otherwise.
 // An Intel part on D3D12: BC compression, no ASTC or ETC2, which are the
 // mobile and Apple formats.
 const _GPU_ADAPTER_FEATURES = [
@@ -118,7 +122,6 @@ const _GPU_APPLE = {
     maxComputeWorkgroupsPerDimension: 65535,
     minSubgroupSize: null,
     maxSubgroupSize: null,
-    maxImmediateSize: 64,
     maxStorageBuffersInFragmentStage: 10,
     maxStorageTexturesInFragmentStage: 8,
     maxStorageBuffersInVertexStage: 10,
@@ -127,14 +130,17 @@ const _GPU_APPLE = {
   features: [
     // Chrome exposes this set in adapter enumeration order. GPUSupportedFeatures
     // is iterable, so preserving the order matters to the challenge payload.
+    // Re-measured on the live Chromium 149 baseline payload (2026-10-06):
+    // bgra8unorm-storage precedes texture-formats-tier1 and shader-f16 sits
+    // after the bc-sliced-3d entry; subgroup-size-control is absent there.
     'depth32float-stencil8', 'rg11b10ufloat-renderable',
-    'texture-formats-tier1', 'bgra8unorm-storage', 'texture-compression-bc',
+    'bgra8unorm-storage', 'texture-formats-tier1', 'texture-compression-bc',
     'dual-source-blending', 'core-features-and-limits', 'float32-filterable',
     'indirect-first-instance', 'texture-compression-astc-sliced-3d',
-    'float32-blendable', 'subgroup-size-control', 'texture-compression-astc',
-    'texture-compression-etc2', 'depth-clip-control',
-    'texture-compression-bc-sliced-3d', 'texture-formats-tier2', 'clip-distances',
-    'shader-f16', 'texture-component-swizzle', 'subgroups',
+    'float32-blendable', 'texture-compression-astc', 'texture-compression-etc2',
+    'depth-clip-control', 'texture-compression-bc-sliced-3d', 'shader-f16',
+    'texture-formats-tier2', 'clip-distances', 'texture-component-swizzle',
+    'subgroups',
   ],
 };
 function _gpuAdapterProfile() {
@@ -142,13 +148,16 @@ function _gpuAdapterProfile() {
     limits: _GPU_LIMITS, features: _GPU_ADAPTER_FEATURES,
   };
 }
-// A property of the Chrome build, not of the adapter.
+// A property of the Chrome build, not of the adapter. Re-measured on the
+// live Chromium 149 baseline payload (2026-10-06): nine names; the
+// immediate_address_space / swizzle_assignment / buffer_view /
+// texture_formats_tier1 quartet of a newer build is absent there, and the
+// order is the captured one.
 const _GPU_WGSL_FEATURES = [
   'packed_4x8_integer_dot_product', 'subgroup_uniformity',
-  'immediate_address_space', 'subgroup_id', 'linear_indexing',
-  'readonly_and_readwrite_storage_textures', 'swizzle_assignment',
-  'unrestricted_pointer_parameters', 'buffer_view',
-  'pointer_composite_access', 'texture_formats_tier1',
+  'linear_indexing', 'subgroup_id',
+  'readonly_and_readwrite_storage_textures',
+  'unrestricted_pointer_parameters', 'pointer_composite_access',
   'texture_and_sampler_let', 'uniform_buffer_standard_layout',
 ];
 

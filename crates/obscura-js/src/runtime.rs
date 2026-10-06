@@ -31364,7 +31364,9 @@ RequestRedirect value",
                 "appleFormats": true,
                 "deviceBelowAdapter": true,
                 "preferredFormat": "bgra8unorm",
-                "wgslCount": 13,
+                // The live Chromium 149 baseline carries nine WGSL language
+                // features; the newer-build quartet stays out.
+                "wgslCount": 9,
                 "subgroupNull": true,
                 "fallbackNull": true,
                 "brands": ["[object GPUAdapter]", "[object GPUSupportedLimits]",
@@ -31447,7 +31449,8 @@ RequestRedirect value",
         ("maxComputeWorkgroupsPerDimension", 65535, 65535),
         ("maxDynamicStorageBuffersPerPipelineLayout", 8, 4),
         ("maxDynamicUniformBuffersPerPipelineLayout", 10, 8),
-        ("maxImmediateSize", 64, 64),
+        // maxImmediateSize is absent on the live Chromium 149 baseline in
+        // both tiers: 37 limits, no immediate-size slot.
         ("maxInterStageShaderVariables", 28, 16),
         ("maxSampledTexturesPerShaderStage", 48, 16),
         ("maxSamplersPerShaderStage", 16, 16),
