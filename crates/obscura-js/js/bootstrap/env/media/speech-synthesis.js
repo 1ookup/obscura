@@ -10,16 +10,17 @@ if (typeof globalThis.speechSynthesis === 'undefined') {
   globalThis.speechSynthesis = synth;
 }
 if (typeof globalThis.SpeechSynthesisUtterance === 'undefined') {
-  // Chrome's utterance is an EventTarget: `u instanceof EventTarget` answers
-  // true on the reference browser and every event-handler attribute is an own
-  // property of the instance, so the interface carries both. The event face
-  // below is the Blink idl set (onstart/onend/onerror/onmark/onboundary/
-  // onpause/onresume); the data-attribute defaults (voice null, lang "",
-  // rate/pitch/volume 1) live in _speechUtteranceInitialize.
+  // Chrome's utterance is an EventTarget whose interface members all live on
+  // the prototype as accessors: `u instanceof EventTarget` is true and
+  // `Object.getOwnPropertyNames(u)` is empty on the reference, while the
+  // prototype carries the six attributes and the seven Blink event handlers
+  // (14 with the constructor). The accessors install below the class
+  // definition; the state sits behind one per-instance symbol slot.
   globalThis.SpeechSynthesisUtterance = class SpeechSynthesisUtterance extends EventTarget {
     constructor(text) {
       super();
       _speechUtteranceInitialize(this, text);
     }
   };
+  _installUtteranceMembers(globalThis.SpeechSynthesisUtterance);
 }

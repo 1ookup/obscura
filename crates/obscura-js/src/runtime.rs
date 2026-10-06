@@ -36178,4 +36178,62 @@ mod secure_context_navigator_gate_probe {
             "rendered frame: visible document, animation pump runs"
         );
     }
+
+    /// The utterance interface lives on the prototype as accessors, the way
+    /// WebIDL ships it: 14 prototype own names (constructor + six attributes
+    /// + seven Blink event handlers, the reference count on 149), an instance
+    /// with no own string-keyed properties, and working accessors over the
+    /// per-instance state.
+    #[test]
+    fn utterance_members_live_on_the_prototype_as_accessors() {
+        let dom = parse_html("<html><body></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("https://example.com/test");
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const u = new SpeechSynthesisUtterance('hello');
+                    const defaults = {
+                        text: u.text, lang: u.lang, voice: u.voice,
+                        volume: u.volume, rate: u.rate, pitch: u.pitch,
+                    };
+                    u.text = 'bye';
+                    u.rate = 2;
+                    u.onboundary = function mark() {};
+                    const protoNames = Object.getOwnPropertyNames(
+                        SpeechSynthesisUtterance.prototype);
+                    return {
+                        protoLen: protoNames.length,
+                        protoHead: protoNames.slice(0, 4),
+                        hasCtor: protoNames.includes('constructor'),
+                        instanceOwn: Object.getOwnPropertyNames(u).length,
+                        defaults,
+                        textAfterSet: u.text,
+                        rateAfterSet: u.rate,
+                        handlerRound: typeof u.onboundary,
+                        isEventTarget: u instanceof EventTarget,
+                        setHandlerToWeird: (u.onstart = 42, u.onstart),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "protoLen": 14,
+                "protoHead": ["constructor", "text", "lang", "voice"],
+                "hasCtor": true,
+                "instanceOwn": 0,
+                "defaults": {"text": "hello", "lang": "", "voice": null,
+                             "volume": 1, "rate": 1, "pitch": 1},
+                "textAfterSet": "bye",
+                "rateAfterSet": 2,
+                "handlerRound": "function",
+                "isEventTarget": true,
+                "setHandlerToWeird": null,
+            })
+        );
+    }
 }

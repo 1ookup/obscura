@@ -621,3 +621,19 @@ run covers are then removed.
   count is challenge-call-volume, not a dropped-entry bug. Scoped:
   obscura-js 755/755 (--features render, one new two-frame probe test).
   Full gate deferred to the next backfill
+
+- utterance members move to the prototype (10-06): the fixture measured
+  prototype own names 1 vs 14 against the reference. The members had been
+  installed as per-instance data properties; WebIDL ships them as
+  prototype accessors -- the prototype now carries the six attributes and
+  seven Blink handlers over one per-instance symbol slot (14 names with
+  the constructor, constructor-first), an instance answers no own
+  string-keyed names, and accessors convert on write (handler set to a
+  non-function stays null). The voices list is deliberately untouched:
+  the passing-round payloads read mZLmS3 as the same 32-name list on both
+  sides, so an empty-array alignment would move a matched key; the
+  fixture's empty getVoices is an environment reading (voices load
+  asynchronously from the system TTS service) and needs a ruling on which
+  browser state the verdict compares before the table changes. Scoped:
+  obscura-js 756/756 (--features render, one new shape test). Full gate
+  deferred to the next backfill
