@@ -2105,3 +2105,72 @@ IP 未封，retry 键含引擎特征维度。TTL 冷却（主 Agent 19:50/20:20 
 
 **判决终态**：待冷却解除后组合判决轮补（验证清单：XYvy9[5] 表传导、kRQwh3="0" 保持、
 etmnR7 组 34 powerPreference、lDUiR4 architecture、aQgx8 走向、rc_ni 重置、POST /1.txt）。
+
+### Step 358：2026-10-06 会话——对拍基线重立（基线=Chromium 149）+ Oct-5「154 对齐」整批判反（2026-10-06 10:40）
+
+**背景**：cf5s worktree 会话以现役二进制（`worktree-dev1` @ `39256ac` 重建）重开判决。代理链
+`：9000` Reqable → `:8080` mitmdump（`mitm_inject_ov2_addon.py` 注入 `chanllenge/ov2/ov2.js`，
+当时代次 `ov2-1006-10`）→ CF。TLS 需 `SSL_CERT_FILE=<reqable CA>`（BoringSSL 不读 keychain；
+`OBSCURA_INSECURE_TLS=1` 亦可）。
+
+**基线重立（重要）**：`~/chrome-profile/Default/tracelog/trace.jsonl` 在 10:06 的内容是
+**10-02 的 replay 残留**（payload `Uheo3=1790949270`、页面 `vXDzj6=…/123.txt`、api.js 无
+`/b/` 路径、516 条 `vmp.deobf.1002.vmerr RangeError` = 反 replay 卡死特征）——**不可作基线**。
+活体基线由验证 Agent 用 turnstile-instrumentation-verify 流程重采（/1.txt、无 bridge、自动点击），
+快照 `/tmp/cf-runs/ref-live-r1.jsonl`（266 条：258 `1006.exec` + 4 new + 4 payloadJSON；
+**无 apicom/csp.gate 记录**——此二 key 只在 Obscura 侧出现，归因未决）。
+
+**Obscura 轮 1（fail 样本）**：serve(9223, stealth, :9000, tracelog→`/tmp/cf-runs/obs-trace-r1.jsonl`)
++ `cdp_click_clean.py --click-after 8 --deadline 26 --settle 5`。widget 8.0s 出框、点击成功、
+**interactiveEnd 后 1.26s 即 `fail code=600010`**、12.7s 重开 widget（retry）。apicom 34 条全序列
+与 payload 4 条（47→94→96→98 key）均落盘。终态：页面停在「验证成功。正在等待响应」，无 POST /1.txt。
+
+**P0——「154 参考」是错靶，基线浏览器是 Chromium 149**：
+- `/Users/l9h8/Applications/Chromium.app` = **149.0.7827.0**（带 tracelog 后端 = chrome-profile
+  基线机）；`/Applications/Google Chrome.app` = 154.0.8037.93（Oct-5 census/对齐对象）。
+- 活体基线 payload `zIyO8.jKeeJ4` = `Chrome/149.0.0.0`；我方 = `Chrome/154.0.0.0`（`bd9737f`
+  引入，其前就是 149）。
+- gsLi5 N 桶（隐藏帧 window 枚举）集合差双向实锤：only-in-ref（149 有）= SharedStorage 八名 +
+  ModelContext + WebMCPEvent + `d.requestStorageAccessFor`——正是 `520fe3a`/`eedbd38` 按 154
+  census **删掉**的；only-in-our（154 有）= FontFaceSet/HTMLCamera/HTMLMicrophone/HTMLUserMedia/
+  InteractionContentfulPaint/NodeRange/OpaqueRange/PerformanceSoftNavigation/PermissionsPolicy/
+  XSLTProcessor/requestResize——正是 `520fe3a` **加进来的** 11 名。`69b4d28` 的 `n.cpuPerformance=3`
+  同错（149 活体无此属性）。
+- 目标文档明确对拍基线 = chrome-profile(149) trace ⇒ **Oct-5 身份批（bd9737f/a6cbb36/520fe3a/
+  eedbd38/69b4d28/8ee8b3d）整批内容回退到 149**。回退同时恢复对拍可比性（两侧同身份 ⇒ 剩余
+  diff 全是引擎缺陷）。
+
+**P1——屏幕/窗口几何与基线不符**（fingerprint.rs macOS 桌面默认仍 1440×900@DPR2），活体 149
+基线实测（gsLi5 值→名反查表，/1.txt 隐藏帧读数）：
+
+| 事实 | 基线(149) | 我方 |
+|---|---|---|
+| s.width/s.availWidth/outerWidth | **1720** | 1440 |
+| s.height | **1260** | 900 |
+| s.availHeight | **1140** | 867 |
+| outerHeight | **1119**（≠availHeight!） | 867（=availHeight） |
+| screenX/screenLeft | 0 | 0 |
+| screenY/screenTop | **51** | 0 |
+| s.availTop | **30** | 33 |
+| s.colorDepth/s.pixelDepth | **24** | 30 |
+| devicePixelRatio | **1** | 2 |
+| n.languages | **['zh-CN']（单元素）** | ['zh-CN','zh'] |
+| n.cpuPerformance | 无 | 3 |
+
+注意 B7（languages 必须 ['zh-CN','zh']）是 09-24 旧参考（真 Chrome zh 环境）的结论，**现行 149
+参考实测单元素**——判据跟浏览器走，不跟旧文档走。
+
+**P2（未决，下批）**：① 我方第 4 条 payload（98-key）重发 gsLi5/XCvwf5 整桶而基线第 2 条全量
+不带（增量 vs 全量构造差异）；② `1.hCfV6` 159 vs 60；③ `1.omMvP9` null vs 0（状态撞车形态）；
+④ WebRTC 证书指纹串前 3 段一致第 4 段不同（未判）；⑤ apicom/csp.gate 只在我方 trace 出现。
+
+**复现命令**（本轮产物在 `/tmp/cf-runs/`，对拍工具 `payload_deep_diff.py`）：
+```bash
+OBSCURA_INSECURE_TLS=1 OBSCURA_TRACELOG_FILE=/tmp/cf-runs/obs-trace-rN.jsonl \
+  ./target/release/obscura serve --port 9223 --proxy http://127.0.0.1:9000 --stealth --allow-private-network
+/tmp/probe-venv/bin/python .claude/skills/obscura-challenge-probe/scripts/cdp_click_clean.py \
+  https://www.thelancet.com/1.txt --port 9223 --click-after 8 --deadline 26 --settle 5
+```
+
+**判决**：回退批落地→重建→判决轮（判据不变：POST /1.txt → 404 为唯一通过判据；600010/重开
+widget 为失败形态）。
