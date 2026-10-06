@@ -40,18 +40,32 @@ pub const MAIN_WORLD: u64 = 0;
 const BOOTSTRAP_SRC: &str = include_str!(env!("OBSCURA_BOOTSTRAP_PATH"));
 
 /// Mirror of the `<obscura:init>` script the runtime constructor executes in
-/// the default context (runtime.rs).
-const REALM_INIT_SRC: &str =
-    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;";
+/// the default context (runtime.rs). Every frame-realm creation path runs
+/// this same init (fresh, snapshot-restored, deferred-surface), which makes
+/// it the one common point for the OjmeV1[118] toString diagnosis arm.
+fn realm_init_src() -> String {
+    let mut src = String::from(
+        "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;",
+    );
+    if std::env::var_os("OBSCURA_DEBUG_TOSTRING").is_some() {
+        src.push_str(
+            " globalThis.__obscura_diag_tostring__ = true;",
+        );
+        src.push_str(DIAG_TOSTRING_FRAME);
+    }
+    src
+}
 
 /// The frame-realm arm of the OjmeV1[118] toString diagnosis. page-init.js
 /// does not run in frame realms (their init is REALM_INIT_SRC below), so the
-/// wrap has to ride the hydration injection. Full-print form: every
-/// conversion warns with the constructor, keys, result and stack, tagged
-/// with the realm origin.
+/// wrap rides the realm init itself -- which every creation path executes
+/// (fresh, snapshot-restored, deferred-surface). Full-print form: every
+/// conversion warns with the constructor, keys, result and stack. The
+/// __obscuraDiag mark makes a double install (realm init + hydration
+/// injection) a no-op.
 const DIAG_TOSTRING_FRAME: &str = r#"
 (function () {
-  if (!globalThis.__obscura_diag_tostring__) return;
+  if (Object.prototype.toString.__obscuraDiag) return;
   try { console.warn("[tostring-diag] armed realm=" +
     String(globalThis.location && globalThis.location.origin || "frame")); } catch (_e0) {}
   const _origToString = Object.prototype.toString;
@@ -1229,7 +1243,7 @@ impl ObscuraJsRuntime {
                 tracing::warn!("frame realm tracelog install failed: {error}");
             }
         }
-        self.execute_in_context(&context, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
+        self.execute_in_context(&context, "<obscura:frame-realm-init>", &realm_init_src())?;
         if timing {
             realm_phase_print("realm_init", t_phase.elapsed());
         }
@@ -1915,7 +1929,7 @@ impl ObscuraJsRuntime {
     /// realm. Order matters: the Deno binding was injected at creation, the
     /// init globals come next, then the bootstrap source (it calls ops).
     pub fn bootstrap_secondary_realm(&mut self, realm: &SecondaryRealm) -> Result<(), String> {
-        self.realm_execute_script(realm, "<obscura:realm-init>", REALM_INIT_SRC)?;
+        self.realm_execute_script(realm, "<obscura:realm-init>", &realm_init_src())?;
         // window.external.tracelog (tracelog.rs) is installed by the bootstrap,
         // so the host's decision on a destination has to reach this realm before
         // the bootstrap source runs, as it does in every other realm.
@@ -2363,7 +2377,7 @@ pub(crate) fn spawn_frame_realm(
                 tracing::warn!("frame realm tracelog install failed: {error}");
             }
         }
-        run_script(scope, "<obscura:frame-realm-init>", REALM_INIT_SRC)?;
+        run_script(scope, "<obscura:frame-realm-init>", &realm_init_src())?;
         if timing {
             realm_phase_print("sync realm_init", t_phase.elapsed());
         }
