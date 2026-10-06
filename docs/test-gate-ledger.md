@@ -653,3 +653,17 @@ run covers are then removed.
   adjacent-sample-difference collector never sees a small gap). Scoped:
   obscura-js 757/757 (--features render, the matrix pinned as a test).
   Full gate deferred to the next backfill
+
+- SVG text measurement path pinned in the reference cost band (10-06):
+  fixture timing on the current engine reads a 16ms first pass over 23
+  SVG text elements (2.9-4.2ms one-time layout warm-up on the first
+  element, 0.5-1.1ms steady state per element -- inside the reference's
+  0.35-1.5ms band) and a same-parameter repeat pass at 1.1-1.3ms total
+  (~15x under the first pass, sub-millisecond per element), so the
+  geometry heat path already holds and no caching change was needed; the
+  3-6.6ms-per-element fixture reading was taken on an earlier binary.
+  The timing probe is pinned as a regression test asserted as a ratio
+  (repeat under a quarter of the first pass) plus a catastrophic
+  per-element bound, because absolute milliseconds move with parallel
+  test load. Scoped: obscura-js 759/759 (--features render). Full gate
+  deferred to the next backfill
