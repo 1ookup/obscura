@@ -2174,3 +2174,34 @@ OBSCURA_INSECURE_TLS=1 OBSCURA_TRACELOG_FILE=/tmp/cf-runs/obs-trace-rN.jsonl \
 
 **判决**：回退批落地→重建→判决轮（判据不变：POST /1.txt → 404 为唯一通过判据；600010/重开
 widget 为失败形态）。
+
+### Step 359：149 回退批 `ae1168f` 落地——身份/几何对拍全绿，判决仍 fail；残余分歧按「活体双轮抖动分离」重排（2026-10-06 11:0x）
+
+**批次验收（轮 2 = `/tmp/cf-runs/obs-trace-r2.jsonl`，同基线对拍）**：
+- gsLi5 屏幕/几何 8 项（1720/1260/1140/1119/51/30/24/zh-CN）**全 OK**；
+- N 桶 1167/1167 **0 hunks**、x/o 桶 0 hunks——window 枚举面与活体 149 逐字节一致；
+- UA 逐字一致。scoped：obscura-net 137/137、obscura-js 751/751（ledger 已记）。
+- 判决：**仍 fail（interactiveEnd 后同形态 600010）**——单批身份回退不足以翻盘（10-05 前也在败，
+符合预期）。
+
+**方法升级——桶按内容签名对齐**：块号每会话重排（本轮 gsLi5 落桶 3 而基线落桶 1），桶对齐改用
+「去 9 骨架键后的内层键集合指纹」；39/40 桶配上，ref 桶 14 无对应（待查）。
+
+**抖动分离（活体 p1 vs p2 同机两轮）**：CYsxg7/zYUn5/uUOw3/RPKTR7/lgWCE7/ppMls5/cHIoX8/
+thhSb9/lIEA1/qIEN4/gPOK0/hCKCP8 **在活体两轮间自身就变** ⇒ 会话测量值，排除出修复清单
+（**lgWCE7 1308|1048、gPOK0 遍历序在活体两轮都不同——0927 时代的 C3「lgWCE7 差 80px」按此降级**）。
+
+**第二批修复清单（已下发）**：
+- P0-A UA-CH brands 2 条目（去 "Google Chrome"；JS 面+wire 头同源）；
+- P0-B `OjmeV1[118]` = "EBlFw4**[object Object]**" 序列化泄漏（ref=4611；另 [75] 12/14、[79]
+  false/true）——真·bot 信号级缺陷；
+- P1-A Pdbt7 performance entries 13 vs 8 + paint 条目错位；
+- P1-B oHIQ6 ref 恒空 vs 我方 71 条、IGBuA2 2 vs 7（过量发射）；
+- P1-C BKkj0/zXuvs9 68 vs 32、sAMar8 true/false、knVv1 7 vs 5（先查明语义再修）；
+- P1-D lDUiR4 WebGPU limits 表按 149 活体重核（10-05 表源自 Chrome 154 抓取）。
+
+**结构性观察（未解，下批候选）**：① 我方全量 payload 3 条（render→proof→proof+2键）vs 活体 2 条
+（render→**更小**的 proof：活体第 2 条全量丢桶 40/41 且桶 1 不带 gsLi5/XCvwf5/omMvP9=增量形态；
+我方是超集重发）——疑似首 proof 被拒后的客户端重测重发；② 活体发 2 条 47-key 报告（chl_api_m）
+我方只发 1 条；③ apicom/csp.gate 为 Obscura 自诊断打点（page-init.js），活体没有是**正常**，
+非分歧（本步定案，勿再查）。
