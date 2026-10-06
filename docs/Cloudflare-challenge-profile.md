@@ -2307,3 +2307,26 @@ realm 从未 armed，覆盖问题仍未证伪/证实。
 
 **授权变更**：修复 Agent 改为自跑诊断轮（独立端口 9225）直至钩子命中 X——等待主 Agent 轮次
 的节奏跟不上流程漂移。
+
+### Step 364：**冷却（引擎键控短重试臂）复发 + brunhild 判据的假阴性修正 + 钩子战果盘点**（2026-10-06 17:1x）
+
+**现象**：r13(16:04)/r14/r15 三轮全部**极早死**——页级 fo 发出后 widget 从不 init（apicom 46 条
+全是 meow/food 心跳，无 init/requestExtraParams/interactiveBegin），无 VM 记录、无 payloadJSON。
+r15 brunhild=0 是**假阴性**（没到 render 相）。
+
+**归因**：参考浏览器 17:04 同 IP 同代理同新代 ov2（16:06 轮换，md5 71c6f5ec，词汇仍是
+vmp.deobf.1006.*——「1006」不是代计数器而是当日稳定词汇）**正常挂载 widget 并发 fo** ⇒ 不是
+新代插桩坏了、不是 IP 封禁 ⇒ **step 357 的引擎键控短重试臂复发**（今天 ~15 轮打光预算）。
+
+**判据协议修正（重要）**：brunhild 计数只有在「本轮确有 render」时才可判读——前置条件=
+trace 有 payloadJSON 或 serve log 有 widget 侧 h/g/fo POST。冷却期里 brunhild 恒 0 但毫无意义。
+轮次节奏改为一小时一探（免点击），render 恢复即判读。
+
+**钩子战果盘点（对账修复 Agent 的 6 小时）**：`3b852df`/`21bb772`/`ce952f3` 三个钩子提交；
+`/tmp/tostring-hits.txt` 166 命中=126 CallSite + 40 String（钩子自身噪音）。**CallSite 是红鲱鱼**
+——夹具证明两侧 String(CallSite) 都正常输出帧串（'<eval-remote>:8:13' vs '<anonymous>:5:13'），
+且 hits 来自本地无代理夹具轮非真挑战。X118 未被抓到；修复 Agent 的 f1-f3 本地轮亦未复现泄漏
+（本地夹具不跑 OjmeV1 探针）。**X118 追捕转为 ov2.js 定制插桩路线**（goal 授权改部署件；窗口
+受 3h 自动轮换约束，动手前先查 ov2.js mtime）。
+
+**冷却期动作**：停止烧轮；离线整理。冷却解除判据：免点击探针轮出现 payloadJSON。
