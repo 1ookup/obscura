@@ -682,3 +682,29 @@ run covers are then removed.
   verdict-round body dump to read the String(X) expression. Scoped:
   obscura-js 759/759 (--features render, arm is env-gated and inert when
   unset). Full gate deferred to the next backfill
+
+- supportedEntryTypes back to the 149 thirteen (10-06, verifier offline
+  cross-check vfix-pA-perf.json): our 15 carried the 10-05 154-only pair --
+  interaction-contentful-paint and soft-navigation -- which the 149
+  reference does not publish. Both leave the supported list, their
+  interface rows (InteractionContentfulPaint,
+  PerformanceSoftNavigation) and member shims leave the surface, and the
+  non-isolated hidden-name gate drops the two entries (nothing left to
+  hide). N-bucket our-only residue of both names goes with them.
+  Recorded, not fixed here: Pdbt7's Lcfc8 family reads as
+  long-animation-frame entries (reference top document 1 LoAF, ours 2,
+  with navigation 1484ms vs 344ms) -- engine-speed class, tracked
+  separately.
+
+- toString-diag frame regression fixed (10-06): the previous batch's
+  frame-realm wrap rode the hydration injection unconditionally, and its
+  guard flip (from the arm-flag check to the __obscuraDiag mark) made the
+  wrap install on every frame hydration even with the diagnosis unset --
+  frame_environment_uses_its_url_origin_cookies_and_storage_area and
+  frame_blob_worker_eval_fetch_empty_hits_frame_origin failed on it (the
+  wrap raced the post-hydration surface restore). The wrap now installs
+  only from realm_init_src() -- the REALM_INIT common point all three
+  frame creation paths execute -- under the env condition, and the
+  hydration injection carries the arm flag only. Both frame tests pass
+  again. Scoped: obscura-js 759/759 (--features render). Full gate
+  deferred to the next backfill
