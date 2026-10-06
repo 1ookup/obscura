@@ -1,11 +1,13 @@
 // SharedStorage.
 //
-// Retired on the Chrome 154 evidence: the family this file once installed
-// (SharedStorage, five *Method classes, SharedStorageWorklet, a
-// `sharedStorage` accessor) does not exist on the 154 reference in any realm
-// we can observe. The shapes below were measured against the 149 oracle;
-// they stay as reference, and the installer returns before touching the
-// global.
+// Object.getOwnPropertyNames(window) in Chrome lists SharedStorage, the five
+// *Method classes, SharedStorageWorklet and a `sharedStorage` accessor, all as
+// non-enumerable own properties; the engine answered none of them, so a census
+// of the global came up ten names short of the browser it claims to be. The
+// shapes below are measured on the local Chrome oracle (149): constructor
+// lengths, prototype member order (Chrome puts `constructor` between
+// batchUpdate and worklet, which is why it is moved here), and the error each
+// constructor raises.
 //
 // The storage itself is not implemented. Writes and batchUpdate resolve
 // without persisting anything, and the three entry points that need a
@@ -13,14 +15,6 @@
 // nothing in this engine can add one; a resolved promise there would be a
 // value no browser produces for those calls.
 (function installSharedStorageSurface() {
-  // Chrome 154 carries no SharedStorage family in any realm we can observe:
-  // the top document, a secure origin and the cross-origin widget frame all
-  // answer `'sharedStorage' in window` with false, `typeof SharedStorage` is
-  // undefined, and the 154 payload census lists none of the constructors.
-  // The 149 oracle this file was measured against is stale; installing any of
-  // it now would be ten invented keys on the global. The shapes below stay
-  // for reference only.
-  return;
   if (typeof globalThis.SharedStorage !== 'undefined') return;
 
   const method = (name, length, fn) => {

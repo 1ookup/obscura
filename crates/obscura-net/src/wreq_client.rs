@@ -31,7 +31,7 @@ use crate::client::{
     validate_cors_response, validate_request_mode, validate_url, origin_header_required,
 };
 
-// The default stealth identity is the same macOS Chrome 154 the fingerprint
+// The default stealth identity is the same macOS Chrome 149 the fingerprint
 // derives; the wire layer and the JS layer must never disagree on it.
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str = crate::fingerprint::DEFAULT_USER_AGENT;
@@ -275,7 +275,7 @@ impl StealthHttpClient {
         allow_private_network: bool,
         fingerprint: crate::fingerprint::BrowserFingerprint,
     ) -> Self {
-        // Chrome148 is the closest profile wreq-util ships to 154. The
+        // Chrome148 is the closest profile wreq-util ships to 149. The
         // platform must agree with the fingerprint identity the page reports
         // (Win32/D3D11 etc.): a macOS-marked transport under a Windows
         // identity is a cross-layer mismatch. Requests still carry an
@@ -1533,11 +1533,11 @@ mod tests {
         assert!(captured[1].to_ascii_lowercase().contains("\r\nsec-ch-ua-bitness: \"64\"\r\n"), "{captured:?}");
         let retry_lower = captured[1].to_ascii_lowercase();
         assert!(retry_lower.contains("\r\nsec-ch-ua-full-version-list: "), "{captured:?}");
-        // The User-Agent carries Chrome's reduced `154.0.0.0` token; the
+        // The User-Agent carries Chrome's reduced `149.0.0.0` token; the
         // full-version list carries a build Chrome shipped, because the
         // reduced token is a value no Chrome has ever published there.
-        assert!(retry_lower.contains("\"chromium\";v=\"154.0.8037.93\""), "{captured:?}");
-        assert!(retry_lower.contains("\"not a(brand\";v=\"99.0.0.0\""), "{captured:?}");
+        assert!(retry_lower.contains("\"chromium\";v=\"149.0.7827.0\""), "{captured:?}");
+        assert!(retry_lower.contains("\"not)a;brand\";v=\"24.0.0.0\""), "{captured:?}");
         assert_eq!(retry_lower.matches("\r\nsec-ch-ua:").count(), 1, "{captured:?}");
         // The legacy spellings in Accept-CH (`UA`, `UA-Full-Version-List`) are
         // ignored the way Chrome ignores them, so neither the bare `ua` header

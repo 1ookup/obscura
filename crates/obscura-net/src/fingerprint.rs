@@ -103,14 +103,14 @@ pub struct FingerprintOverrides {
 }
 
 pub const DEFAULT_USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
 fn default_language() -> String {
     host_language()
 }
 
 fn default_languages() -> Vec<String> {
-    authored_languages(&default_language())
+    vec![default_language()]
 }
 
 /// Chrome reports the machine's preferred language, so the default identity
@@ -243,12 +243,6 @@ pub fn fingerprint_overrides_from_env() -> FingerprintOverrides {
 pub const MACOS_UA_PLATFORM_VERSION: &str = "26.4.0";
 pub const WINDOWS_UA_PLATFORM_VERSION: &str = "15.0.0";
 
-/// The macOS work area sits below the menu bar, so a real macOS session always
-/// reports `availTop > 0` and `availHeight < height`. A macOS identity that
-/// answered the full screen height at the origin is a shape no macOS Chrome
-/// produces, on a notched or a classic display alike.
-pub const MACOS_MENUBAR_INSET: u32 = 33;
-
 /// Real Chrome builds, by major version.
 ///
 /// Chrome's User-Agent is reduced to `M.0.0.0`, but `sec-ch-ua-full-version`,
@@ -259,7 +253,6 @@ pub const MACOS_MENUBAR_INSET: u32 = 33;
 /// produce, and it is trivially checkable. Majors absent from this table keep
 /// the User-Agent token, because a wrong specific build is no better.
 const CHROME_BUILDS: &[(&str, &str)] = &[
-    ("154", "154.0.8037.93"),
     ("151", "151.0.7922.76"),
     ("149", "149.0.7827.0"),
     ("146", "146.0.7680.80"),
@@ -284,20 +277,14 @@ fn resolve_browser_version(token: String) -> String {
         .unwrap_or(token)
 }
 
-/// `navigator.languages` is the authored preference list plus the
-/// base-language fallback Chrome reports for a regional variant: a `zh-CN`
-/// session reads `["zh-CN", "zh"]`, byte for byte the reference capture of
-/// 2026-10-05 (an older census claim that it stays one entry lost to the
-/// direct byte comparison). The Accept-Language header serializes the same
-/// pair, so the property and the header stay one list; the lone-entry
-/// synthesis in `accept_language` only covers a directly supplied single
-/// tag.
+/// `navigator.languages` is exactly the authored preference list: a `zh-CN`
+/// session reports `["zh-CN"]` (passing Chrome census, Step 300; the live
+/// 149 baseline payload reads `n.language`/`n.languages` into the bare
+/// `zh-CN` bucket alike). The base-language fallback lives in the
+/// Accept-Language header only, where Chrome's serializer synthesizes it
+/// (`accept_language` below). The two surfaces used to share one expanded
+/// list, which leaked the header shape into the property.
 fn authored_languages(language: &str) -> Vec<String> {
-    if let Some((base, _)) = language.split_once('-') {
-        if !base.is_empty() && base != language {
-            return vec![language.to_string(), base.to_string()];
-        }
-    }
     vec![language.to_string()]
 }
 
@@ -430,20 +417,26 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
                 hardware_concurrency: host_hardware_concurrency(),
                 device_memory: 16.0,
                 screen: ScreenFingerprint {
-                    width: 1440,
-                    height: 900,
-                    avail_width: 1440,
-                    // The macOS work area starts below the menu bar, so the
-                    // default has to be smaller than the screen even before an
-                    // embedder supplies its host's real metrics.
-                    avail_height: 900 - MACOS_MENUBAR_INSET,
-                    avail_top: MACOS_MENUBAR_INSET as i32,
+                    // The default is the live Chromium 149 baseline host's
+                    // desktop, read out of the gsLi5 reverse table of a real
+                    // passing-round payload (ref-live-r1, 2026-10-06):
+                    // s.width/s.availWidth 1720, s.height 1260,
+                    // s.availHeight 1140, s.availTop 30, devicePixelRatio 1,
+                    // and the window geometry outerWidth 1720 /
+                    // outerHeight 1119 (a windowed window, not maximized:
+                    // outerHeight sits below availHeight) with
+                    // screenY/screenTop 51 and screenX/screenLeft 0.
+                    width: 1720,
+                    height: 1260,
+                    avail_width: 1720,
+                    avail_height: 1140,
+                    avail_top: 30,
                     avail_left: 0,
-                    device_scale_factor: 2.0,
-                    outer_width: 0,
-                    outer_height: 0,
+                    device_scale_factor: 1.0,
+                    outer_width: 1720,
+                    outer_height: 1119,
                     screen_x: 0,
-                    screen_y: 0,
+                    screen_y: 51,
                 },
                 gpu: GpuFingerprint {
                     vendor: "Google Inc. (Apple)".to_string(),
@@ -572,11 +565,10 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
     /// request header. The first entry is unweighted; later entries use
     /// Chrome's conventional descending q-values.
     ///
-    /// The authored list carries the base-language fallback for a regional
-    /// variant (`zh-CN` -> `["zh-CN", "zh"]`), which serializes verbatim; a
-    /// lone regional variant supplied directly still gets the base
-    /// synthesized here, matching Chrome's serializer (`zh-CN` preference ->
-    /// `zh-CN,zh;q=0.9` header).
+    /// Chrome's header serializer synthesizes the base language of a lone
+    /// regional variant (`zh-CN` preference -> `zh-CN,zh;q=0.9` header) while
+    /// `navigator.languages` stays the authored one-entry list. A list with
+    /// more than one authored entry serializes verbatim.
     pub fn accept_language(&self) -> String {
         let authored = if self.languages.is_empty() {
             std::slice::from_ref(&self.language)
@@ -735,18 +727,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_a_macos_chrome_154_apple_silicon_identity() {
+    fn default_is_a_macos_chrome_149_apple_silicon_identity() {
         let fingerprint = BrowserFingerprint::from_user_agent(DEFAULT_USER_AGENT);
         // The language is the host's, not a constant: the surfaces must agree
         // with whichever locale this machine reports (header synthesis
         // included), which is the property the census reads.
         let language = default_language();
         assert_eq!(fingerprint.language, language);
-        let mut expected_languages = vec![language.clone()];
-        if let Some((base, _)) = language.split_once('-') {
-            expected_languages.push(base.to_string());
-        }
-        assert_eq!(fingerprint.languages, expected_languages);
+        assert_eq!(fingerprint.languages, vec![language.clone()]);
         let expected_header = if language.contains('-') {
             let base = language.split('-').next().unwrap();
             format!("{language},{base};q=0.9")
@@ -763,6 +751,20 @@ mod tests {
         assert!(fingerprint.gpu.renderer.contains("ANGLE Metal Renderer"));
         assert_eq!(fingerprint.sec_ch_ua_platform(), "\"macOS\"");
         assert_eq!(fingerprint.sec_ch_ua_mobile(), "?0");
+        // The default screen is the live Chromium 149 baseline host's desktop,
+        // read from a passing-round gsLi5 reverse table: a 1720x1260 panel at
+        // DPR 1 with a windowed (not maximized) window at y=51.
+        let screen = &fingerprint.screen;
+        assert_eq!(
+            (screen.width, screen.height, screen.avail_width, screen.avail_height),
+            (1720, 1260, 1720, 1140)
+        );
+        assert_eq!((screen.avail_top, screen.avail_left), (30, 0));
+        assert_eq!(screen.device_scale_factor, 1.0);
+        assert_eq!(
+            (screen.outer_width, screen.outer_height, screen.screen_x, screen.screen_y),
+            (1720, 1119, 0, 51)
+        );
     }
 
     /// Chrome seeds a stable permutation of the brand list with the major
@@ -901,17 +903,17 @@ mod tests {
     }
 
     #[test]
-    fn language_property_carries_the_same_base_fallback_as_the_header() {
+    fn language_property_is_the_authored_list_and_header_adds_the_fallback() {
         let fingerprint = BrowserFingerprint::default().with_overrides(&FingerprintOverrides {
             language: Some("zh-CN".to_string()),
             ..FingerprintOverrides::default()
         });
         assert_eq!(fingerprint.language, "zh-CN");
-        // navigator.languages carries the authored regional variant plus its
-        // base-language fallback, matching the reference Chrome capture of
-        // 2026-10-05 (["zh-CN", "zh"]). The header serializes the same pair,
-        // so Accept-Language still reads zh-CN,zh;q=0.9.
-        assert_eq!(fingerprint.languages, vec!["zh-CN", "zh"]);
+        // navigator.languages is the authored one-entry preference (the live
+        // 149 baseline reads n.language and n.languages into the bare "zh-CN"
+        // bucket alike). The base-language fallback is a header-side synthesis
+        // only: Accept-Language still reads zh-CN,zh;q=0.9.
+        assert_eq!(fingerprint.languages, vec!["zh-CN"]);
         assert_eq!(fingerprint.accept_language(), "zh-CN,zh;q=0.9");
 
         let languages = BrowserFingerprint::default().with_overrides(&FingerprintOverrides {
@@ -945,10 +947,8 @@ mod tests {
     fn serializes_the_javascript_injection_contract() {
         let value = serde_json::to_value(BrowserFingerprint::default()).unwrap();
         assert_eq!(value["navigatorPlatform"], "MacIntel");
-        assert_eq!(value["screen"]["deviceScaleFactor"], 2.0);
-        // The 154 major seeds the [2, 0, 1] permutation, so the serialized
-        // list leads with Chromium (the reference capture's order).
-        assert_eq!(value["brands"][0]["brand"], "Chromium");
+        assert_eq!(value["screen"]["deviceScaleFactor"], 1.0);
+        assert_eq!(value["brands"][0]["brand"], "Google Chrome");
         assert_eq!(value["gpu"]["webgpuProfile"], "apple");
     }
 

@@ -295,10 +295,6 @@ registerNavigatorSurface();
   // reference machine's answer, measured Chrome 149 page and worker alike --
   // the earlier "absent everywhere" reading was taken on an insecure origin.
   defGetter('deviceMemory', function() { return _fingerprint().deviceMemory || 16; });
-  // `cpuPerformance` is the constant number 3 on the reference Chrome 154,
-  // in the top document and in a cross-origin frame alike (live direct
-  // reads), and the reference dec bucket carries n.cpuPerformance too.
-  defGetter('cpuPerformance', function() { return 3; });
 
   _navProto.share = _markNative(function share(data) {
     return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));

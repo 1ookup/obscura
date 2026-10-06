@@ -628,14 +628,21 @@ let _SharedArrayBufferCtor = globalThis.SharedArrayBuffer || (() => {
 let _applySecureContextGating = null;
 let _applyCrossOriginIsolation = null;
 let _crossOriginIsolatedValue = false;
-// A non-isolated document's Window surface used to omit these four
-// experimental constructors from own-key reflection on the strength of a
-// Chrome 153 reading. The Chrome 154 censuses reverse it: FontFaceSet,
+// A non-isolated document's Window surface omits these experimental
+// constructors from own-key reflection. The values remain available through
+// direct property access in realms that implement them; only the reflected
+// surface is gated, and cross-origin-isolated realms keep the complete set.
+//
+// This used to be gated to cross-origin child frames, because the frame's
+// WindowProxy shape was the only census taken. The challenge page's own top
+// window answers the same way (Chrome 153, 2026-09-28): FontFaceSet,
 // HTMLUserMediaElement, InteractionContentfulPaint and
-// PerformanceSoftNavigation are own names of a plain non-isolated secure
-// document (measured on a localhost page and on the widget frame alike), so
-// the gate is empty and the names stay on the surface everywhere.
-const _nonIsolatedHiddenNames = new Set([]);
+// PerformanceSoftNavigation are not own properties there either, so the gate
+// follows the document's isolation, not its position in the frame tree.
+const _nonIsolatedHiddenNames = new Set([
+  'FontFaceSet', 'HTMLUserMediaElement', 'InteractionContentfulPaint',
+  'PerformanceSoftNavigation',
+]);
 // V8's code-generation callback reads this realm-local flag to enforce the
 // document's `script-src` `unsafe-eval` requirement without replacing the
 // intrinsic eval binding (which would change direct-eval scope).

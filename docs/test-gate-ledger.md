@@ -529,3 +529,24 @@ run covers are then removed.
   new scripted_accept_ch_sends_all_six_high_entropy_hints seeds the accepted
   set with the full nine names and asserts each of the six high-entropy hints
   is sent exactly once; full gate deferred to the next backfill
+
+- revert the Oct-5 Chrome 154 alignment to the Chromium 149 baseline and pin
+  the baseline host geometry (10-06): the live baseline browser is the local
+  Chromium 149.0.7827.0 (profile step 358), so the 154 identity sync
+  (bd9737f), both realm census realignments (a6cbb36, 520fe3a), the
+  requestStorageAccessFor drop (eedbd38) and the cpuPerformance restore
+  (69b4d28) are content-reverted; the SharedStorage/ModelContext/WebMCPEvent
+  family and document.requestStorageAccessFor return, the eleven 154 stubs
+  (PermissionsPolicy, FontFaceSet, XSLTProcessor, the camera/microphone pair,
+  NodeRange/OpaqueRange, the paint entries, requestResize) leave, and
+  navigator.languages returns to the single authored entry (the live 149
+  payload reads n.language and n.languages into the bare zh-CN bucket
+  alike). New, not a revert: the default macOS screen identity becomes the
+  baseline host's desktop measured from the passing-round gsLi5 reverse
+  table (1720x1260, avail 1720x1140 top 30, DPR 1 so colorDepth/pixelDepth
+  derive to 24, windowed outer 1720x1119 at screenY 51); the resize-observer
+  device-box fixture pins DPR 2 explicitly so its conversion assertion keeps
+  its discriminating power. Scoped: obscura-net 137/137, obscura-js 751/751
+  (--features render); a7254de (low-entropy header order) and 8ee8b3d
+  (six-hint emission test, value-free) stay; the milestone-table brands(154)
+  rows predate this batch and stay. Full gate deferred to the next backfill
