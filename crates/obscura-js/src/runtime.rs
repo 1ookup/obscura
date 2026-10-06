@@ -36042,4 +36042,63 @@ mod secure_context_navigator_gate_probe {
         assert_eq!(value["leaked"], serde_json::json!([]));
         assert_eq!(value["len"].as_u64(), Some(43));
     }
+
+    /// userAgentData is [SecureContext]: present with the two-entry brand
+    /// list on an https document, absent (not undefined-valued) on an http
+    /// one. Pinned as a pair after the 1fe592a/b5253f1 unbranding was
+    /// misread as losing the surface -- the insecure half of that reading
+    /// was the gate working, not a regression.
+    #[test]
+    fn user_agent_data_exists_secure_and_is_gated_insecure() {
+        for scheme in ["https", "http"] {
+            let dom = parse_html("<html><body></body></html>");
+            let mut rt = ObscuraJsRuntime::new();
+            rt.set_dom(dom);
+            rt.set_url(&format!("{scheme}://example.com/test"));
+            rt.run_page_init();
+            let result = rt.evaluate(
+                "JSON.stringify({secure: isSecureContext,\
+                  uadType: typeof navigator.userAgentData,\
+                  uadIn: 'userAgentData' in navigator,\
+                  brands: (() => { try { return navigator.userAgentData ? navigator.userAgentData.brands : null; } catch (e) { return 'threw: ' + e.message; } })()})",
+            )
+            .unwrap();
+            println!("UAD-{scheme}={}", result);
+        }
+    }
+
+    /// Statement-for-statement replay of /tmp/cf-runs/uach_probe.js on the
+    /// secure origin the challenge page runs on. The probe's about:blank
+    /// reading is context-sensitive: NavigatorUAData is [SecureContext], so
+    /// an opaque/http origin answers undefined the way Chrome does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn uach_probe_replay_answers_the_two_entry_lists_on_secure_origin() {
+        let dom = parse_html("<html><body></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("https://challenges.cloudflare.com/test");
+        rt.run_page_init();
+        rt.evaluate(
+            r#"(() => {
+                var o = {};
+                try { o.ua_data = typeof navigator.userAgentData; } catch (e) { o.ua_data = 'E'; }
+                try { o.brands = JSON.stringify(navigator.userAgentData.brands); } catch (e) { o.brands = 'ERR:' + e.message; }
+                try { o.fvl = String(navigator.userAgentData.getHighEntropyValues).slice(0, 40); } catch (e) { o.fvl = 'ERR:' + e.message; }
+                try {
+                    navigator.userAgentData.getHighEntropyValues(
+                        ['brands','fullVersionList','architecture','bitness','mobile','model','platform','platformVersion','uaFullVersion','wow64'])
+                        .then(v => { window.__uach = JSON.stringify(v); },
+                              e => { window.__uach = 'REJ:' + e.message; });
+                } catch (e) { window.__uach = 'ERR:' + e.message; }
+                window.__uach_probe = JSON.stringify(o);
+            })()"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(20).await.unwrap();
+        println!(
+            "UACH-PROBE={} __uach={}",
+            rt.evaluate("window.__uach_probe").unwrap(),
+            rt.evaluate("window.__uach").unwrap()
+        );
+    }
 }

@@ -589,3 +589,18 @@ run covers are then removed.
   the reference's full 36-name list before it can be aligned without
   guessing. Scoped: obscura-js 752/752 (--features render, one new gate
   probe test). Full gate deferred to the next backfill
+
+- userAgentData regression report investigated, no engine fault found
+  (10-06): the report claimed navigator.userAgentData went undefined after
+  1fe592a/b5253f1 on an about:blank fixture and that the round-5 payload's
+  Yyepi7 bucket lost brands/fullVersionList. Both halves check out the
+  other way: NavigatorUAData is [SecureContext], so an opaque/http origin
+  answers undefined the way Chrome does (the gate's insecure behavior,
+  present since before this batch -- measured 149), and the round-5
+  payload's Yyepi7 carries both lists in the new two-entry shape
+  (brands {Chromium,149}/{Not)A;Brand,24}, fullVersionList
+  {Chromium,149.0.7827.0}/{Not)A;Brand,24.0.0.0}). Two regression tests
+  added: the secure/insecure userAgentData pair, and a statement-level
+  replay of the uach_probe.js fixture on the challenge origin (two-entry
+  lists through getHighEntropyValues). Scoped: obscura-js 754/754
+  (--features render). Full gate deferred to the next backfill
