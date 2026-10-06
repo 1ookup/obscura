@@ -2392,6 +2392,18 @@ r17-r21 **全部早死**（无测量相），同二进制无 env 的 r16 正常 
 
 **BKkj0/zXuvs9=68（任务 C，已落修）**：实锤=**speechSynthesis.getVoices().length**。参考 Chromium 149 本机 dump：68 语音（全 localService、婷婷 default、固定顺序）；mZLmS3=排序名字列表的 slice(0,32)（两侧早已一致）。我方旧表 32 行且**5 处语言错位**（Alva pt-BR→sv-SE、Amira ar-001→ms-MY、Daria sv-SE→bg-BG、Geeta en-IN→te-IN、Lana ru-RU→hr-HR——旧表像按错位排序构建）。已按实测 dump 扩表 32→68（speech-synthesis-behavior.js）；`say -v '?'`=72 但 Chrome 暴露 68（AVSpeechSynthesisVoice 集），表复刻 Chrome dump。夹具：我方现答 68。Scoped obscura-js 761/761 + release build；ledger 已记。
 
+**Step 370（深夜收官实验：三个假设修正）**：① **reloadApiJsRequest 舞步=正常行为非分歧**——给
+patched api.js（链路把双方 api.js 都替换为 10-02 的 turnstile-api.patched.js，x-warm-fiddle-api:1
+实测确认）加消息队列死投后跑参考轮：**参考每轮也发 reloadApiJsRequest**（stale patched api.js 对
+新 widget 的固有 mismatch），且参考第 1 个 widget 也会 **fail** 并 3 次换挂、第 2 轮**无点击即
+interactiveBegin**——Step 369 的「最新线索」降级为正常舞步。② **api.js census 两侧 99% 逐字一致**
+（d.cT/ht.atrs/pfp 全字串/mL/sL/ssL/tL=46/sR=true/xp/wp 全同；唯一差 vDvp 视口尺寸=夹具窗口差，
+非引擎差）——环境报告面干净。③ 我方 r36 免点击轮同样到达 interactiveBegin——**双方流程骨架同构**
+（init→extraParams→reload(拒)→translationInit→interactiveBegin；参考多一轮 fail-换挂循环）。
+**仍存的两分岔不变**：brunhild 加时（render 被判可疑）与点击后 proof 被拒（600010）。诊断工具新增：
+patched api.js 死投模式（localStorage cdump/evq——**注意用后必须还原**，死投键进 localStorage
+对挑战可见=污染源，本轮已还原 md5 dd959f0a ✓）。
+
 **Step 369（solo 收官段）**：① frame visibility 活读修复落地（251dd72）：init 快照冻结在
 pre-layout 时刻（op 注释亲证）→ widget 永久 hidden → 定时器全程 1s 钳；getter 改 epoch 缓存
 活读，vis 探针轮 r36 实证 widget 第 3 拍（~300ms）起 visible/iw300、100ms 探针全速；display:none
