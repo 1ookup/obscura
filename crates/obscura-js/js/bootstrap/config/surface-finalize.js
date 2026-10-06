@@ -299,6 +299,22 @@
       'keyboard', 'virtualKeyboard', 'presentation', 'devicePosture',
       'adAuctionComponents', 'runAdAuction', 'canLoadAdAuctionFencedFrame',
       'deprecatedRunAdAuctionEnforcesKAnonymity',
+      // The rest of the Protected Audience / AdSelection surface: the gate
+      // above removed `protectedAudience` and the three auction names, but
+      // the interest-group methods are [SecureContext] members in their own
+      // right and stayed on the insecure prototype. getInstalledRelatedApps
+      // rides the gate rather than a physical removal: the insecure-clip
+      // fixture cannot tell "removed in 149" from "secure-gated", and the
+      // gate is the side that is right either way.
+      'clearOriginJoinedAdInterestGroups', 'createAuctionNonce',
+      'joinAdInterestGroup', 'leaveAdInterestGroup',
+      'updateAdInterestGroups', 'deprecatedReplaceInURN',
+      'deprecatedURNToURL', 'getInterestGroupAdAuctionData',
+      'getInstalledRelatedApps',
+      // WebMCP's navigator.modelContext, Window Controls Overlay, the
+      // badge methods and WebMIDI discovery are [SecureContext] alike.
+      'modelContext', 'windowControlsOverlay',
+      'clearAppBadge', 'setAppBadge', 'requestMIDIAccess',
       // `userAgentData` and `deviceMemory` are [SecureContext] in Chrome and
       // are absent, not undefined, on an insecure origin (measured 149).
       'userAgentData', 'deviceMemory',

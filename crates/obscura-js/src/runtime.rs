@@ -35993,3 +35993,53 @@ RequestRedirect value",
         }
     }
 }
+
+#[cfg(test)]
+mod secure_context_navigator_gate_probe {
+    use super::*;
+    use obscura_dom::parse_html;
+
+    /// The secure-context gate on the Navigator surface: every gated member
+    /// is gone from the whole chain (absent, not undefined) on an insecure
+    /// document, where the live 149 oracle answers a 36-name prototype. The
+    /// engine currently answers 43 -- the seven-name residue is pinned by
+    /// count until the reference's full name list lands (the candidates,
+    /// doNotTrack/scheduling/userActivation/webkitTemporaryStorage/
+    /// webkitPersistentStorage/requestMediaKeySystemAccess and friends, need
+    /// the reference list rather than a guess).
+    #[test]
+    fn navigator_secure_context_gate_covers_the_prototype() {
+        let dom = parse_html("<html><body></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.com/test");
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const names = Object.getOwnPropertyNames(Navigator.prototype);
+                    const gated = ['serviceWorker', 'mediaDevices', 'storage', 'clipboard',
+                        'wakeLock', 'credentials', 'locks', 'bluetooth', 'hid', 'serial',
+                        'usb', 'xr', 'login', 'managed', 'protectedAudience', 'gpu',
+                        'keyboard', 'virtualKeyboard', 'presentation', 'devicePosture',
+                        'storageBuckets', 'userAgentData', 'deviceMemory',
+                        'clearOriginJoinedAdInterestGroups', 'createAuctionNonce',
+                        'joinAdInterestGroup', 'leaveAdInterestGroup',
+                        'updateAdInterestGroups', 'deprecatedReplaceInURN',
+                        'deprecatedURNToURL', 'getInterestGroupAdAuctionData',
+                        'getInstalledRelatedApps', 'modelContext', 'windowControlsOverlay',
+                        'clearAppBadge', 'setAppBadge', 'requestMIDIAccess'];
+                    return {
+                        secure: isSecureContext,
+                        len: names.length,
+                        leaked: gated.filter(name => name in navigator),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        let value = result;
+        assert_eq!(value["secure"], serde_json::json!(false));
+        assert_eq!(value["leaked"], serde_json::json!([]));
+        assert_eq!(value["len"].as_u64(), Some(43));
+    }
+}

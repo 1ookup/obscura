@@ -574,3 +574,18 @@ run covers are then removed.
   true on the reference, the strongest remaining sAMar8 candidate. Scoped:
   obscura-js 751/751 (--features render). Full gate deferred to the next
   backfill
+
+- navigator secure-context gate: 14 more members (10-06): the insecure
+  prototype answered 57 names against the reference's 36; the gate had
+  covered 27 members and missed 14 [SecureContext] ones -- modelContext,
+  windowControlsOverlay, clearAppBadge/setAppBadge, requestMIDIAccess,
+  getInstalledRelatedApps (gate-removed rather than physically deleted:
+  the insecure about:blank fixture cannot tell "removed in 149" from
+  "secure-gated", and a https-side check or a Chromium removal version is
+  needed for the physical cut) and the eight interest-group/FLEDGE
+  methods. Engine now answers 43; the seven-name residue
+  (doNotTrack/scheduling/userActivation/webkitTemporaryStorage/
+  webkitPersistentStorage/requestMediaKeySystemAccess candidates) needs
+  the reference's full 36-name list before it can be aligned without
+  guessing. Scoped: obscura-js 752/752 (--features render, one new gate
+  probe test). Full gate deferred to the next backfill
