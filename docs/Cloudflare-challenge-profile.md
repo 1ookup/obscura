@@ -2377,3 +2377,17 @@ r17-r21 **全部早死**（无测量相），同二进制无 env 的 r16 正常 
 - hit2：(66,216177,176)(250,216184,203)(188,216203,162)(**66**,216215,199)
 两尾均以 **op66** 收束——拼接前最后执行的 op 稳定为 66（op 表语义由插桩方解读；pc 跨会话
 不可比，作废前先读本会话内对照）。
+
+### Step 367：**X118 语义定案（'EBlFw4'+X.toString()，X 参考=611/我方={}）+ 栈行号映射破解 + stackTraceLimit 坑**；**oHIQ6/IGBuA2/bLvQ6 三键=加时分支专属采集**（参考 Chromium 实验否掉 headless-rAF 假说）；**BKkj0/zXuvs9=68 实锤 getVoices().length 并落修**（2026-10-06 19:0x–21:xx）
+
+**X118（任务 A，语义定案，最后一公里待会话字节码）**：
+- ov2 当日 19:06 轮换到新代 64754f61（**pristine、无 OV2T helper** ⇒ r27/r28 trace 无 exec/payloadJSON，仅 45/57 行）。r27（v2 钩子）/r28（v3+stackTraceLimit）各 2 hit，部署件用后即还原并核 md5 64754f6127d35f6ca010d015a08b5d87 ✓；9225 独立端口，9223 未动。
+- **语义**：探针做 `'EBlFw4' + X`（拼接 op，旧代 qi.A/新代 z0.yf）与 `X.toString()`（方法调用 op，旧代 qi.qU/新代 z0.oh，receiver 无参调用——wrap 是被 `hX.call(hC)` 调的）。参考侧 X=数字 **611**；我方 X=裸 `{}`（ctor=Object、own keys 空）。即 X=「预期为数值的环境读数，我方经 `|| {}` 类兜底变 {}」。
+- **栈行号映射（新）**：rch 响应=HTML 内联替换脚本 ⇒ V8 栈行号=文档行号=gen 文件行+23（21 钩子行+2 HTML 前缀）；已在 4285/4793 等行验证。旧代 71c6f5ec（r22-24）= backup+x118hook 精确成立。
+- **栈截断根因=V8 默认 `Error.stackTraceLimit=10`**（前任 800 字符上限只看到 10 帧）。置 5000 后 25 帧全链=纯 VM 嵌套（run/oZ/oe 递归至栈底 oe@3716）——**审计循环是纯字节码，JS 栈永远到不了「探针函数名」**，JS 栈路线到顶。下一手=CDP Network 域旁路抓 rch 响应体拿会话字节码（不动 mitm）离线解 op63（r24 hit1 前的 197 字节宽 op，疑产 X 的读取）。
+- **排除再添两项**：EBlFw4 不在 api.js census 构建器（census 全文在 turnstile-api.patched.js 71356 起，键为可读名 "d.cT"/"ht.atrs"/"pg.ref"/pi{…}/"w.iW"，数值字段=元素/脚本/样式表/meta 计数）；不在服务端 extra-params 下行（r24 apicom 全文零命中）。
+- r27/r28 verdict「still on the challenge」但 x2/x3hit 照常命中 ⇒ 该面在 ov2 侧的包装继续未被识破（样本 n=3）。
+
+**oHIQ6（任务 B）**：**参考 Chromium 149 headless=new 在同页实测 rAF 连发**（134 次/2.2s，16.66ms 节律；我方 119-134 同量级、真时钟非虚拟）⇒ 参考恒空**不是** headless 不发 rAF。三键形状（20+ 轮恒定）：IGBuA2 我方 [76,125,126,127,128,159,163] = 参考 [159,163] + 5 条额外；bLvQ6 我方 [1043] vs 参考 []；oHIQ6 我方 71/243 vs 参考 []。额外数据跨轮逐字节相同 ⇒ 与 Step 360「brunhild 加时分支参考从不进入」同构：**采集器武装在加时分支里，参考流从未跑到**。引擎侧无可修行为；分支触发因=判决级悬案。另：oHIQ6 71-shape 值跨轮恒定 ⇒ 不是裸 rAF 时间戳（我方活体 rAF 探针是有噪声的真时钟），其精确语义同需字节码。
+
+**BKkj0/zXuvs9=68（任务 C，已落修）**：实锤=**speechSynthesis.getVoices().length**。参考 Chromium 149 本机 dump：68 语音（全 localService、婷婷 default、固定顺序）；mZLmS3=排序名字列表的 slice(0,32)（两侧早已一致）。我方旧表 32 行且**5 处语言错位**（Alva pt-BR→sv-SE、Amira ar-001→ms-MY、Daria sv-SE→bg-BG、Geeta en-IN→te-IN、Lana ru-RU→hr-HR——旧表像按错位排序构建）。已按实测 dump 扩表 32→68（speech-synthesis-behavior.js）；`say -v '?'`=72 但 Chrome 暴露 68（AVSpeechSynthesisVoice 集），表复刻 Chrome dump。夹具：我方现答 68。Scoped obscura-js 761/761 + release build；ledger 已记。

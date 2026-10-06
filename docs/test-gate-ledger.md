@@ -738,3 +738,21 @@ run covers are then removed.
   gone with it. Scoped: obscura-js 760/760 (--features render, the
   utterance shape test extended with the ctor length and the handler
   accessor assertions). Full gate deferred to the next backfill
+
+- Speech voice table extended 32 to 68 (10-06, reference host Chrome 149
+  getVoices() dump, names/langs/order/flags per row): the challenge payload's
+  BKkj0/zXuvs9 pair reads speechSynthesis.getVoices().length (reference 68,
+  ours 32), and the sorted-name list it also reports is the first 32 names of
+  the same table, so the count itself is a consumed fingerprint field. The
+  old 32-row table also carried five languages shifted between rows (Alva
+  sv-SE not pt-BR, Amira ms-MY not ar-001, Daria bg-BG not sv-SE, Geeta
+  te-IN not en-IN, Lana hr-HR not ru-RU); the full table now replicates the
+  measured dump (68 rows, all localService, Tingting default, reference
+  order, so the sorted first-32 slice is byte-identical to before). Note:
+  `say -v '?'` lists 72 on this host; Chrome exposes 68 (the
+  AVSpeechSynthesisVoice set) and the table replicates Chrome's dump, not
+  say's. Fixture on the https page: our engine now answers 68 (was 32).
+  Scoped: obscura-js 761/761 (--features render, new
+  voice_table_matches_the_reference_host_dump pins count 68, the head and
+  tail rows, all-local, and the single default). Full gate deferred to the
+  next backfill
