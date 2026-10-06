@@ -151,9 +151,16 @@ globalThis.__obscura_init = function() {
       const _origToString = Object.prototype.toString;
       const seenStacks = new Set();
       let printed = 0;
+      // Round-13 form: print every conversion (not just default-tag hits),
+      // tagged with the realm, so a leak that carries its own toString (and
+      // never reaches the default tag) still shows up. Local grep does the
+      // filtering.
+      try { console.warn("[tostring-diag] armed realm=" +
+        String(globalThis.location && globalThis.location.origin || "worker")); } catch (_e0) {}
       const wrapped = function toString() {
         const result = _origToString.call(this);
-        if (result === "[object Object]" && printed < 300) {
+        if (printed < 300) {
+          printed++;
           try {
             const stack = String(new Error().stack || "").replace(/\s+/g, " ");
             const stackHead = stack.slice(0, 200);
@@ -167,6 +174,8 @@ globalThis.__obscura_init = function() {
               } catch (_e) {}
               let keys = "?";
               try { keys = Object.keys(this).slice(0, 10).join(","); } catch (_e2) {}
+              try { console.warn("[tostring-diag] ctor=" + ctor + " keys=[" + keys +
+                "] result=" + result + " stack=" + stack.slice(0, 500)); } catch (_e3) {}
               // Dump the source of the very functions in the stack: they are
               // same-realm values, reachable by scanning the frame's global
               // for members whose function name matches a stack entry.
@@ -180,8 +189,6 @@ globalThis.__obscura_init = function() {
                     const parts = full.split(".");
                     wanted.add(parts[parts.length - 1]);
                   }
-                  const sink = (globalThis.__tostringDiag =
-                    globalThis.__tostringDiag || []);
                   for (const gk of Object.getOwnPropertyNames(globalThis)) {
                     let gv;
                     try { gv = globalThis[gk]; } catch (_eg) { continue; }
@@ -193,22 +200,16 @@ globalThis.__obscura_init = function() {
                       try {
                         const mv = gv[mk];
                         if (typeof mv === "function") {
-                          sink.push("FN " + gk + "." + mk + " (name=" +
-                            mv.name + ") = " + String(mv).slice(0, 2500));
+                          console.warn("[tostring-diag] FN " + gk + "." + mk +
+                            " = " + String(mv).slice(0, 2000));
                         }
                       } catch (_ev) {}
                     }
                   }
                 } catch (_eScan) {}
               }
-              const line = "ctor=" + ctor + " keys=[" + keys + "] stack=" + stack.slice(0, 400);
-              // Frame realms cannot share a buffer with the main realm
-              // (cross-origin), and Deno.core.print is swallowed by the
-              // fetch pipeline: emit through console.warn, which the
-              // --trace-op-file channel records, and buffer locally as a
-              // fallback for same-realm eval reads.
-              try { console.warn("[tostring-diag] " + line); } catch (_e3) {}
-              (globalThis.__tostringDiag = globalThis.__tostringDiag || []).push(line);
+              try { console.warn("[tostring-diag] ctor=" + ctor + " keys=[" + keys +
+                "] result=" + result + " stack=" + stack.slice(0, 500)); } catch (_e3) {}
             }
           } catch (_e) {}
         }
@@ -217,6 +218,48 @@ globalThis.__obscura_init = function() {
       Object.defineProperty(wrapped, "name", { value: "toString", configurable: true });
       Object.defineProperty(wrapped, "__obscuraDiag", { value: true, configurable: true });
       Object.prototype.toString = wrapped;
+      // The other authored concat paths: explicit String(x) and join(). A
+      // bare `prefix + x` is not wrappable without touching the addition
+      // operator itself. Same cap, same tag.
+      const _origString = String;
+      const wrappedString = function String(value) {
+        if (printed < 300 && value !== null && typeof value === "object") {
+          printed++;
+          let ctor = "null-proto";
+          try {
+            const proto = Object.getPrototypeOf(value);
+            ctor = (proto && proto.constructor && proto.constructor.name) || "null-proto";
+          } catch (_e) {}
+          try {
+            console.warn("[tostring-diag] String() object arg ctor=" + ctor +
+              " keys=[" + (() => { try { return Object.keys(value).slice(0, 10).join(","); } catch (_e2) { return "?"; } })() + "]");
+          } catch (_e3) {}
+        }
+        return _origString(value);
+      };
+      Object.defineProperty(wrappedString, "name", { value: "String", configurable: true });
+      Object.defineProperty(wrappedString, "length", { value: 1, configurable: true });
+      globalThis.String = wrappedString;
+      const _origJoin = Array.prototype.join;
+      Array.prototype.join = function join(separator) {
+        let hasObject = false;
+        if (printed < 300) {
+          for (let i = 0; i < this.length; i++) {
+            const item = this[i];
+            if (item !== null && typeof item === "object") { hasObject = true; break; }
+          }
+        }
+        const result = _origJoin.call(this, separator);
+        if (hasObject && printed < 300) {
+          printed++;
+          try {
+            console.warn("[tostring-diag] join() with object member result=" +
+              String(result).slice(0, 200));
+          } catch (_e4) {}
+        }
+        return result;
+      };
+      Object.defineProperty(Array.prototype.join, "name", { value: "join", configurable: true });
     })();
   }
   // The synthetic-fingerprint seed stays constant across pages and sessions:

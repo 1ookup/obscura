@@ -44,6 +44,57 @@ const BOOTSTRAP_SRC: &str = include_str!(env!("OBSCURA_BOOTSTRAP_PATH"));
 const REALM_INIT_SRC: &str =
     "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;";
 
+/// The frame-realm arm of the OjmeV1[118] toString diagnosis. page-init.js
+/// does not run in frame realms (their init is REALM_INIT_SRC below), so the
+/// wrap has to ride the hydration injection. Full-print form: every
+/// conversion warns with the constructor, keys, result and stack, tagged
+/// with the realm origin.
+const DIAG_TOSTRING_FRAME: &str = r#"
+(function () {
+  if (!globalThis.__obscura_diag_tostring__) return;
+  try { console.warn("[tostring-diag] armed realm=" +
+    String(globalThis.location && globalThis.location.origin || "frame")); } catch (_e0) {}
+  const _origToString = Object.prototype.toString;
+  const seenStacks = new Set();
+  let printed = 0;
+  const wrapped = function toString() {
+    const result = _origToString.call(this);
+    if (printed < 300) {
+      printed++;
+      try {
+        const stack = String(new Error().stack || "").replace(/\s+/g, " ");
+        const stackHead = stack.slice(0, 200);
+        if (!seenStacks.has(stackHead)) {
+          seenStacks.add(stackHead);
+          let ctor = "null-proto";
+          try {
+            const proto = Object.getPrototypeOf(this);
+            ctor = (proto && proto.constructor && proto.constructor.name) || "null-proto";
+          } catch (_e) {}
+          let keys = "?";
+          try { keys = Object.keys(this).slice(0, 10).join(","); } catch (_e2) {}
+          try { console.warn("[tostring-diag] ctor=" + ctor + " keys=[" + keys +
+            "] result=" + result + " stack=" + stack.slice(0, 500)); } catch (_e3) {}
+        }
+      } catch (_e) {}
+    }
+    return result;
+  };
+  Object.defineProperty(wrapped, "name", { value: "toString", configurable: true });
+  Object.prototype.toString = wrapped;
+  const _origString = globalThis.String;
+  const wrappedString = function String(value) {
+    if (printed < 300 && value !== null && typeof value === "object") {
+      printed++;
+      try { console.warn("[tostring-diag] String() object arg"); } catch (_e4) {}
+    }
+    return _origString(value);
+  };
+  Object.defineProperty(wrappedString, "name", { value: "String", configurable: true });
+  globalThis.String = wrappedString;
+})();
+"#;
+
 /// Runs in a template-restored frame context right after its global `Deno`
 /// has been swapped for the live runtime's binding: registers this realm's
 /// baked Function.prototype.toString override with the shared native
@@ -1149,7 +1200,8 @@ impl ObscuraJsRuntime {
                 "globalThis.__obscura_set_fingerprint({fingerprint_json}); \
                  globalThis.__obscura_stealth = {stealth}; \
                  globalThis.__obscura_webgl_enabled = {webgl_enabled}; \
-                 globalThis.__obscura_diag_tostring__ = {diag_tostring};"
+                 globalThis.__obscura_diag_tostring__ = {diag_tostring}; \
+                 {DIAG_TOSTRING_FRAME}"
             ),
         )?;
         if timing {

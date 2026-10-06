@@ -879,6 +879,7 @@ fn worker_prep_script(
     tracelog: bool,
 ) -> String {
     let json = |s: &str| serde_json::Value::String(s.to_string()).to_string();
+    let diag_tostring = std::env::var_os("OBSCURA_DEBUG_TOSTRING").is_some();
     WORKER_PREP_TEMPLATE
         .replace("__OBSCURA_WORKER_URL__", &json(script_url))
         .replace("__OBSCURA_WORKER_NAME__", &json(name))
@@ -894,6 +895,10 @@ fn worker_prep_script(
         )
         .replace("__OBSCURA_WORKER_SHARED__", if shared { "true" } else { "false" })
         .replace("__OBSCURA_TRACELOG__", if tracelog { "true" } else { "false" })
+        .replace(
+            "__OBSCURA_DIAG_TOSTRING__",
+            if diag_tostring { "true" } else { "false" },
+        )
 }
 
 /// Executed in the fresh worker runtime before the worker source. The
@@ -909,6 +914,44 @@ fn worker_prep_script(
 const WORKER_PREP_TEMPLATE: &str = r#"(function () {
   var G = globalThis;
   var defineProperty = Object.defineProperty;
+  // OBSCURA_DEBUG_TOSTRING arm: the worker realm carries its own
+  // Object.prototype.toString, so the page-realm wrap does not reach here.
+  // When armed, String()/join()/default-tag conversions of objects warn
+  // through the console with the constructor and a short stack. Unset, no
+  // wrapping happens at all.
+  if (__OBSCURA_DIAG_TOSTRING__) {
+    G.__obscura_diag_tostring__ = true;
+    (function () {
+      var _origToString = Object.prototype.toString;
+      var seen = {};
+      var printed = 0;
+      var wrapped = function toString() {
+        var result = _origToString.call(this);
+        if (printed < 200) {
+          var stack = String(new Error().stack || "").replace(/\s+/g, " ").slice(0, 300);
+          if (!seen[stack]) {
+            seen[stack] = 1;
+            printed++;
+            console.warn("[tostring-diag][worker] result=" + result + " stack=" + stack);
+          }
+        }
+        return result;
+      };
+      defineProperty(wrapped, "name", { value: "toString", configurable: true });
+      Object.prototype.toString = wrapped;
+      var _origString = G.String;
+      var wrappedString = function String(value) {
+        if (printed < 200 && value !== null && typeof value === "object") {
+          printed++;
+          console.warn("[tostring-diag][worker] String() object arg");
+        }
+        return _origString(value);
+      };
+      defineProperty(wrappedString, "name", { value: "String", configurable: true });
+      defineProperty(wrappedString, "length", { value: 1, configurable: true });
+      G.String = wrappedString;
+    })();
+  }
   // The engine namespace is bound only while the host runs this prep: the
   // worker global is page-visible surface, and no browser has a `Deno`
   // global. Capturing it here keeps every closure this prep installs
