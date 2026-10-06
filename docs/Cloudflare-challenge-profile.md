@@ -2392,6 +2392,20 @@ r17-r21 **全部早死**（无测量相），同二进制无 env 的 r16 正常 
 
 **BKkj0/zXuvs9=68（任务 C，已落修）**：实锤=**speechSynthesis.getVoices().length**。参考 Chromium 149 本机 dump：68 语音（全 localService、婷婷 default、固定顺序）；mZLmS3=排序名字列表的 slice(0,32)（两侧早已一致）。我方旧表 32 行且**5 处语言错位**（Alva pt-BR→sv-SE、Amira ar-001→ms-MY、Daria sv-SE→bg-BG、Geeta en-IN→te-IN、Lana ru-RU→hr-HR——旧表像按错位排序构建）。已按实测 dump 扩表 32→68（speech-synthesis-behavior.js）；`say -v '?'`=72 但 Chrome 暴露 68（AVSpeechSynthesisVoice 集），表复刻 Chrome dump。夹具：我方现答 68。Scoped obscura-js 761/761 + release build；ledger 已记。
 
+**Step 372（深夜三段：init +2s 归因终落——DCL/paint 等子帧导航，引擎级 bug 已被验收测试钉死）**：
+① 微任务/定时器调度排除（await 链夹具双侧同速亚毫秒）；② r38 boot 探针（现 bee5777c 代）：
+widget 帧 eval 1966ms、可见性 4.15s 才翻 visible（钳制期 tick1→2→3 各 ~1s，第 4 拍起 110ms 全速）
+——钳制本身是正确 Chrome 语义，慢因在**父页面布局晚**；③ **受控夹具定案**：慢 iframe(2s) 下
+参考 Chrome DCL=87ms/paint=128ms（只有 load 事件等），我方 DCL=paint=**2166ms**；无 iframe 双方
+即时。根因=page.rs `load_child_frames` 在主文档 setup 期**逐个 await 子帧完整导航**（7344 行
+`navigate_frame(...).await`，调用于 4344）。这同时解释：interstitial DCL→paint 1192ms 空窗、
+nav 1484 vs 344、tZwbF3/wOvYJ5/eaaP6 3 倍慢（Step 368/369 重开的归因就此收口）、widget 帧
+visibility 翻转晚→boot 定时器全程被钳。**已落验收测试** `dom_content_loaded_does_not_wait_for_a_slow_child_frame`
+（obscura-browser，#[ignore] 至修复；实测失败值 2268.5ms vs Chrome 真值 <900ms；commit 64720e5）。
+修复形态：把子帧导航从父文档 DCL/paint 关键路径挪走（load_child_frames 内改异步推进）——
+涉及导航管线架构，留待后续会话实施。**此 bug 极可能同时是 brunhild 加时的上游**（首报告三
+计时字段 3 倍慢是服务端最早可见的可判别差）。
+
 **Step 371（深夜二段：api.js↔widget 协议层定案=完全一致）**：出站载荷死投（patched api.js 的 Cr
 包装器 localStorage 'outq'，用后已还原 dd959f0a ✓）双端原文对比：**四条消息逐条同构**——init /
 extraParams(action:managed+完整 apiJsResourceTiming 含 initiatorType:'script') / **execute(=cs 错误
