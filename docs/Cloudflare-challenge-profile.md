@@ -2205,3 +2205,31 @@ thhSb9/lIEA1/qIEN4/gPOK0/hCKCP8 **在活体两轮间自身就变** ⇒ 会话测
 我方是超集重发）——疑似首 proof 被拒后的客户端重测重发；② 活体发 2 条 47-key 报告（chl_api_m）
 我方只发 1 条；③ apicom/csp.gate 为 Obscura 自诊断打点（page-init.js），活体没有是**正常**，
 非分歧（本步定案，勿再查）。
+
+### Step 360：**brunhild /h/g/i/ = 服务端给我们的加时分支，参考轮从不进入**（2026-10-06 11:2x）
+
+**方法**：轮 3 带 `RUST_LOG=obscura_js=debug,obscura_net=debug` 跑全流程；参考侧写全 target
+CDP 网络记录器（`/tmp/cf-runs/netlog.py`，browser 级 setAutoAttach+逐 session Network.enable，
+`/tmp/cf-runs/nav.py` 先 attach 后导航），对照跑参考的不点击轮与点击轮。
+
+**参考点击轮（PASS，body="Missing resource /1.txt"）网络序**：api.js×2 → rch W1(uuvsy)×2 →
+fo#1 → api.js×2 → **rch W2(6x69g)×2（点击前换挂第二个 widget）** → ci → fo#2(render) → 点击 →
+fo#3(proof) → ci#2 → fo#4(final) → PASS。**全程零 brunhild**。每个 rch Document 都恰好加载 2 次。
+
+**我方轮 3（fail）**：… fo#1(render) 于 21.6s 完成 → **21.9s（+330ms）fetch
+`brunhild…/h/g/i/<ray>/<token>` → 失败（0.8s）** → ci → fo#2(proof) 24.5 OK → fo#3 **12ms 传输级
+失败** → fo#4 重试 29.1 OK（Set-Cookie）→ 页面级 fo OK（Set-Cookie）→ 31.6s 重取 orchestrate
+（挑战循环重启）→ 600010。**brunhild 紧跟 render-fo 响应 = 服务端在 render 提交后下发的加时指令
+（额外验证步骤），参考轮从未被要求加时**。
+
+**网络事实**：brunhild 从本机**不可达**——代理 :9000 下任意路径 502、直连 000；hagen 与
+challenges.cloudflare.com 均正常 404（fake-IP DNS 198.18.x，两主机器件同隧道，仅 brunhild 烂）。
+⇒ 即使被加时也完不成。**根修方向 = 让 render payload（首条全量）无可挑剔，避免触发加时**；
+不必也不应去修 brunhild 可达性（基础设施层）。
+
+**因果链定案（当前最优解释）**：render payload 中仍有可判别差异（Step 359 清单）→ 服务端下发
+brunhild 加时 → 加时不可达 → proof 构造不完整 → fo#3 客户端传输失败/fo#4 被拒 → 状态机 600010 →
+页面重走 orchestrate。**600010 属客户端状态机默认值**（0922-12 记忆），非服务器码。
+
+**下一判据**：批次 2（brands/OjmeV1/perf entries/过量发射）落地后判决轮看三点：① brunhild 是否
+消失；② 是否出现点击前第二 widget（rch×2 换挂）；③ POST /1.txt → 404。
