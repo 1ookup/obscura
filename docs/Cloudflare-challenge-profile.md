@@ -2330,3 +2330,19 @@ trace 有 payloadJSON 或 serve log 有 widget 侧 h/g/fo POST。冷却期里 br
 受 3h 自动轮换约束，动手前先查 ov2.js mtime）。
 
 **冷却期动作**：停止烧轮；离线整理。冷却解除判据：免点击探针轮出现 payloadJSON。
+
+### Step 365：**Step 364 的"冷却"结论被推翻——真因是 21bb772 钩子回归**；轮次恢复，brunhild 仍 3（2026-10-06 17:4x）
+
+**推翻链**：修复 Agent bisect（reflog: checkout 0b0a1e3→21bb772）发现其 `21bb772` 的
+toString/String/join 包装存在**门控回归**（未设 env 时仍安装→污染页面原生面→widget 拒 init），
+`bf187cf` 修复（包装只从 realm-init 公共点安装）。轮 16（修复后二进制）**全部恢复**：VM 134
+exec + 2 payloadJSON + 6 条 widget fo。⇒ r13-r15 的早死=钩子回归，**不是**引擎键控冷却
+（Step 364 主结论作废；其"brunhild 判据须带 render 前置条件"的协议修正保留——正是它让我
+第一时间识别出 r15 的 0 是假阴性）。
+
+**同批落地**：`7f956e0` supportedEntryTypes 回到 149 的 13 型（去 interaction-contentful-paint/
+soft-navigation——verifier 的对照数据 vfix-pA-perf.json 实锤）。
+
+**轮 16 现值**（仍被加时 brunhild=3）：OjmeV1[118] 仍 '[object Object]'（[75]=13/[79]=true 有
+抖动）、oHIQ6 仍 71、IGBuA2 仍 7、Pdbt7 9/13、sAMar8 仍 false。X118 追捕转 ov2.js 定制插桩
+路线（VM concat 钩子，goal 授权；注意 3h 自动轮换窗口）。
