@@ -2233,3 +2233,9 @@ brunhild 加时 → 加时不可达 → proof 构造不完整 → fo#3 客户端
 
 **下一判据**：批次 2（brands/OjmeV1/perf entries/过量发射）落地后判决轮看三点：① brunhild 是否
 消失；② 是否出现点击前第二 widget（rch×2 换挂）；③ POST /1.txt → 404。
+
+**补证（同日）**：我方**不点击轮**（click-after 999）brunhild **照样出现**（`/tmp/cf-runs/serve-r4.log`，
+ray a46186e4）⇒ escalation 完全由 render 提交触发，与点击数据无关。
+**副产品（重要实验加速器）**：`grep -c brunhild serve.log` 成为**免点击的快速二元判据**——
+20s 一轮（`cdp_click_clean.py --click-after 999 --deadline 20 --settle 2` + debug serve），
+出现=render 仍被判可疑；消失=render 过关。环境假设的二分/回归不再依赖点击与服务端终判。
