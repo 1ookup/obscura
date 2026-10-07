@@ -298,6 +298,14 @@ pub struct ObscuraState {
     /// uses this only to repair a stale event-loop waker after an embedder
     /// cancels a pending poll; deno_core still owns timer ordering and firing.
     pub(crate) browser_timer_deadlines: HashMap<u64, std::time::Instant>,
+    /// Whether the top-level page (the tab) is hidden. Chromium's one-second
+    /// background timer clamp (`kBackgroundTimerMinimumInterval`) keys on this
+    /// page-level decision, never on a frame's rendered state -- a
+    /// display:none or 0x0 iframe of a visible page keeps its authored timer
+    /// cadence, and its document.visibilityState reads the page there too.
+    /// The engine is headless, so the page stays visible unless an embedder
+    /// marks it hidden (op_set_page_hidden).
+    pub page_hidden: bool,
     /// Monotonic identity of the currently installed document. Async resource
     /// completions use this to discard bytes and lifecycle results belonging
     /// to a navigation that has already been replaced.
@@ -544,6 +552,7 @@ impl ObscuraState {
             page_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             activity_generation: 0,
             browser_timer_deadlines: HashMap::new(),
+            page_hidden: false,
             document_generation: 0,
             #[cfg(feature = "render")]
             prepared_render: None,
@@ -6516,6 +6525,28 @@ fn op_browser_timer_complete(state: &OpState, native_id: f64) {
         .remove(&(native_id as u64));
 }
 
+/// Whether the page (the top-level tab) is currently hidden. This is the key
+/// Chromium's background timer throttle reads (`kBackgroundTimerMinimumInterval`
+/// applies to every frame's timers only while the page is hidden); a frame's
+/// own rendered state never feeds it. Bound to the bootstrap as the clamp's
+/// single source of truth so a frame realm cannot mistake its local
+/// document.visibilityState for the page's.
+#[op2(fast)]
+fn op_page_hidden(state: &OpState) -> bool {
+    let shared = state.borrow::<SharedState>().clone();
+    let hidden = shared.borrow().page_hidden;
+    hidden
+}
+
+/// Embedder-side page visibility switch (a headless engine has no OS window to
+/// lose focus; the CDP lifecycle layer or a test flips this). Every realm's
+/// document.visibilityState and the timer clamp re-derive from it per read.
+#[op2(fast)]
+fn op_set_page_hidden(state: &OpState, hidden: bool) {
+    let shared = state.borrow::<SharedState>().clone();
+    shared.borrow_mut().page_hidden = hidden;
+}
+
 /// Wake one browser posted task without routing through Tokio's timer wheel.
 /// `yield_now` guarantees the op cannot settle in the initiating JavaScript
 /// turn, while avoiding the roughly one-millisecond floor of a zero-duration
@@ -8678,6 +8709,8 @@ pub fn build_extension() -> Extension {
         op_async_runtime_available(),
         op_browser_timer_schedule(),
         op_browser_timer_complete(),
+        op_page_hidden(),
+        op_set_page_hidden(),
         op_posted_task(),
         op_binding_called(),
         op_subtle_digest(),

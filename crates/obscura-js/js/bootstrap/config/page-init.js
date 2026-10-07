@@ -503,21 +503,25 @@ globalThis.__obscura_init = function() {
           globalThis.innerHeight = zeroViewport ? 0 : parsed.clientHeight;
         }
         // The visibility slot rides the same layout answer: a frame with no
-        // rendering box is a hidden document (Chrome reports the challenge
-        // widget's document as hidden), and hidden frames fire no animation
-        // callbacks. Top-level documents keep the visible default.
+        // rendering box is a hidden document, and hidden frames fire no
+        // animation callbacks (that rendering hold is the point of this
+        // per-frame reading -- the timer throttle does NOT read it; modern
+        // Chromium reports a nested document's visibilityState as the page's,
+        // so the surface question is deliberately separate from this slot).
         // The snapshot is a FALLBACK only: at frame-realm init the main
         // layout is not prepared yet, so op_layout_metrics answers
         // rendered:false for every frame here -- freezing that reading kept a
         // visible widget (a laid-out host box mounted after its script
-        // evaluated) hidden forever, which clamped its boot timers to the
-        // background minimum. The live reader below re-derives on every read
-        // (epoch-cached), so the widget flips visible as soon as its box
-        // exists while display:none frames stay hidden.
+        // evaluated) hidden forever. The live reader below re-derives on
+        // every read (epoch-cached), so the widget flips visible as soon as
+        // its box exists while display:none frames stay hidden.
         globalThis.__documentVisibilityState__ =
           parsed.rendered === false ? 'hidden' : 'visible';
         globalThis.__obscuraDocumentVisibility = function() {
           try {
+            // A hidden page hides every document in it, rendered or not
+            // (Chrome reports all frames of a background tab as hidden).
+            if (Deno.core.ops.op_page_hidden()) return 'hidden';
             const m = readFrameMetrics();
             if (m) return m.rendered === false ? 'hidden' : 'visible';
           } catch (_e) {}
@@ -554,6 +558,18 @@ globalThis.__obscura_init = function() {
       // stays live without the own accessors an earlier shape installed --
       // Chrome's visualViewport has no own properties at all.
     } catch (_e) {}
+  }
+  if (!_callingFrameRoot()) {
+    // Top-level document: the page decision is the whole visibility surface
+    // (a background tab hides the top document too). The timer clamp reads
+    // the same page state through op_page_hidden, so this surface and the
+    // throttle can never split.
+    globalThis.__obscuraDocumentVisibility = function() {
+      try {
+        if (Deno.core.ops.op_page_hidden()) return 'hidden';
+      } catch (_e) {}
+      return globalThis.__documentVisibilityState__ || 'visible';
+    };
   }
   // Window-level geometry. A window claims a maximized window: outer bounds
   // fill the working area, the window origin sits at the working area's

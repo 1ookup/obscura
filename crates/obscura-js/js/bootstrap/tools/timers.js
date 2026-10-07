@@ -38,18 +38,20 @@ function _clampNestedDelay(delay) {
     : delay;
 }
 
-// Chromium's background timer throttling: a hidden frame's timers run at
-// most once per second (`kBackgroundTimerMinimumInterval`), cross-origin
-// widget frames included. The challenge widget is a 0x0 hidden iframe, so a
-// page-side sampling loop that answers a heartbeat there reads empty-or-
-// sparse on the reference browser and would beat at full cadence here. The
-// clamp re-evaluates on every (re)schedule, so a frame that becomes visible
-// returns to its authored cadence.
+// Chromium's background timer throttling (`kBackgroundTimerMinimumInterval`):
+// while the *page* is hidden, its timers run at most once per second. The key
+// is the page decision, not a frame's rendered state -- a display:none or 0x0
+// iframe of a visible page keeps its authored cadence even though its own
+// document.visibilityState reads 'hidden' there (measured on Chromium 149:
+// setTimeout(550) fires at ~556ms inside such a frame, and its
+// document.visibilityState is the page's 'visible'). Reading the frame
+// document instead clamped every cross-origin widget frame to 1Hz while the
+// page was visible. The clamp re-evaluates on every (re)schedule, so a page
+// that becomes visible returns to its authored cadence.
 function _clampHiddenPageDelay(delay) {
   if (delay >= 1000) return delay;
   try {
-    if (globalThis.document
-        && String(globalThis.document.visibilityState) === 'hidden') {
+    if (Deno.core.ops.op_page_hidden()) {
       return 1000;
     }
   } catch (_e) {}

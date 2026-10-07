@@ -36504,14 +36504,16 @@ mod secure_context_navigator_gate_probe {
         );
     }
 
-    /// Chromium's background timer throttling, pinned per source in a hidden
-    /// frame: no animation callbacks (the rendering pump holds), and timers
-    /// clamped to the one-second background minimum -- an interval ticks once
-    /// in the window and a nested timeout chain does not reach its first
-    /// authored step. This is the shape that keeps page-side heartbeat
-    /// collectors empty-or-sparse in a hidden widget frame.
+    /// Chromium throttles a hidden *page's* timers to the one-second background
+    /// minimum; it never throttles a hidden *frame's* timers in a visible page.
+    /// Measured on Chromium 149: setTimeout(550) inside a display:none
+    /// cross-origin iframe of a visible page fires at ~556ms, and a 16ms
+    /// interval there keeps authored cadence (~245 ticks in 4s). The
+    /// rendering hold is independent: an unrendered frame still fires no
+    /// animation callbacks. This is the exact shape of the challenge
+    /// divergence (ddiv1): the widget's 550ms beat must not clamp.
     #[tokio::test(flavor = "current_thread")]
-    async fn hidden_frame_heartbeats_run_at_the_background_minimum() {
+    async fn visible_page_hidden_frame_timers_keep_authored_cadence() {
         let dom = parse_html(
             r#"<html><body><iframe id=hiddenf style="display:none"></iframe></body></html>"#,
         );
@@ -36548,16 +36550,14 @@ mod secure_context_navigator_gate_probe {
             1,
             crate::realm::MAIN_WORLD,
             r#"(() => {
-                window.__matrix = {raf: 0, interval: 0, chain: 0};
+                window.__matrix = {raf: 0, interval: 0, to: 0, toAt: 0};
                 requestAnimationFrame(() => { window.__matrix.raf++; });
                 setInterval(() => { window.__matrix.interval++; }, 16);
-                let chainDepth = 0;
-                const chainStep = () => {
-                    chainDepth++;
-                    window.__matrix.chain++;
-                    if (chainDepth < 200) setTimeout(chainStep, 16);
-                };
-                setTimeout(chainStep, 16);
+                const t0 = performance.now();
+                setTimeout(() => {
+                    window.__matrix.to = 1;
+                    window.__matrix.toAt = performance.now() - t0;
+                }, 550);
                 return document.visibilityState;
             })()"#,
             true,
@@ -36566,6 +36566,109 @@ mod secure_context_navigator_gate_probe {
         )
         .await
         .unwrap();
+        rt.run_event_loop_bounded(900).await.unwrap();
+        let matrix = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "hidden-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                "JSON.stringify(window.__matrix)",
+                true,
+                true,
+                2_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        println!("VISIBLE-PAGE-HIDDEN-FRAME-MATRIX={}", matrix);
+        let m: serde_json::Value = serde_json::from_str(matrix.as_str().unwrap()).unwrap();
+        assert_eq!(m["raf"], serde_json::json!(0),
+            "unrendered frame: no animation callbacks, throttling or not");
+        assert_eq!(m["to"], serde_json::json!(1),
+            "a hidden frame of a VISIBLE page must not clamp its timers to the 1s background minimum");
+        let to_at = m["toAt"].as_f64().unwrap();
+        assert!((540.0..900.0).contains(&to_at),
+            "setTimeout(550) fired at {to_at}ms; clamping would push it past 1000");
+        let interval = m["interval"].as_u64().unwrap();
+        assert!(interval >= 5,
+            "16ms interval ticked {interval}x in a 900ms window; the clamp yields ~1");
+    }
+
+    /// The other half of the Chromium shape: when the PAGE is hidden, every
+    /// frame's timers clamp to the one-second background minimum, and every
+    /// document of the page (top and frames alike) reads visibilityState
+    /// 'hidden'. Flipping the page back to visible restores authored cadence
+    /// on the next (re)schedule.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hidden_page_clamps_timers_to_the_background_minimum() {
+        let dom = parse_html(
+            r#"<html><body><iframe id=hiddenf style="display:none"></iframe></body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(400.0, 300.0);
+        rt.run_page_init();
+        rt.install_internal_namespace();
+        let root = rt
+            .evaluate(
+                r#"(() => {
+                    const op = (cmd, a1) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), "");
+                    const host = document.getElementById("hiddenf")[Symbol.for('obscura.nid')];
+                    const created = JSON.parse(op("create_iframe_content_document", host));
+                    op("set_document_scope", created.root, JSON.stringify({
+                        url: "https://widget.example/frame",
+                        originUrl: "https://widget.example/frame",
+                        frameId: "hidden-frame",
+                        documentGeneration: 1,
+                        csp: null,
+                    }));
+                    op("parse_into_subtree", created.root, "<html><body></body></html>");
+                    return created.root;
+                })()"#,
+            )
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("hidden-frame", 1, root, "https://widget.example/frame")
+            .unwrap();
+        rt.evaluate("Deno.core.ops.op_set_page_hidden(true)").unwrap();
+        assert_eq!(rt.evaluate("document.visibilityState").unwrap(),
+            serde_json::json!("hidden"), "a hidden page hides the top document");
+        rt.evaluate_in_frame_realm_for_cdp(
+            "hidden-frame",
+            1,
+            crate::realm::MAIN_WORLD,
+            r#"(() => {
+                window.__matrix = {raf: 0, interval: 0, to: 0};
+                requestAnimationFrame(() => { window.__matrix.raf++; });
+                setInterval(() => { window.__matrix.interval++; }, 16);
+                setTimeout(() => { window.__matrix.to = 1; }, 550);
+                return document.visibilityState;
+            })()"#,
+            true,
+            true,
+            2_000,
+        )
+        .await
+        .unwrap();
+        let frame_vs = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "hidden-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                "document.visibilityState",
+                true,
+                true,
+                2_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(frame_vs, serde_json::json!("hidden"),
+            "a hidden page hides every frame document, rendered or not");
         rt.run_event_loop_bounded(400).await.unwrap();
         let matrix = rt
             .evaluate_in_frame_realm_for_cdp(
@@ -36581,13 +36684,49 @@ mod secure_context_navigator_gate_probe {
             .unwrap()
             .value
             .unwrap();
-        println!("HIDDEN-FRAME-MATRIX={}", matrix);
-        assert_eq!(
-            matrix,
-            serde_json::json!(
-                "{\"raf\":0,\"interval\":1,\"chain\":0}"
+        println!("HIDDEN-PAGE-MATRIX={}", matrix);
+        let m: serde_json::Value = serde_json::from_str(matrix.as_str().unwrap()).unwrap();
+        assert_eq!(m["raf"], serde_json::json!(0));
+        assert_eq!(m["to"], serde_json::json!(0),
+            "a 550ms timer scheduled while the page is hidden clamps past the 400ms window");
+        assert_eq!(m["interval"], serde_json::json!(1),
+            "the interval's first tick keeps its authored delay; the re-schedule clamps to 1s");
+        // Back to visible: the next authored-cadence timer clears its window.
+        rt.evaluate("Deno.core.ops.op_set_page_hidden(false)").unwrap();
+        assert_eq!(rt.evaluate("document.visibilityState").unwrap(),
+            serde_json::json!("visible"));
+        rt.evaluate_in_frame_realm_for_cdp(
+            "hidden-frame",
+            1,
+            crate::realm::MAIN_WORLD,
+            r#"(() => {
+                window.__resumed = 0;
+                setTimeout(() => { window.__resumed = 1; }, 16);
+                return true;
+            })()"#,
+            true,
+            true,
+            2_000,
+        )
+        .await
+        .unwrap();
+        rt.run_event_loop_bounded(300).await.unwrap();
+        let resumed = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "hidden-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                "window.__resumed",
+                true,
+                true,
+                2_000,
             )
-        );
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(resumed.as_f64(), Some(1.0),
+            "the clamp re-evaluates per schedule: visible page, authored cadence");
     }
 
     /// A frame realm inited while its host was unrendered (the exact moment
