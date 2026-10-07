@@ -241,6 +241,12 @@ pub struct ObscuraState {
     pub storage_dir: Option<PathBuf>,
     pub(crate) websockets: HashMap<u64, WebSocketState>,
     pub websocket_counter: u64,
+    /// Fired (notify_one) by every page-owned WebSocket I/O task whenever a
+    /// frame lands or the peer drops the connection. An owner whose event
+    /// loop is parked — a CDP connection whose client went away, timers idle
+    /// — waits on this to re-arm a delivery turn; without it a page-owned
+    /// socket whose peer is silent can never deliver into JS again.
+    pub websockets_activity: Arc<Notify>,
     /// When set (stealth mode), scripted fetch()/XHR is routed through the wreq
     /// client so the request carries the Chrome TLS fingerprint and client
     /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
@@ -465,6 +471,33 @@ pub(crate) struct FrameRenderState {
 }
 
 impl ObscuraState {
+    /// Clone of the page-wide WebSocket activity wake source.
+    pub fn websockets_activity(&self) -> Arc<Notify> {
+        self.websockets_activity.clone()
+    }
+
+    /// Whether any page-owned WebSocket is still open.
+    pub fn has_open_websockets(&self) -> bool {
+        !self.websockets.is_empty()
+    }
+
+    /// Actively close every page-owned WebSocket: the peer sees a clean close
+    /// frame instead of an abrupt TCP teardown when the owning page goes away.
+    /// Returns how many sockets were closed.
+    pub fn close_all_websockets(&mut self) -> usize {
+        let sockets: Vec<_> = self.websockets.drain().collect();
+        let closed = sockets.len();
+        for (_, socket) in sockets {
+            let _ = socket.sender.send(Message::Close(Some(
+                tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: 1001.into(),
+                    reason: "Going away".into(),
+                },
+            )));
+        }
+        closed
+    }
+
     pub fn new() -> Self {
         ObscuraState {
             dom: None,
@@ -489,6 +522,7 @@ impl ObscuraState {
             storage_dir: None,
             websockets: HashMap::new(),
             websocket_counter: 0,
+            websockets_activity: Arc::new(Notify::new()),
             #[cfg(feature = "stealth")]
             stealth_client: None,
             pending_navigation: None,
@@ -4629,6 +4663,7 @@ async fn op_websocket_open(
     let notify = Arc::new(Notify::new());
     let events_task = events.clone();
     let notify_task = notify.clone();
+    let page_wake = shared.borrow().websockets_activity.clone();
     let (mut writer, mut reader) = socket.split();
     tokio::spawn(async move {
         loop {
@@ -4638,12 +4673,18 @@ async fn op_websocket_open(
                 }
                 incoming = reader.next() => {
                     match incoming {
-                        Some(Ok(Message::Text(text))) => { events_task.lock().await.push_back(json!({"type":"message","data":text.to_string()}).to_string()); notify_task.notify_waiters(); }
-                        Some(Ok(Message::Binary(bytes))) => { events_task.lock().await.push_back(json!({"type":"message","data":base64::engine::general_purpose::STANDARD.encode(bytes),"binary":true}).to_string()); notify_task.notify_waiters(); }
-                        Some(Ok(Message::Close(frame))) => { let (code, reason) = frame.map(|f| (u16::from(f.code), f.reason.to_string())).unwrap_or((1000, String::new())); events_task.lock().await.push_back(json!({"type":"close","code":code,"reason":reason,"wasClean":true}).to_string()); notify_task.notify_waiters(); break; }
+                        Some(Ok(Message::Text(text))) => { events_task.lock().await.push_back(json!({"type":"message","data":text.to_string()}).to_string()); notify_task.notify_waiters(); page_wake.notify_one(); }
+                        Some(Ok(Message::Binary(bytes))) => { events_task.lock().await.push_back(json!({"type":"message","data":base64::engine::general_purpose::STANDARD.encode(bytes),"binary":true}).to_string()); notify_task.notify_waiters(); page_wake.notify_one(); }
+                        Some(Ok(Message::Close(frame))) => { let (code, reason) = match &frame { Some(f) => (u16::from(f.code), f.reason.to_string()), None => (1000, String::new()) }; events_task.lock().await.push_back(json!({"type":"close","code":code,"reason":reason,"wasClean":true}).to_string()); notify_task.notify_waiters(); page_wake.notify_one(); let _ = writer.send(Message::Close(frame)).await; break; }
+                        Some(Ok(Message::Ping(payload))) => {
+                            // Split-stream tungstenite does not auto-pong: an
+                            // unanswered ping makes heartbeat servers drop the
+                            // socket out from under the page.
+                            let _ = writer.send(Message::Pong(payload)).await;
+                        }
                         Some(Ok(_)) => {}
-                        Some(Err(error)) => { events_task.lock().await.push_back(json!({"type":"error","message":error.to_string()}).to_string()); notify_task.notify_waiters(); break; }
-                        None => { events_task.lock().await.push_back(json!({"type":"close","code":1000,"reason":"","wasClean":true}).to_string()); notify_task.notify_waiters(); break; }
+                        Some(Err(error)) => { events_task.lock().await.push_back(json!({"type":"error","message":error.to_string()}).to_string()); notify_task.notify_waiters(); page_wake.notify_one(); break; }
+                        None => { events_task.lock().await.push_back(json!({"type":"close","code":1000,"reason":"","wasClean":true}).to_string()); notify_task.notify_waiters(); page_wake.notify_one(); break; }
                     }
                 }
             }

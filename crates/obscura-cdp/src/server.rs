@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -489,9 +490,11 @@ fn run_connection(
                 if let Err(e) = handle_connection_ws(tokio_stream, msg_tx).await {
                     error!("WebSocket connection error: {}", e);
                 }
-                // Connection closed (or shutting down): stop this connection's
-                // processor so the thread can exit.
-                processor.abort();
+                // The client is gone, but Chromium pages outlive their client:
+                // drop the client channel and let the processor decide. It
+                // parks while a page has live JS (bounded by its park TTL),
+                // tears that page down cleanly when the park ends, and exits
+                // immediately when nothing is live or on shutdown.
                 let _ = processor.await;
             });
 
@@ -733,6 +736,25 @@ async fn cdp_processor(
     // next command/navigation, so static pages consume no polling budget.
     let mut runtime_pump_armed = false;
     let mut runtime_pump_error_streak = 0_u8;
+    // Chromium pages outlive their DevTools client: after the client goes
+    // away a page with live JS (open WebSockets included) keeps running and
+    // its sockets stay connected. When the client disconnects, park the
+    // connection world instead of tearing it down, for at most
+    // OBSCURA_SERVE_PAGE_PARK_SECS (default 600; 0 parks until shutdown).
+    let park_ttl = match std::env::var("OBSCURA_SERVE_PAGE_PARK_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(secs) => Some(std::time::Duration::from_secs(secs)),
+        None => Some(std::time::Duration::from_secs(600)),
+    };
+    let mut parked = false;
+    let mut park_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
+    // The V8 watchdog that bounds a parked page's turn: when the park TTL
+    // elapses it terminates the page's isolate, which is what makes the
+    // in-flight pump turn return so the loop can tear the page down cleanly.
+    let mut park_watchdog: Option<obscura_js::runtime::WatchdogToken> = None;
 
     loop {
         // Drain any deferred messages from the previous interception window
@@ -754,14 +776,74 @@ async fn cdp_processor(
                         .map(|(session_id, _)| (session_id.clone(), page.frame_id.clone()))
                 });
             let has_intercept_rx = intercept_rx.is_some();
+            // The page WebSocket-activity signal is re-armed every iteration:
+            // the I/O task's notify_one latches a permit while no waiter is
+            // registered, so a frame landing between iterations is not lost.
+            let live_ws_activity = ctx
+                .pages
+                .iter()
+                .find(|page| page.has_js())
+                .and_then(|page| page.websockets_activity());
             tokio::select! {
                 biased;
-                msg = rx.recv() => match msg {
+                msg = rx.recv(), if !parked => match msg {
                     Some(m) => Some(m),
-                    None => break,
+                    None => {
+                        // Chromium pages outlive their DevTools client: keep
+                        // the connection world (runtime, pages, page-owned
+                        // WebSockets) alive while a page still has JS. The
+                        // page's V8 watchdog bounds the park: when the TTL
+                        // elapses it terminates the isolate, which is what
+                        // returns the in-flight pump turn to this select so
+                        // the page can be torn down cleanly.
+                        if let Some(page) =
+                            ctx.pages.iter_mut().find(|page| page.has_js())
+                        {
+                            parked = true;
+                            park_sleep = park_ttl.map(|ttl| {
+                                Box::pin(tokio::time::sleep_until(
+                                    tokio::time::Instant::now() + ttl,
+                                ))
+                            });
+                            park_watchdog = park_ttl.and_then(|ttl| {
+                                page.arm_page_watchdog(ttl)
+                            });
+                            info!(
+                                "client disconnected; parking 1 live page(s) for {}",
+                                match park_ttl {
+                                    Some(ttl) => format!("{ttl:?}"),
+                                    None => "an unbounded park".to_string(),
+                                }
+                            );
+                            None
+                        } else {
+                            break;
+                        }
+                    }
                 },
                 _ = &mut shutdown => {
                     tracing::info!("Shutdown signal received (connection processor)");
+                    break;
+                },
+                _ = async {
+                    match live_ws_activity.as_ref() {
+                        Some(signal) => signal.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // A page-owned WebSocket delivered a frame or dropped:
+                    // re-arm the event-loop pump so the event is delivered
+                    // into JS on this connection's runtime.
+                    runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
+                    None
+                },
+                _ = async {
+                    match park_sleep.as_mut() {
+                        Some(sleep) => sleep.as_mut().await,
+                        None => std::future::pending().await,
+                    }
+                }, if parked => {
+                    info!("park TTL elapsed; closing parked page(s)");
                     break;
                 },
                 pump_result = pump_live_page_event_loop(&mut ctx), if runtime_pump_armed => {
@@ -821,7 +903,15 @@ async fn cdp_processor(
                         std::future::pending().await
                     }
                 }, if has_intercept_rx => {
-                    if let (Some((session_id, frame_id)), Some(reply_tx)) =
+                    if parked {
+                        // No client is connected to resolve interception with:
+                        // fail the request so the parked page never stalls.
+                        let _ = intercepted.resolver.send(
+                            obscura_js::ops::InterceptResolution::Fail {
+                                reason: "client disconnected".into(),
+                            },
+                        );
+                    } else if let (Some((session_id, frame_id)), Some(reply_tx)) =
                         (live_page_route.as_ref(), connection_reply_tx.as_ref())
                     {
                         emit_intercepted_request(
@@ -900,6 +990,28 @@ async fn cdp_processor(
         runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
         runtime_pump_error_streak = 0;
 
+    }
+
+    // The park watchdog may have terminated the page's isolate (park TTL
+    // elapsed): stop it and clear the termination flag so the runtime drops
+    // without tripping V8's terminated-isolate assertions.
+    if let Some(token) = park_watchdog.take() {
+        for page in ctx.pages.iter_mut() {
+            page.disarm_page_watchdog(token);
+            break;
+        }
+    }
+
+    // Chromium closes a page's WebSocket connections with clean close frames
+    // when the page goes away; dropping the runtime would instead reset the
+    // TCP connections under the peers. Give the close frames a moment to
+    // flush through the socket tasks before the runtime drops.
+    let mut closed_sockets = 0usize;
+    for page in ctx.pages.iter_mut() {
+        closed_sockets += page.close_all_websockets();
+    }
+    if closed_sockets > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     // The connection thread merges this context's cookie delta into the
@@ -1663,10 +1775,10 @@ mod tests {
                 let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
                 let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
                 let default_context = crate::dispatch::CdpContext::new().default_context;
-                let processor = tokio::task::spawn_local(super::cdp_processor(
+                let mut processor = tokio::task::spawn_local(super::cdp_processor(
                     server_rx,
                     default_context,
-                    shutdown,
+                    shutdown.clone(),
                 ));
 
                 server_tx
@@ -1771,9 +1883,23 @@ mod tests {
                 }
 
                 drop(server_tx);
+                // Chromium pages outlive their DevTools client: the page has
+                // live JS, so the processor parks instead of exiting, and a
+                // parked page must not wedge the connection — the shutdown
+                // signal still tears it down promptly.
+                let parked = tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    &mut processor,
+                )
+                .await;
+                assert!(
+                    parked.is_err(),
+                    "processor must park while a page has live JS"
+                );
+                shutdown.notify_waiters();
                 tokio::time::timeout(std::time::Duration::from_secs(2), processor)
                     .await
-                    .expect("processor shutdown timeout")
+                    .expect("processor shutdown timeout after park")
                     .expect("processor task");
             })
             .await;

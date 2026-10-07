@@ -4000,6 +4000,31 @@ impl Page {
         }
     }
 
+    /// Arm the page's V8 termination watchdog with `budget`. An owner that
+    /// parks its event loop (a CDP connection whose client went away) uses
+    /// this to bound the park: when the budget elapses the isolate is
+    /// terminated, which returns the in-flight event-loop turn to the owner
+    /// for teardown. Balance with [`Self::disarm_page_watchdog`].
+    pub fn arm_page_watchdog(
+        &mut self,
+        budget: std::time::Duration,
+    ) -> Option<obscura_js::runtime::WatchdogToken> {
+        self.js.as_mut().map(|js| js.arm_watchdog(budget))
+    }
+
+    /// Stop a watchdog armed by [`Self::arm_page_watchdog`]. If it had fired
+    /// (terminated the isolate), the termination flag is cleared so the
+    /// runtime drops cleanly. Returns true if it had fired.
+    pub fn disarm_page_watchdog(
+        &mut self,
+        token: obscura_js::runtime::WatchdogToken,
+    ) -> bool {
+        match self.js.as_mut() {
+            Some(js) => js.disarm_watchdog(token),
+            None => false,
+        }
+    }
+
     /// Advance one wake-driven browser task for a continuously owned page.
     /// `true` means deno_core reached full idle; `false` means one wake/task was
     /// delivered and the owner should offer another turn after servicing any
@@ -5660,6 +5685,29 @@ impl Page {
 
     pub fn has_js(&self) -> bool {
         self.js.is_some()
+    }
+
+    /// Wake source fired whenever a page-owned WebSocket delivers a frame or
+    /// its peer drops the connection, so an owner with a parked event loop can
+    /// re-arm a delivery turn.
+    pub fn websockets_activity(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        self.js.as_ref().map(|js| js.websockets_activity())
+    }
+
+    /// Actively close every page-owned WebSocket with a clean close frame.
+    /// Returns how many sockets were closed.
+    pub fn close_all_websockets(&mut self) -> usize {
+        match self.js.as_mut() {
+            Some(js) => js.close_all_websockets(),
+            None => 0,
+        }
+    }
+
+    /// Whether any page-owned WebSocket is still open.
+    pub fn has_open_websockets(&self) -> bool {
+        self.js
+            .as_ref()
+            .is_some_and(|js| js.has_open_websockets())
     }
 
     pub fn release_object_group(&mut self) {

@@ -4115,6 +4115,26 @@ impl ObscuraJsRuntime {
         self.state.borrow().activity_generation
     }
 
+    /// Wake source fired whenever a page-owned WebSocket delivers a frame or
+    /// its peer drops the connection. An owner with a parked event loop (a CDP
+    /// connection whose client went away) waits on this to re-arm a delivery
+    /// turn; without it a frame landing on an idle page is never pumped into
+    /// JS.
+    pub fn websockets_activity(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.state.borrow().websockets_activity()
+    }
+
+    /// Actively close every page-owned WebSocket with a clean close frame.
+    /// Returns how many sockets were closed.
+    pub fn close_all_websockets(&mut self) -> usize {
+        self.state.borrow_mut().close_all_websockets()
+    }
+
+    /// Whether any page-owned WebSocket is still open.
+    pub fn has_open_websockets(&self) -> bool {
+        self.state.borrow().has_open_websockets()
+    }
+
     fn has_pending_network_requests(&self) -> bool {
         let state = self.state.borrow();
         state
@@ -5210,6 +5230,123 @@ mod tests {
         // global before page script runs. Bind it for the whole test.
         rt.install_internal_namespace();
         rt
+    }
+
+    /// A page-owned WebSocket frame must wake the page's activity signal even
+    /// when nothing is driving the event loop (the parked-connection case:
+    /// the CDP client went away, so nobody polls the runtime). The wake must
+    /// fire BEFORE the owning turn runs, and the frame must land in JS on
+    /// bounded delivery turns. Page teardown must close any surviving socket
+    /// with a clean close frame, never an abrupt TCP reset.
+    #[tokio::test(flavor = "current_thread")]
+    async fn websocket_frame_wakes_parked_owner_and_delivers_to_js() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::task::spawn(async move {
+            use futures_util::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::Message;
+            // Round 0: send one frame, then close from the peer so the
+            // page's delivery turn reaches event-loop idle (a live recv on
+            // an open socket never idles on its own).
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            eprintln!("[srv] round0 accepted");
+            ws.send(Message::text("wake-1")).await.unwrap();
+            let _ = ws.close(None).await;
+            eprintln!("[srv] round0 close sent");
+            while let Some(frame) = ws.next().await {
+                if frame.is_err() {
+                    break;
+                }
+            }
+            eprintln!("[srv] round0 drained");
+            // Round 1: an open socket the page tears down. The page must
+            // close it with a clean close frame.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            eprintln!("[srv] round1 accepted");
+            let mut saw_clean_close = false;
+            while let Some(frame) = ws.next().await {
+                match frame {
+                    Ok(Message::Close(_)) => {
+                        saw_clean_close = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            eprintln!("[srv] round1 done saw_clean_close={saw_clean_close}");
+            saw_clean_close
+        });
+
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(&format!(
+            "(function() {{ window.__got = []; \
+             window.__ev = []; \
+             window.__ws = new WebSocket('ws://{addr}/probe-a'); \
+             window.__ws.onmessage = function (e) {{ window.__got.push(String(e.data)); }}; \
+             window.__ws.onclose = function () {{ window.__ev.push('close'); }}; }})()"
+        ))
+        .unwrap();
+        // Drive the open handshake to completion.
+        for turn in 0..50 {
+            rt.run_autonomous_event_loop_turn().await;
+            if rt.has_open_websockets() {
+                break;
+            }
+        }
+        assert!(rt.has_open_websockets(), "socket never opened");
+
+        // Park: wait on the activity signal with no manual V8 turns in
+        // between. The server's frame arrives while nothing polls the
+        // runtime, so this wake is the only thing that can move it.
+        let activity = rt.websockets_activity();
+        let wake = activity.notified();
+        tokio::time::timeout(std::time::Duration::from_secs(5), wake)
+            .await
+            .expect("websocket frame did not wake the parked owner");
+
+        // The re-armed delivery turns must land the frame and the peer close
+        // in JS. Bounded slices only: between the frame and the peer close a
+        // full turn would park on the live recv forever.
+        for _ in 0..50 {
+            rt.run_event_loop_for_duration(100).await.unwrap();
+            let closed = rt
+                .evaluate("window.__ev.includes('close')")
+                .ok()
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if closed {
+                break;
+            }
+        }
+        let got = rt
+            .evaluate("JSON.stringify(window.__got)")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(got.contains("wake-1"), "frame never delivered: {got}");
+
+        // Probe B: an open socket at page-teardown time. close_all must send
+        // a clean close frame that the server recognizes. Bounded slices
+        // only: a full turn would hang on probe B's pending recv.
+        rt.evaluate(&format!(
+            "(function() {{ window.__wsB = new WebSocket('ws://{addr}/probe-b'); }})()"
+        ))
+        .ok();
+        for _ in 0..50 {
+            rt.run_event_loop_for_duration(100).await.unwrap();
+        }
+        let closed = rt.close_all_websockets();
+        assert!(closed >= 1, "expected sockets to drain, got {closed}");
+        let saw_clean_close = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server task timed out")
+            .expect("server task panicked");
+        assert!(saw_clean_close, "server did not see a clean close frame");
     }
 
     /// The geometry hot path memoizes the document base URL. The memo must
