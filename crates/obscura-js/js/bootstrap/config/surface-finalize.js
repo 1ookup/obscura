@@ -2793,8 +2793,6 @@ const _chromeNonEnumerableWindowObjects = [
 ];
 function _normalizeWindowObjectEnumerability(target) {
   if (!target) return;
-  const isFrameRealm = typeof target.__obscura_frame_document_nid === 'number'
-    && target.__obscura_frame_document_nid > 0;
   const setEnumerable = (name, enumerable) => {
     try {
       const descriptor = Object.getOwnPropertyDescriptor(target, name);
@@ -2803,18 +2801,16 @@ function _normalizeWindowObjectEnumerability(target) {
     } catch (_error) {}
   };
   for (const name of _chromeEnumerableWindowObjects) setEnumerable(name, true);
-  for (const name of _chromeEnumerableWindowFunctions) {
-    if (isFrameRealm && !Object.prototype.hasOwnProperty.call(target, name)
-        && target.Window?.prototype && typeof target.Window.prototype[name] === 'function') {
-      try {
-        Object.defineProperty(target, name, {
-          value: target.Window.prototype[name], writable: true,
-          enumerable: true, configurable: true,
-        });
-      } catch (_error) {}
-    }
-    setEnumerable(name, true);
-  }
+  // The EventTarget methods (addEventListener/dispatchEvent/removeEventListener)
+  // and `when` stay OFF the window's own-key surface in every realm: Chrome
+  // exposes them through the prototype chain only, on the main window and on
+  // iframe contentWindow alike (measured on Chromium 149: fourOwn=[] for a
+  // frame window; the 154 wk census agrees). The old frame-realm mint here
+  // re-added all four as own enumerable properties after the finalize pass
+  // had moved them to Window.prototype -- exactly the 4-key ownKeys leak the
+  // gsLi5 payload reflection carried (ddiv/wk census: 1287 vs 1283). Keep only
+  // the enumerability normalization for names a page itself made own.
+  for (const name of _chromeEnumerableWindowFunctions) setEnumerable(name, true);
   // Window interface constructors are own properties of the global object,
   // but WebIDL exposes those bindings as non-enumerable. Several legacy
   // shims were installed with `globalThis.X = ...` before the interface table

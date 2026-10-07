@@ -36301,6 +36301,98 @@ mod secure_context_navigator_gate_probe {
         );
     }
 
+    /// Chrome keeps the EventTarget surface off every window's own-key
+    /// reflection: addEventListener/dispatchEvent/removeEventListener resolve
+    /// through Window.prototype (EventTarget.prototype for `when`), on the
+    /// main window and on iframe contentWindow alike (Chromium 149: fourOwn=[]
+    /// for a frame window; the 154 wk census agrees). A frame-realm mint in
+    /// _normalizeWindowObjectEnumerability used to re-add all four as own
+    /// enumerable properties after finalize had moved them to
+    /// Window.prototype -- 1287 vs 1283 own keys, the exact surface the
+    /// challenge's ownKeys reflection carried into the payload.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_window_ownkeys_carry_no_eventtarget_surface() {
+        let dom = parse_html(
+            r#"<html><body><iframe id=widgetf style="display:block;width:300px;height:65px"></iframe></body></html>"#,
+        );
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_viewport(400.0, 300.0);
+        rt.run_page_init();
+        rt.install_internal_namespace();
+        let root = rt
+            .evaluate(
+                r#"(() => {
+                    const op = (cmd, a1) =>
+                        Deno.core.ops.op_dom(cmd, String(a1 ?? ""), "");
+                    const host = document.getElementById("widgetf")[Symbol.for('obscura.nid')];
+                    const created = JSON.parse(op("create_iframe_content_document", host));
+                    op("set_document_scope", created.root, JSON.stringify({
+                        url: "https://widget.example/frame",
+                        originUrl: "https://widget.example/frame",
+                        frameId: "keys-frame",
+                        documentGeneration: 1,
+                        csp: null,
+                    }));
+                    op("parse_into_subtree", created.root, "<html><body></body></html>");
+                    return created.root;
+                })()"#,
+            )
+            .unwrap()
+            .as_f64()
+            .unwrap() as u32;
+        rt.ensure_frame_realm("keys-frame", 1, root, "https://widget.example/frame")
+            .unwrap();
+        let frame = rt
+            .evaluate_in_frame_realm_for_cdp(
+                "keys-frame",
+                1,
+                crate::realm::MAIN_WORLD,
+                r#"(() => {
+                    const four = ['addEventListener', 'dispatchEvent',
+                        'removeEventListener', 'when'];
+                    const own = Object.getOwnPropertyNames(globalThis);
+                    return JSON.stringify({
+                        ownFour: four.filter(n => own.includes(n)),
+                        stillCallable: four.every(n => typeof globalThis[n] === 'function'),
+                        onWindowProto: typeof Window === 'function' && Window.prototype
+                            ? four.filter(n => Object.getOwnPropertyNames(
+                                  Window.prototype).includes(n))
+                            : [],
+                        ownEnumerableCount:
+                            Object.keys(globalThis).filter(n => four.includes(n)).length,
+                    });
+                })()"#,
+                true,
+                true,
+                2_000,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        println!("FRAME-KEYS={}", frame);
+        let f: serde_json::Value = serde_json::from_str(frame.as_str().unwrap()).unwrap();
+        assert_eq!(f["ownFour"], serde_json::json!([]),
+            "frame window ownKeys must not carry the EventTarget surface");
+        assert_eq!(f["stillCallable"], serde_json::json!(true),
+            "the methods stay reachable through the prototype chain");
+        assert_eq!(f["onWindowProto"],
+            serde_json::json!(["addEventListener", "dispatchEvent", "removeEventListener"]),
+            "the three methods ride Window.prototype; `when` rides EventTarget.prototype");
+        let main = rt.evaluate(
+            r#"(() => {
+                const four = ['addEventListener', 'dispatchEvent',
+                    'removeEventListener', 'when'];
+                const own = Object.getOwnPropertyNames(globalThis);
+                return four.filter(n => own.includes(n));
+            })()"#,
+        )
+        .unwrap();
+        assert_eq!(main, serde_json::json!([]),
+            "main window ownKeys carry no EventTarget surface either");
+    }
+
     /// A frame whose host iframe has no rendering box is a hidden document
     /// (the challenge widget is a 0x0 hidden iframe, and the live 149 payload
     /// reads its document as hidden), and hidden documents fire no animation
