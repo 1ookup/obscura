@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """extract-fo-payloads.py <trace.jsonl> <out-prefix> [--keys k1,k2,...]
-从 tracelog JSONL 提取 k=payloadJSON 记录（按时序），每条 parse 后 sort_keys dump 到
+从 tracelog JSONL 提取 k=payloadJSON 记录（按时序），每条 parse 后按原始键序（不重排）dump 到
 <out-prefix>-fo<N>.json（N 从 1 起）。--keys 另外输出指定 k 的计数与样本。
 """
 import json, sys, collections
@@ -42,7 +42,7 @@ def main():
             continue
         out = f'{prefix}-fo{n}.json'
         with open(out, 'w') as f:
-            json.dump(obj, f, indent=1, sort_keys=True, ensure_ascii=False)
+            json.dump(obj, f, indent=1, ensure_ascii=False)  # 键序=trace 原始顺序，不重排
         top = list(obj.keys())[:4] if isinstance(obj, dict) else type(obj).__name__
         print(f'[extract] fo{n} -> {out}  top={top}  bytes(orig)={len(v) if isinstance(v,str) else "?"}')
     for key in extra_keys:
