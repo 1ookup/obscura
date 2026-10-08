@@ -129,6 +129,11 @@ globalThis.navigator = _bootstrapObject('navigator', () => ({
       if (requested.has('platformVersion')) result.platformVersion = fingerprint.uaPlatformVersion || '';
       if (requested.has('uaFullVersion')) result.uaFullVersion = fingerprint.browserVersion || '';
       if (requested.has('wow64')) result.wow64 = !!fingerprint.wow64;
+      // Chrome 130+ answers the form-factors hint from the device class:
+      // a non-mobile device is a desktop (Chromium 149 measured ["Desktop"]).
+      if (requested.has('formFactors')) {
+        result.formFactors = fingerprint.mobile ? ['Phone'] : ['Desktop'];
+      }
       return Promise.resolve(result);
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },

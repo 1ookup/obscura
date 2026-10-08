@@ -36453,6 +36453,61 @@ mod secure_context_navigator_gate_probe {
     /// secure origin the challenge page runs on. The probe's about:blank
     /// reading is context-sensitive: NavigatorUAData is [SecureContext], so
     /// an opaque/http origin answers undefined the way Chrome does.
+    /// getHighEntropyValues answers the full Client Hints surface; the
+    /// form-factors hint resolves from the device class (Chromium 149:
+    /// ["Desktop"] on a non-mobile device) rather than being omitted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn uach_high_entropy_values_answer_the_form_factors_hint() {
+        let dom = parse_html("<html><body></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("https://example.com/test");
+        rt.run_page_init();
+        rt.evaluate(
+            r#"(() => {
+                navigator.userAgentData.getHighEntropyValues(
+                    ['formFactors', 'architecture', 'wow64'])
+                    .then(v => { window.__hev = JSON.stringify(v); },
+                          e => { window.__hev = 'REJ:' + e.message; });
+                navigator.userAgentData.getHighEntropyValues([])
+                    .then(v => { window.__hevNone = JSON.stringify(v); },
+                          e => { window.__hevNone = 'REJ:' + e.message; });
+            })()"#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(50).await.unwrap();
+        let hev: serde_json::Value =
+            serde_json::from_str(rt.evaluate("window.__hev").unwrap().as_str().unwrap()).unwrap();
+        // Chrome always carries the low-entropy set (brands/mobile/platform)
+        // alongside the requested hints (measured: getHighEntropyValues([])
+        // answers exactly those three).
+        assert_eq!(
+            hev,
+            serde_json::json!({
+                "formFactors": ["Desktop"],
+                "architecture": "arm",
+                "wow64": false,
+                "brands": navigator_brands(),
+                "mobile": false,
+                "platform": "macOS",
+            })
+        );
+        // No hints requested: only the three always-present members.
+        let none: serde_json::Value =
+            serde_json::from_str(rt.evaluate("window.__hevNone").unwrap().as_str().unwrap()).unwrap();
+        assert_eq!(
+            none,
+            serde_json::json!({"brands": navigator_brands(), "mobile": false, "platform": "macOS"})
+        );
+    }
+
+    fn navigator_brands() -> serde_json::Value {
+        serde_json::json!([
+            {"brand": "Chromium", "version": "149"},
+            {"brand": "Not)A;Brand", "version": "24"},
+        ])
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn uach_probe_replay_answers_the_two_entry_lists_on_secure_origin() {
         let dom = parse_html("<html><body></body></html>");
