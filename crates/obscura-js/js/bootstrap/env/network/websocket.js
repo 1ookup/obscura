@@ -119,3 +119,10 @@ if (typeof WebSocket === 'undefined') {
     static CLOSED = 3;
   };
 }
+
+// Chrome's WebSocket is an EventTarget: the interface prototype chains to
+// EventTarget.prototype (measured Chromium 149: WebSocket.prototype ->
+// EventTarget.prototype -> Object.prototype).
+if (typeof EventTarget === 'function' && globalThis.WebSocket?.prototype) {
+  Object.setPrototypeOf(globalThis.WebSocket.prototype, EventTarget.prototype);
+}

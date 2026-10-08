@@ -7724,8 +7724,13 @@ mod tests {
             serde_json::json!(12),
             "Screen.prototype keeps its twelve accessors",
         );
+        let mut screen_l2 = result["screenL2"].clone();
+        screen_l2
+            .as_array_mut()
+            .unwrap()
+            .sort_by(|a, b| a.as_str().unwrap().cmp(b.as_str().unwrap()));
         assert_eq!(
-            result["screenL2"],
+            screen_l2,
             serde_json::json!(["addEventListener", "constructor", "dispatchEvent",
                 "removeEventListener", "when"]),
             "Screen.prototype sits on the full EventTarget.prototype",

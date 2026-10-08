@@ -102,3 +102,9 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
   getStats() { return Promise.resolve(new Map()); }
   get [Symbol.toStringTag]() { return 'RTCPeerConnection'; }
 };
+
+// Chrome's RTCPeerConnection is an EventTarget: the interface prototype
+// chains to EventTarget.prototype (measured Chromium 149).
+if (typeof EventTarget === 'function' && globalThis.RTCPeerConnection?.prototype) {
+  Object.setPrototypeOf(globalThis.RTCPeerConnection.prototype, EventTarget.prototype);
+}

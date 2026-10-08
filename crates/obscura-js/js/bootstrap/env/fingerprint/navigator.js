@@ -376,8 +376,11 @@ globalThis.chrome = {
   },
 };
 
-globalThis.Notification = class Notification {
+globalThis.Notification = class Notification extends EventTarget {
   static permission = "default";
   static requestPermission() { return Promise.resolve(Notification.permission); }
-  constructor() {}
+  // Chromium 149: Notification.maxActions is 2.
+  static maxActions = 2;
+  constructor() { super(); }
 };
+Object.setPrototypeOf(globalThis.Notification.prototype, EventTarget.prototype);

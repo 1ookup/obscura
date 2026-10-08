@@ -82,3 +82,12 @@
   _markNative(globalThis.AbortSignal);
   _markNative(globalThis.AbortController);
 })();
+
+// Chrome's AbortSignal is an EventTarget: the interface prototype chains to
+// EventTarget.prototype (measured Chromium 149: AbortSignal.prototype ->
+// EventTarget.prototype -> Object.prototype). The abort-registry
+// add/remove/dispatch stay as own members (they back the controller's abort
+// machinery; Chromium serves the event surface through interceptors).
+if (typeof EventTarget === 'function' && globalThis.AbortSignal?.prototype) {
+  Object.setPrototypeOf(globalThis.AbortSignal.prototype, EventTarget.prototype);
+}
