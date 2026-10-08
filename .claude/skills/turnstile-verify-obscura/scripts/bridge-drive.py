@@ -168,7 +168,13 @@ def main():
     parser.add_argument("--url", default="https://www.thelancet.com/123.txt")
     parser.add_argument("--deadline", type=float, default=45.0,
                         help="challenge resolves or fails within ~10-25s; 45s is generous")
-    parser.add_argument("--offset", default="24,33")
+    # Click where the Chromium-side driver (turnstile-ui-state.mjs) clicks: it
+    # resolves the widget checkbox and clicks its box center, measured at
+    # iframe-local (93,33) on the 2026-10 build. The old (24,33) lands on the
+    # focusable control itself, which the challenge click record flags
+    # (wbeQI0.eiLB1 input vs the accepted body). Keep both point and record
+    # shape identical to the accepted side.
+    parser.add_argument("--offset", default="93,33")
     parser.add_argument("--max-clicks", type=int, default=3)
     args = parser.parse_args()
     offset = tuple(int(part) for part in args.offset.split(","))
