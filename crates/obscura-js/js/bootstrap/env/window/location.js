@@ -31,32 +31,21 @@ function _environmentSettings() {
     const info = _documentScopeUrls(root);
     const rawUrl = info.url || globalThis.__obscura_frame_base_url || "about:blank";
     let url = rawUrl;
-    // The deliberate answer below applies only to frames whose document
-    // origin is the inherited tuple origin. Opaque-origin frames (sandboxed
-    // without allow-same-origin) keep the spec answer: Chrome reports
-    // location.origin "null" there, and no probe can expect more than the
-    // browser it models shows.
-    const tupleOrigin = typeof info.origin === "string"
-      && info.origin !== "" && info.origin !== "null";
-    if (tupleOrigin && (rawUrl === "about:srcdoc" || rawUrl === "about:blank")
-        && /^https?:/i.test(info.baseUrl || "")) {
-      // srcdoc/about:blank frames inherit their creator's origin. Chrome
-      // keeps `document.URL` as about:srcdoc but reports a Location whose
-      // href is the creator's document URL. Returning the raw about: URL
-      // made Turnstile's srcdoc probes see protocol "about:" and choose PAT.
-      //
-      // The about:blank case is deliberate: Cloudflare builds about:blank
-      // frames for its probes, and answering "about:" for them sends the VM
-      // down the PAT branch. Measured 2026-09-17: restoring the spec answer
-      // (location.origin "null") turns three tests green but stalls the
-      // challenge after ~4s / ~4k records with a blank page, against 801k
-      // records with this deliberate answer. Keep the deliberate answer.
-      url = info.baseUrl;
-    } else if (tupleOrigin && (rawUrl === "about:srcdoc" || rawUrl === "about:blank")
-        && globalThis.__obscura_frame_base_url
-        && /^https?:/i.test(globalThis.__obscura_frame_base_url)) {
-      url = globalThis.__obscura_frame_base_url;
-    }
+    // srcdoc/about:blank frames keep their spec Location, in every frame
+    // whose document origin is the inherited tuple origin. Chrome answers
+    // href "about:blank"/"about:srcdoc" with location.origin "null" for them
+    // (measured on Chromium 149: href/origin/protocol "about:"/host ""/
+    // pathname "blank", ancestorOrigins carrying the ancestor chain), and
+    // window.origin stays the inherited tuple origin through the `origin`
+    // field below. Opaque-origin frames (sandboxed without allow-same-origin)
+    // keep the spec answer too. The 2026-09-17 creator-URL answer here
+    // (href = the embedding document's URL) is exactly the shape the
+    // challenge's window enumerator sampled as a host-input divergence
+    // (callret valuediff B1: obscura href=challenge URL + empty
+    // ancestorOrigins vs Chrome href="about:blank" + double origin chain),
+    // so the spec answer stands. Relative-URL resolution is untouched:
+    // `baseUrl` still carries the creator's document URL for the frame's
+    // own base.
     const baseUrl = (globalThis.document && globalThis.document.baseURI)
       || info.baseUrl || globalThis.__obscura_frame_base_url || url;
     const cookieUrl = /^(?:https?|wss?):/i.test(url) ? url : baseUrl;
@@ -154,10 +143,10 @@ function __currentUrl() {
 // empty. The own-key enumeration of `location` itself lists ancestorOrigins
 // first, then the URL components, then the navigation methods, with toString
 // last (oracle, Chrome 153).
-function _ancestorOriginsList() {
+function _ancestorOriginsList(ownRootNid) {
   const origins = [];
   try {
-    let root = Number(globalThis.__obscura_frame_document_nid) || 0;
+    let root = Number(ownRootNid ?? globalThis.__obscura_frame_document_nid) || 0;
     for (let depth = 0; depth < 8 && root > 0; depth++) {
       const container = _domParse('frame_container_info', root) || {};
       const parentRoot = Number(container.parentRoot) || 0;
@@ -165,7 +154,15 @@ function _ancestorOriginsList() {
       // top-level document reports one entry, and the walk previously broke
       // before reading it because the top document's content root is 0.
       const info = _domParse('document_scope_info', parentRoot > 0 ? parentRoot : 0) || {};
-      const origin = typeof info.origin === 'string' && info.origin ? info.origin : null;
+      let origin = typeof info.origin === 'string' && info.origin ? info.origin : null;
+      // The top scope reports origin null when the embedder never derived
+      // the tuple origin; the main realm's own settings path already falls
+      // back to the document URL's origin in that case, and the walk here
+      // needs the same fallback or a same-origin top document reads as if it
+      // had no origin at all.
+      if (!origin && typeof info.url === 'string' && /^https?:/i.test(info.url)) {
+        try { origin = new URL(info.url).origin; } catch (_e2) {}
+      }
       if (origin && origins[origins.length - 1] !== origin) origins.push(origin);
       root = parentRoot > 0 ? parentRoot : 0;
     }

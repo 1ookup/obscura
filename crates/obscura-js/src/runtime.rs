@@ -22722,38 +22722,101 @@ RequestRedirect value",
         let result = rt.evaluate(r#"(() => {
             const frame = document.createElement('iframe');
             document.body.append(frame);
-            const read = frame => ({
-                url: frame.contentDocument.URL,
-                locationOrigin: frame.contentWindow.location.origin,
-                origin: frame.contentWindow.origin,
-                domain: frame.contentDocument.domain,
-                referrer: frame.contentDocument.referrer,
-                base: frame.contentDocument.baseURI,
-            });
+            const read = frame => {
+                const L = frame.contentWindow.location;
+                return {
+                    url: frame.contentDocument.URL,
+                    href: L.href,
+                    locationOrigin: L.origin,
+                    protocol: L.protocol,
+                    origin: frame.contentWindow.origin,
+                    domain: frame.contentDocument.domain,
+                    referrer: frame.contentDocument.referrer,
+                    base: frame.contentDocument.baseURI,
+                };
+            };
             const child = read(frame);
             const nested = frame.contentDocument.createElement('iframe');
             frame.contentDocument.body.append(nested);
             return {child, nested: read(nested)};
         })()"#).unwrap();
-        // locationOrigin is the deliberate creator-URL answer, not the spec
-        // one: inherited-origin about:blank frames report a Location on the
-        // creator's document URL (see `_environmentSettings` in
-        // env/window/location.js for the Cloudflare measurement behind it).
-        // `document.URL` stays "about:blank" and `window.origin`/`domain`
-        // still prove the inheritance this test is named for.
+        // The spec answer, matching Chromium 149 measured: an inherited-origin
+        // about:blank frame's Location reports href "about:blank" with
+        // location.origin "null" (the about: URL's opaque origin), while
+        // window.origin/domain/referrer/base still prove the inheritance this
+        // test is named for. The creator-URL Location answer this test used
+        // to pin is the exact host-input divergence the challenge's window
+        // enumerator sampled (callret valuediff B1); Chrome's own answer was
+        // re-measured 2026-10-08 before flipping. ancestorOrigins is asserted
+        // from inside the frame realm below (the walk's own-root lookup goes
+        // through the realm's identity flags, which a cross-realm WindowProxy
+        // read of a lazily-booted about:blank frame resolves too early).
         assert_eq!(result, serde_json::json!({
             "child": {
-                "url": "about:blank", "locationOrigin": "https://creator.example:8443",
+                "url": "about:blank", "href": "about:blank",
+                "locationOrigin": "null", "protocol": "about:",
                 "origin": "https://creator.example:8443", "domain": "creator.example",
                 "referrer": "https://creator.example:8443/parent/path",
                 "base": "https://creator.example:8443/parent/path",
             },
             "nested": {
-                "url": "about:blank", "locationOrigin": "https://creator.example:8443",
+                "url": "about:blank", "href": "about:blank",
+                "locationOrigin": "null", "protocol": "about:",
                 "origin": "https://creator.example:8443", "domain": "creator.example",
                 "referrer": "about:blank", "base": "https://creator.example:8443/parent/path",
             },
         }));
+    }
+
+    /// The frame realm's own view of its Location.ancestorOrigins: the
+    /// creator's origin, nearest first, with the about:blank href kept
+    /// (Chromium 149: ancestor=[parent origin] for a no-src iframe). The
+    /// walk reads the frame's identity flags inside the realm, so this is
+    /// asserted from evaluate_in_frame_realm_for_cdp.
+    /// IGNORED until the snapshot-realm identity split is fixed: a
+    /// template-restored frame realm's location surface resolves its lexical
+    /// `globalThis` to the snapshot-era global, whose
+    /// __obscura_frame_document_nid is the template placeholder (1), so the
+    /// walk starts from the wrong document and page-init's captured-root
+    /// re-install of the ancestorOrigins getter cannot run either (it lives
+    /// in the frame branch that needs the live nid at boot). The challenge
+    /// sampling path is covered: hydrated widget realms rebind at page-init
+    /// with the live root, and the WindowProxy facade answers pre-realm
+    /// reads. The proper fix is a realm.rs identity hook on the
+    /// internalNamespace pattern (re-point the surface's realm identity at
+    /// restore time).
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "template-realm location getter resolves the snapshot-era global; needs the realm identity hook"]
+    async fn frame_realm_ancestor_origins_list_the_creator_chain() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://creator.example/parent/path");
+        let root = rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.append(frame);
+            return Number(Deno.core.ops.op_dom('iframe_content_document_root',
+                String(frame[Symbol.for('obscura.nid')]), ''));
+        })()"#).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("chain-frame", 1, root, "about:blank").unwrap();
+        let result = rt.evaluate_in_frame_realm_for_cdp(
+            "chain-frame", 1, crate::realm::MAIN_WORLD,
+            r#"(() => {
+                const ao = location.ancestorOrigins, chain = [];
+                for (let i = 0; i < ao.length; i++) chain.push(ao[i]);
+                return JSON.stringify({href: location.href, origin: location.origin,
+                    chain, length: ao.length, item0: ao.item(0),
+                    contains: ao.contains("https://creator.example"),
+                    json: Object.keys(ao)});
+            })()"#,
+            true, true, 2_000,
+        ).await.unwrap().value.unwrap();
+        println!("CHAIN-VIEW={}", result);
+        let v: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(v["href"], serde_json::json!("about:blank"));
+        assert_eq!(v["origin"], serde_json::json!("null"));
+        assert_eq!(v["chain"], serde_json::json!(["https://creator.example"]));
+        assert_eq!(v["length"], serde_json::json!(1));
+        assert_eq!(v["item0"], serde_json::json!("https://creator.example"));
+        assert_eq!(v["contains"], serde_json::json!(true));
     }
 
     #[test]

@@ -527,6 +527,31 @@ globalThis.__obscura_init = function() {
           } catch (_e) {}
           return globalThis.__documentVisibilityState__ || 'visible';
         };
+        // The location surface's ancestorOrigins getter resolves its own
+        // frame root through the lexical `globalThis`, which in a
+        // template-restored realm is the snapshot-era global (a stale nid),
+        // not this live one where the host injected the real root. Rebind
+        // the getter here where `frameRootNid` is the live value, captured
+        // at install; the walk itself is realm-independent ops.
+        try {
+          const loc = globalThis.location;
+          if (loc && typeof loc === 'object'
+              && typeof _ancestorOriginsList === 'function'
+              && _ancestorOriginsCache instanceof WeakMap) {
+            const ownRoot = Number(frameRootNid) || 0;
+            Object.defineProperty(loc, 'ancestorOrigins', {
+              get: _markNative(function ancestorOrigins() {
+                let v = _ancestorOriginsCache.get(this);
+                if (!v) {
+                  v = _ancestorOriginsList(ownRoot);
+                  _ancestorOriginsCache.set(this, v);
+                }
+                return v;
+              }),
+              enumerable: true, configurable: true,
+            });
+          }
+        } catch (_e) {}
       }
       // A frame viewport can change without recreating its realm (responsive
       // iframe CSS, display toggles, animation, or an embedder resize). Keep

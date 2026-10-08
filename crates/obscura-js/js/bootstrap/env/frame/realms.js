@@ -973,11 +973,25 @@ function _frameWindowProxyFor(hostEl) {
   // Stable per-proxy location. Reads re-check the frame origin on every
   // access; writes/assign/replace are permitted cross-origin per HTML and
   // enqueue a navigation through the Rust frame controller.
+  // ancestorOrigins belongs here too: a probe reading
+  // frame.contentWindow.location before the frame realm materializes must
+  // still see the frame's own ancestor chain (Chrome answers the creator's
+  // origin chain for a about:blank frame's Location, not the accessing
+  // realm's), keyed per content root so a navigation rebuilds it.
+  let frameAncestorOrigins = null;
   const frameLocation = {
     get href() {
       const st = frameState();
       if (!st.same) throw securityError();
       return _documentScopeUrls(st.root).url || "about:blank";
+    },
+    get ancestorOrigins() {
+      const st = frameState();
+      if (!st.same) throw securityError();
+      if (!frameAncestorOrigins || frameAncestorOrigins.root !== st.root) {
+        frameAncestorOrigins = { root: st.root, list: _ancestorOriginsList(st.root) };
+      }
+      return frameAncestorOrigins.list;
     },
     set href(v) { navigate(v); },
     assign(v) { navigate(v); },
