@@ -7468,6 +7468,64 @@ mod tests {
         );
     }
 
+    /// A WebGPU object answers {} to JSON and to own-key reflection: label
+    /// lives on the prototype (GPUObjectBase), and a shader module's source
+    /// is not a page-visible member at all. The ddiv valuediff B3 catch --
+    /// the WGSL source serialized out of createRenderPipeline's descriptor
+    /// because the module carried label/code as own enumerable properties.
+    #[tokio::test(flavor = "current_thread")]
+    async fn webgpu_objects_json_to_an_empty_own_surface() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let _ = rt.evaluate("globalThis.__obscura_webgl_enabled = true;");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const adapter = await navigator.gpu.requestAdapter();
+                    const device = await adapter.requestDevice();
+                    const source = '@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{return vec4f(0,0,0,1);}';
+                    const module = device.createShaderModule({code: source});
+                    const pipeline = device.createRenderPipeline(
+                        {layout: 'auto', vertex: {module, entryPoint: 'vs'}});
+                    const texture = device.createTexture(
+                        {size: [8, 8], format: 'rgba8unorm', usage: 17});
+                    const sampler = device.createSampler();
+                    return JSON.stringify({
+                        moduleJson: JSON.stringify(module),
+                        moduleOwn: Object.getOwnPropertyNames(module),
+                        label: module.label,
+                        codeStillReadable: typeof module.code === 'string' && module.code.length > 0,
+                        pipelineJson: JSON.stringify(pipeline),
+                        descriptorView: JSON.stringify(
+                            {vertex: {module: JSON.parse(JSON.stringify(module)),
+                                      entryPoint: 'vs'}, layout: 'auto'}),
+                        textureJson: JSON.stringify(texture),
+                        samplerJson: JSON.stringify(sampler),
+                    });
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let result: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "moduleJson": "{}",
+                "moduleOwn": [],
+                "label": "",
+                "codeStillReadable": true,
+                "pipelineJson": "{}",
+                "descriptorView": "{\"vertex\":{\"module\":{},\"entryPoint\":\"vs\"},\"layout\":\"auto\"}",
+                "textureJson": "{}",
+                "samplerJson": "{}",
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn webgpu_device_runs_a_render_pass_and_reads_it_back() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");

@@ -19,6 +19,8 @@
 const _gpuKey = Symbol('obscura.webgpu.construct');
 
 const _gpuTextureState = new WeakMap();
+const _gpuObjectState = new WeakMap();
+const _gpuShaderModuleState = new WeakMap();
 const _gpuBufferState = new WeakMap();
 const _gpuEncoderState = new WeakMap();
 const _gpuPassState = new WeakMap();
@@ -142,8 +144,10 @@ globalThis.GPUTextureView = class GPUTextureView {
     if (key !== _gpuKey) {
       throw new TypeError("Failed to construct 'GPUTextureView': Illegal constructor");
     }
-    this.label = label || '';
+    _gpuObjectState.set(this, { label: String(label || '') });
   }
+  get label() { const st = _gpuObjectState.get(this); return st ? st.label : ''; }
+  set label(value) { const st = _gpuObjectState.get(this); if (st) st.label = String(value || ''); }
   get [Symbol.toStringTag]() { return 'GPUTextureView'; }
 };
 
@@ -267,9 +271,14 @@ globalThis.GPUShaderModule = class GPUShaderModule {
       throw new TypeError("Failed to construct 'GPUShaderModule': Illegal constructor");
     }
     const source = descriptor && typeof descriptor === 'object' ? descriptor : {};
-    this.label = String(source.label || '');
-    this.code = String(source.code || '');
+    _gpuShaderModuleState.set(this, {
+      label: String(source.label || ''),
+      code: String(source.code || ''),
+    });
   }
+  get label() { const st = _gpuShaderModuleState.get(this); return st ? st.label : ''; }
+  set label(value) { const st = _gpuShaderModuleState.get(this); if (st) st.label = String(value || ''); }
+  get code() { const st = _gpuShaderModuleState.get(this); return st ? st.code : ''; }
   getCompilationInfo() {
     return Promise.resolve({ messages: [] });
   }
@@ -281,8 +290,10 @@ globalThis.GPUBindGroupLayout = class GPUBindGroupLayout {
     if (key !== _gpuKey) {
       throw new TypeError("Failed to construct 'GPUBindGroupLayout': Illegal constructor");
     }
-    this.label = String(label || '');
+    _gpuObjectState.set(this, { label: String(label || '') });
   }
+  get label() { const st = _gpuObjectState.get(this); return st ? st.label : ''; }
+  set label(value) { const st = _gpuObjectState.get(this); if (st) st.label = String(value || ''); }
   get [Symbol.toStringTag]() { return 'GPUBindGroupLayout'; }
 };
 
@@ -291,8 +302,10 @@ globalThis.GPUBindGroup = class GPUBindGroup {
     if (key !== _gpuKey) {
       throw new TypeError("Failed to construct 'GPUBindGroup': Illegal constructor");
     }
-    this.label = String(label || '');
+    _gpuObjectState.set(this, { label: String(label || '') });
   }
+  get label() { const st = _gpuObjectState.get(this); return st ? st.label : ''; }
+  set label(value) { const st = _gpuObjectState.get(this); if (st) st.label = String(value || ''); }
   get [Symbol.toStringTag]() { return 'GPUBindGroup'; }
 };
 
@@ -301,8 +314,10 @@ globalThis.GPUPipelineLayout = class GPUPipelineLayout {
     if (key !== _gpuKey) {
       throw new TypeError("Failed to construct 'GPUPipelineLayout': Illegal constructor");
     }
-    this.label = String(label || '');
+    _gpuObjectState.set(this, { label: String(label || '') });
   }
+  get label() { const st = _gpuObjectState.get(this); return st ? st.label : ''; }
+  set label(value) { const st = _gpuObjectState.get(this); if (st) st.label = String(value || ''); }
   get [Symbol.toStringTag]() { return 'GPUPipelineLayout'; }
 };
 
@@ -311,8 +326,10 @@ globalThis.GPUSampler = class GPUSampler {
     if (key !== _gpuKey) {
       throw new TypeError("Failed to construct 'GPUSampler': Illegal constructor");
     }
-    this.label = String(label || '');
+    _gpuObjectState.set(this, { label: String(label || '') });
   }
+  get label() { const st = _gpuObjectState.get(this); return st ? st.label : ''; }
+  set label(value) { const st = _gpuObjectState.get(this); if (st) st.label = String(value || ''); }
   get [Symbol.toStringTag]() { return 'GPUSampler'; }
 };
 
@@ -322,10 +339,16 @@ globalThis.GPUQuerySet = class GPUQuerySet {
       throw new TypeError("Failed to construct 'GPUQuerySet': Illegal constructor");
     }
     const source = descriptor && typeof descriptor === 'object' ? descriptor : {};
-    this.label = String(source.label || '');
-    this.type = String(source.type || '');
-    this.count = Math.max(0, Math.trunc(Number(source.count) || 0));
+    _gpuObjectState.set(this, {
+      label: String(source.label || ''),
+      type: String(source.type || ''),
+      count: Math.max(0, Math.trunc(Number(source.count) || 0)),
+    });
   }
+  get label() { const st = _gpuObjectState.get(this); return st ? st.label : ''; }
+  set label(value) { const st = _gpuObjectState.get(this); if (st) st.label = String(value || ''); }
+  get type() { const st = _gpuObjectState.get(this); return st ? st.type : ''; }
+  get count() { const st = _gpuObjectState.get(this); return st ? st.count : 0; }
   destroy() {}
   get [Symbol.toStringTag]() { return 'GPUQuerySet'; }
 };
@@ -358,8 +381,10 @@ globalThis.GPUComputePipeline = class GPUComputePipeline {
       throw new TypeError("Failed to construct 'GPUComputePipeline': Illegal constructor");
     }
     const source = descriptor && typeof descriptor === 'object' ? descriptor : {};
-    this.label = String(source.label || '');
+    _gpuObjectState.set(this, { label: String(source.label || '') });
   }
+  get label() { const st = _gpuObjectState.get(this); return st ? st.label : ''; }
+  set label(value) { const st = _gpuObjectState.get(this); if (st) st.label = String(value || ''); }
   getBindGroupLayout() {
     return new globalThis.GPUBindGroupLayout(_gpuKey, '');
   }
@@ -371,8 +396,10 @@ globalThis.GPUCommandBuffer = class GPUCommandBuffer {
     if (key !== _gpuKey) {
       throw new TypeError("Failed to construct 'GPUCommandBuffer': Illegal constructor");
     }
-    this.label = String(label || '');
+    _gpuObjectState.set(this, { label: String(label || '') });
   }
+  get label() { const st = _gpuObjectState.get(this); return st ? st.label : ''; }
+  set label(value) { const st = _gpuObjectState.get(this); if (st) st.label = String(value || ''); }
   get [Symbol.toStringTag]() { return 'GPUCommandBuffer'; }
 };
 
