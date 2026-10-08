@@ -78,18 +78,13 @@ class Screen {
   get colorDepth() { return _screenColorDepth(); }
   get pixelDepth() { return _screenColorDepth(); }
   get orientation() { return _screenOrientationFor(this); }
-  // Chrome reports false unless the window spans several displays, which a
-  // headless engine never does.
-  get isExtended() { return false; }
-  get onchange() { return _screenSlot(this, 'onchange'); }
-  set onchange(value) { _screenSetSlot(this, 'onchange', typeof value === 'function' ? value : null); }
   addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
   removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
   dispatchEvent(event) { return _eventTargetDispatch(this, event); }
   get [Symbol.toStringTag]() { return 'Screen'; }
 }
 ['width','height','availWidth','availHeight','availTop','availLeft','colorDepth',
- 'pixelDepth','orientation','isExtended','onchange'].forEach(function(k) {
+ 'pixelDepth','orientation'].forEach(function(k) {
   var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
   if (d && d.get) _markNative(d.get);
   if (d && d.set) _markNative(d.set);

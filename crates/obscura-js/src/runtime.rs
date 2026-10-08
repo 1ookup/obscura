@@ -7721,8 +7721,8 @@ the event methods resolve through EventTarget.prototype",
         };
         assert_eq!(
             result["screenL1Len"],
-            serde_json::json!(12),
-            "Screen.prototype keeps its twelve accessors",
+            serde_json::json!(10),
+            "Screen.prototype keeps its ten accessors (no isExtended/onchange per the RE-149 oracle)",
         );
         let mut screen_l2 = result["screenL2"].clone();
         screen_l2
@@ -37047,11 +37047,10 @@ mod secure_context_navigator_gate_probe {
         );
     }
 
-    /// The voice table matches the reference macOS host's Chrome dump
-    /// (measured per row): 68 voices, all localService, Tingting default,
-    /// reference order preserved. The challenge payload consumes BOTH the
-    /// raw count (reference 68) and the first 32 names of the list, so the
-    /// count and the head of the table are both fingerprint fields.
+    /// The reference environment answers an EMPTY voice list (RE-Chromium 149
+    /// cold profile, awzl9 oracle reversal 10-08: the earlier 68-row host
+    /// table was the local macOS dump, not the reference). getVoices stays a
+    /// prototype method and returns a fresh empty array each call.
     #[test]
     fn voice_table_matches_the_reference_host_dump() {
         let dom = parse_html("<html><body></body></html>");
@@ -37065,17 +37064,9 @@ mod secure_context_navigator_gate_probe {
                     const v = speechSynthesis.getVoices();
                     return {
                         total: v.length,
-                        allLocal: v.every(x => x.localService),
-                        defaultCount: v.filter(x => x.default).length,
-                        defaultName: (v.find(x => x.default) || {}).name,
-                        firstName: v[0].name,
-                        lang0: v[0].lang,
-                        name32: v[0].name + '|' + v[31].name,
-                        row32Lang: v[31].lang,
-                        row33: v[32].name + '|' + v[32].lang,
-                        lastName: v[v.length - 1].name + '|' + v[v.length - 1].lang,
-                        uniqueNames: new Set(v.map(x => x.name)).size,
-                        v0IsSynthInstance: speechSynthesis.getVoices() !== v,
+                        isArray: Array.isArray(v),
+                        freshEachCall: speechSynthesis.getVoices() !== v,
+                        protoOwn: Object.getOwnPropertyNames(speechSynthesis).length,
                     };
                 })()"#,
             )
@@ -37083,18 +37074,10 @@ mod secure_context_navigator_gate_probe {
         assert_eq!(
             result,
             serde_json::json!({
-                "total": 68,
-                "allLocal": true,
-                "defaultCount": 1,
-                "defaultName": "婷婷",
-                "firstName": "婷婷",
-                "lang0": "zh-CN",
-                "name32": "婷婷|Lekha",
-                "row32Lang": "hi-IN",
-                "row33": "Lesya|uk-UA",
-                "lastName": "美嘉|zh-TW",
-                "uniqueNames": 68,
-                "v0IsSynthInstance": true,
+                "total": 0,
+                "isArray": true,
+                "freshEachCall": true,
+                "protoOwn": 0,
             })
         );
     }

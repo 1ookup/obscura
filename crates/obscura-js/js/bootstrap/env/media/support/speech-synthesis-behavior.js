@@ -96,7 +96,9 @@ function _installSpeechSynthesisPrototypeMembers(synth) {
   const proto = globalThis.SpeechSynthesis && globalThis.SpeechSynthesis.prototype;
   if (!proto) return false;
   if (!Object.prototype.hasOwnProperty.call(proto, 'getVoices')) {
-    proto.getVoices = _markNativeAs(function getVoices() { return _speechSynthesisVoices(); },
+    // RE-149 oracle: the reference environment answers an empty voice list
+    // (cold headless profile; the 68-row host table is reversed/superseded).
+    proto.getVoices = _markNativeAs(function getVoices() { return []; },
       'function getVoices() { [native code] }');
     proto.speak = _markNativeAs(function speak() {}, 'function speak() { [native code] }');
     proto.cancel = _markNativeAs(function cancel() {}, 'function cancel() { [native code] }');
