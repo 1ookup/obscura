@@ -53,7 +53,6 @@ function _eventTargetListenersFor(target, type) {
 }
 function _eventTargetRemove(target, type, callback, options) {
   if (target == null) target = globalThis;
-  if (target == null) target = globalThis;
   const byType = _eventTargetListeners.get(target);
   if (!byType) return;
   type = String(type);
