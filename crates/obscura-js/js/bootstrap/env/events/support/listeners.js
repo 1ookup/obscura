@@ -6,6 +6,7 @@ function _eventCapture(options) {
   return typeof options === 'boolean' ? options : !!(options && options.capture);
 }
 function _eventTargetAdd(target, type, callback, options) {
+  if (target == null) target = globalThis;
   if (callback == null) return;
   const isFunction = typeof callback === 'function';
   if (!isFunction && typeof callback.handleEvent !== 'function') return;
@@ -51,6 +52,7 @@ function _eventTargetListenersFor(target, type) {
   return (byType.get(String(type)) || []).slice();
 }
 function _eventTargetRemove(target, type, callback, options) {
+  if (target == null) target = globalThis;
   if (target == null) target = globalThis;
   const byType = _eventTargetListeners.get(target);
   if (!byType) return;

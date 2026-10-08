@@ -7526,9 +7526,9 @@ mod tests {
         // this depth; the Chrome-critical surfaces are depth1 and the protos.
         assert_eq!(
             result["depth2"],
-            serde_json::json!(["addEventListener", "removeEventListener",
-                "dispatchEvent", "f", "s", "t"]),
-            "the WindowProperties level carries the named accessors and the realm-targeting methods",
+            serde_json::json!(["f", "s", "t"]),
+            "the WindowProperties level carries only the named-element accessors; \
+the event methods resolve through EventTarget.prototype",
         );
         assert_eq!(
             result["namedReadable"],

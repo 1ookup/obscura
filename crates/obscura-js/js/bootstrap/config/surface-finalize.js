@@ -2667,26 +2667,16 @@ try {
       }
     }
   } catch (_) {}
-  // The three EventTarget methods ride the WindowProperties level, not
-  // Window.prototype: Chromium's Window.prototype answers exactly
-  // [TEMPORARY, PERSISTENT, constructor] (measured 2026-10-08). They keep
-  // their realm-targeting wrappers (a bare strict-mode call can arrive with
-  // an undefined receiver; the level's accessors are called with the global
-  // as receiver in every resolution path).
-  const levelHolder = typeof _windowPropertiesLevel === 'function'
-    ? _windowPropertiesLevel() : globalThis.Window.prototype;
+  // The three EventTarget methods stay off BOTH Window.prototype and the
+  // WindowProperties level: Chromium's Window.prototype answers exactly
+  // [TEMPORARY, PERSISTENT, constructor] (measured 2026-10-08) and its
+  // WindowProperties.prototype is own-empty (named properties served
+  // dynamically). The core bootstrap mints realm-own copies; delete them in
+  // every realm so the window resolves the methods through EventTarget.
+  // prototype; the shared listener helpers default an undefined receiver
+  // (bare strict-mode calls) to this realm's global.
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
-    const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
-    if (!descriptor || typeof descriptor.value !== 'function') continue;
-    try { delete globalThis[name]; } catch (_) { continue; }
-    const method = name === 'addEventListener'
-      ? function addEventListener(type, fn) { return _eventTargetAdd(globalThis, type, fn, arguments[2]); }
-      : name === 'removeEventListener'
-        ? function removeEventListener(type, fn) { return _eventTargetRemove(globalThis, type, fn, arguments[2]); }
-        : function dispatchEvent(event) { return _eventTargetDispatch(globalThis, event); };
-    Object.defineProperty(levelHolder, name, {
-      value: _markNative(method), writable: true, enumerable: true, configurable: true,
-    });
+    try { delete globalThis[name]; } catch (_) {}
   }
 })();
 

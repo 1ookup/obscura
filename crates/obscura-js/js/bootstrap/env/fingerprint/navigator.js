@@ -105,8 +105,35 @@ globalThis.navigator = _bootstrapObject('navigator', () => ({
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   connection: new NetworkInformation(_networkInformationKey),
-  bluetooth: globalThis.bluetooth,
-  serial: globalThis.serial,
+  bluetooth: {
+    getAvailability: _markNativeAs(function getAvailability() { return Promise.resolve(false); },
+      'function getAvailability() { [native code] }'),
+    getDevices: _markNativeAs(function getDevices() { return Promise.resolve([]); },
+      'function getDevices() { [native code] }'),
+    addEventListener: _markNativeAs(function addEventListener() {},
+      'function addEventListener() { [native code] }'),
+    removeEventListener: _markNativeAs(function removeEventListener() {},
+      'function removeEventListener() { [native code] }'),
+    dispatchEvent: _markNativeAs(function dispatchEvent() { return true; },
+      'function dispatchEvent() { [native code] }'),
+    [Symbol.toStringTag]: 'Bluetooth',
+  },
+  serial: {
+    getPorts: _markNativeAs(function getPorts() { return Promise.resolve([]); },
+      'function getPorts() { [native code] }'),
+    requestPort: _markNativeAs(function requestPort() {
+      return Promise.reject(new DOMException(
+        'Failed to execute \'requestPort\' on \'Serial\': No port selected by the user.',
+        'NotFoundError'));
+    }, 'function requestPort() { [native code] }'),
+    addEventListener: _markNativeAs(function addEventListener() {},
+      'function addEventListener() { [native code] }'),
+    removeEventListener: _markNativeAs(function removeEventListener() {},
+      'function removeEventListener() { [native code] }'),
+    dispatchEvent: _markNativeAs(function dispatchEvent() { return true; },
+      'function dispatchEvent() { [native code] }'),
+    [Symbol.toStringTag]: 'Serial',
+  },
   pdfViewerEnabled: true,
   userAgentData: _bootstrapObject('navigator.userAgentData', () => ({
     get mobile() { return !!_fingerprint().mobile; },
@@ -381,39 +408,7 @@ globalThis.chrome = {
 // navigator.bluetooth / navigator.serial: the interface shapes a headless
 // host can answer honestly (Chromium 149: Bluetooth.getAvailability ->
 // Promise<boolean>, Serial.getPorts -> Promise<[]>, both EventTargets).
-globalThis.bluetooth = {
-  getAvailability: _markNativeAs(function getAvailability() { return Promise.resolve(false); },
-    'function getAvailability() { [native code] }'),
-  getDevices: _markNativeAs(function getDevices() { return Promise.resolve([]); },
-    'function getDevices() { [native code] }'),
-  addEventListener: _markNativeAs(function addEventListener() {},
-    'function addEventListener() { [native code] }'),
-  removeEventListener: _markNativeAs(function removeEventListener() {},
-    'function removeEventListener() { [native code] }'),
-  dispatchEvent: _markNativeAs(function dispatchEvent() { return true; },
-    'function dispatchEvent() { [native code] }'),
-};
-Object.defineProperty(globalThis.bluetooth, Symbol.toStringTag, {
-  value: 'Bluetooth', configurable: true,
-});
-globalThis.serial = {
-  getPorts: _markNativeAs(function getPorts() { return Promise.resolve([]); },
-    'function getPorts() { [native code] }'),
-  requestPort: _markNativeAs(function requestPort() {
-    return Promise.reject(new DOMException(
-      'Failed to execute \'requestPort\' on \'Serial\': No port selected by the user.',
-      'NotFoundError'));
-  }, 'function requestPort() { [native code] }'),
-  addEventListener: _markNativeAs(function addEventListener() {},
-    'function addEventListener() { [native code] }'),
-  removeEventListener: _markNativeAs(function removeEventListener() {},
-    'function removeEventListener() { [native code] }'),
-  dispatchEvent: _markNativeAs(function dispatchEvent() { return true; },
-    'function dispatchEvent() { [native code] }'),
-};
-Object.defineProperty(globalThis.serial, Symbol.toStringTag, {
-  value: 'Serial', configurable: true,
-});
+
 
 globalThis.Notification = class Notification extends EventTarget {
   static permission = "default";
