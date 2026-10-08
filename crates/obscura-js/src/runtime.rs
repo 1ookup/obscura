@@ -7529,6 +7529,59 @@ mod tests {
     /// and the UNMASKED adapter strings stay behind WEBGL_debug_renderer_info
     /// (null until the extension is enabled, fingerprint values after). The
     /// ddiv valuediff B4 hash input is exactly this parameter serialization.
+    /// WebGLShader/WebGLProgram are inert interface instances: JSON and
+    /// own-key reflection answer nothing, the compile/link lifecycle reads
+    /// work through getShaderParameter/getProgramParameter, and
+    /// getShaderSource round-trips the source (the ddiv valuediff B5 catch
+    /// was a {type,source,compiled} literal serializing as shaderSource
+    /// call args where Chrome's shader object serializes to {}).
+    #[tokio::test(flavor = "current_thread")]
+    async fn webgl_shader_objects_serialize_to_an_empty_surface() {
+        let mut rt = setup_secure_runtime("<html><body><canvas id=c></canvas></body></html>");
+        rt.evaluate("globalThis.__obscura_webgl_enabled = true;").unwrap();
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.getElementById('c').getContext('webgl');
+                    const shader = gl.createShader(gl.FRAGMENT_SHADER);
+                    const preCompiled = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+                    gl.shaderSource(shader, 'precision highp float;');
+                    gl.compileShader(shader);
+                    const compiled = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+                    const program = gl.createProgram();
+                    gl.attachShader(program, shader);
+                    gl.linkProgram(program);
+                    const linkStatus = gl.getProgramParameter(program, gl.LINK_STATUS);
+                    return JSON.stringify({
+                        shaderJson: JSON.stringify(shader),
+                        shaderOwn: Object.getOwnPropertyNames(shader),
+                        programJson: JSON.stringify(program),
+                        programOwn: Object.getOwnPropertyNames(program),
+                        preCompiled, compiled, linkStatus,
+                        source: gl.getShaderSource(shader),
+                        illegalCtor: (() => { try { new WebGLShader(); return false; } catch (e) { return true; } })(),
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let result: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "shaderJson": "{}",
+                "shaderOwn": [],
+                "programJson": "{}",
+                "programOwn": [],
+                "preCompiled": false,
+                "compiled": true,
+                "linkStatus": true,
+                "source": "precision highp float;",
+                "illegalCtor": true,
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn webgl1_context_answers_null_for_webgl2_only_parameters() {
         let mut rt = setup_secure_runtime("<html><body><canvas id=c></canvas></body></html>");

@@ -421,6 +421,17 @@ function _webglCompressedTextureAstc() {
   });
 }
 
+const _webglShaderState = new WeakMap();
+const _webglProgramState = new WeakMap();
+
+globalThis.WebGLShader = class WebGLShader {
+  constructor() { throw new TypeError("Failed to construct 'WebGLShader': Illegal constructor"); }
+  get [Symbol.toStringTag]() { return 'WebGLShader'; }
+};
+globalThis.WebGLProgram = class WebGLProgram {
+  constructor() { throw new TypeError("Failed to construct 'WebGLProgram': Illegal constructor"); }
+  get [Symbol.toStringTag]() { return 'WebGLProgram'; }
+};
 class _WebGLContext {
   constructor(canvas, isWebGL2, attrs) {
     this.canvas = canvas; _hset(this, "_isWebGL2", !!isWebGL2); this.drawingBufferWidth = canvas.width; this.drawingBufferHeight = canvas.height;
@@ -542,15 +553,45 @@ class _WebGLContext {
     this._extensions.set(key, value);
     return value;
   }
-  createShader(type) { return { type, source: '', compiled: true }; }
-  shaderSource(shader, source) { if (shader) shader.source = String(source); }
-  compileShader(shader) { if (shader) shader.compiled = true; }
-  getShaderParameter(shader, pname) { return pname === 0x8B81 ? !!shader?.compiled : null; }
+  // Shader/program objects are inert interface instances: state lives in
+  // realm-side maps, never on the object (Chromium 149: JSON and own-key
+  // reflection of a WebGLShader/WebGLProgram answer {}; the ddiv valuediff
+  // B5 catch was a {type,source,compiled} literal serializing as call args).
+  createShader(type) {
+    const shader = Object.create(globalThis.WebGLShader.prototype);
+    _webglShaderState.set(shader, { type: +type || 0, source: '', compiled: false });
+    return shader;
+  }
+  shaderSource(shader, source) {
+    const st = shader && _webglShaderState.get(shader);
+    if (st) st.source = String(source);
+  }
+  compileShader(shader) {
+    const st = shader && _webglShaderState.get(shader);
+    if (st) st.compiled = true;
+  }
+  getShaderParameter(shader, pname) {
+    const st = shader && _webglShaderState.get(shader);
+    return pname === 0x8B81 ? !!(st && st.compiled) : null;
+  }
   getShaderInfoLog() { return ''; }
-  createProgram() { return { shaders: [], linked: true }; }
-  attachShader(program, shader) { if (program && shader) program.shaders.push(shader); }
-  linkProgram(program) { if (program) program.linked = true; }
-  getProgramParameter(program, pname) { return pname === 0x8B82 ? !!program?.linked : null; }
+  createProgram() {
+    const program = Object.create(globalThis.WebGLProgram.prototype);
+    _webglProgramState.set(program, { shaders: [], linked: false });
+    return program;
+  }
+  attachShader(program, shader) {
+    const st = program && _webglProgramState.get(program);
+    if (st) st.shaders.push(shader);
+  }
+  linkProgram(program) {
+    const st = program && _webglProgramState.get(program);
+    if (st) st.linked = true;
+  }
+  getProgramParameter(program, pname) {
+    const st = program && _webglProgramState.get(program);
+    return pname === 0x8B82 ? !!(st && st.linked) : null;
+  }
   getProgramInfoLog() { return ''; }
   useProgram() {} getAttribLocation() { return 0; } getUniformLocation() { return {}; }
   viewport() {} clearColor() {} clear() {} enable() {} disable() {} drawArrays() {} drawElements() {} flush() {} finish() {}
@@ -635,7 +676,10 @@ class _WebGLContext {
   getActiveAttrib() { return null; }
   getActiveUniform() { return null; }
   getAttachedShaders() { return []; }
-  getShaderSource(shader) { return shader ? shader.source : null; }
+  getShaderSource(shader) {
+    const st = shader && _webglShaderState.get(shader);
+    return st ? st.source : null;
+  }
   getUniformBlockIndex() { return 0xFFFFFFFF; }
   getFragDataLocation() { return -1; }
   createFramebuffer() { return {}; }
