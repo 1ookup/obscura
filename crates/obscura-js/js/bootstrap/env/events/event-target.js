@@ -236,6 +236,7 @@ function _withLegacyWindowEvent(event, callback) {
   try { return callback(); } finally { _legacyWindowEvent = previous; }
 }
 function _eventTargetDispatch(target, event) {
+  if (target == null) target = globalThis;
   const previous = _legacyWindowEvent;
   _legacyWindowEvent = event;
   try {

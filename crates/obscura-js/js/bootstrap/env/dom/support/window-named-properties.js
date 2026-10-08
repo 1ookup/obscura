@@ -64,22 +64,41 @@ function _windowNamedValue(name) {
   if (matches.length === 0) return undefined;
   if (matches.length > 1) return _htmlCollectionFrom(matches);
   const element = matches[0];
-  return element.localName === 'iframe' && element.contentWindow
-    ? element.contentWindow
-    : element;
+  if (element.localName === 'iframe') {
+    // Chrome answers the frame's WindowProxy -- never the element, and never
+    // a throw for a not-yet-realized frame. The proxy helper materializes
+    // the realm facade when the contentWindow getter cannot.
+    try {
+      const win = element.contentWindow;
+      if (win) return win;
+    } catch (_error) {}
+    try {
+      const nid = element[Symbol.for('obscura.nid')];
+      if (nid && typeof _frameWindowProxyFor === 'function') {
+        return _frameWindowProxyFor(element);
+      }
+    } catch (_error) {}
+  }
+  return element;
 }
 
+// Named properties are served dynamically through the WindowProperties
+// prototype level (the proxy consults the live document tree per read), so
+// unlike the old per-name accessor install there is nothing to define on
+// Window.prototype -- whose own surface stays byte-equal to Chrome's
+// (TEMPORARY/PERSISTENT/constructor only, measured Chromium 149). The set
+// keeps the name bookkeeping the reconcile/page-init callers rely on.
 function _ensureWindowNamedProperty(name) {
   name = String(name || '');
   if (!name || _windowNamedPropertyNames.has(name)) return;
   if (Object.prototype.hasOwnProperty.call(globalThis, name)) return;
-  const holder = globalThis.Window?.prototype || Object.getPrototypeOf(globalThis);
-  if (!holder || Object.prototype.hasOwnProperty.call(holder, name)) return;
+  const level = _windowPropertiesLevel();
+  if (!level || Object.prototype.hasOwnProperty.call(level, name)) return;
   try {
     // Installed lazily per named element at arbitrary page times, long after
     // the finalize sweeps, so the accessor carries its own mark. Chrome
     // renders the WebIDL accessor as "function get <name>() { [native code] }".
-    Object.defineProperty(holder, name, {
+    Object.defineProperty(level, name, {
       get: _markNativeAs(function () { return _windowNamedValue(name); },
         'function get ' + name + '() { [native code] }'),
       configurable: true, enumerable: false,
@@ -90,9 +109,38 @@ function _ensureWindowNamedProperty(name) {
 function _reconcileWindowNamedProperty(name) {
   if (!_windowNamedPropertyNames.has(name)) return;
   if (_windowNamedCandidates(name).length !== 0) return;
-  const holder = globalThis.Window?.prototype || Object.getPrototypeOf(globalThis);
-  try { if (holder) delete holder[name]; } catch (_error) {}
+  const level = _windowPropertiesLevelInstance;
+  try { if (level) delete level[name]; } catch (_error) {}
   _windowNamedPropertyNames.delete(name);
+}
+
+// The WindowProperties prototype level: sits between Window.prototype and
+// EventTarget.prototype, exactly where Chromium's chain has it (window ->
+// Window.prototype -> WindowProperties.prototype -> EventTarget.prototype ->
+// Object.prototype; the level's own surface is empty -- named properties are
+// answered dynamically, invisible to getOwnPropertyNames at every level).
+// The iframe candidate returns the frame's WindowProxy; a frame whose
+// content window is not realized yet answers its element instead of
+// throwing (reading window.<iframe id> used to throw here).
+// A plain prototype object, not a proxy: a trapped `has` on the global's
+// prototype chain participates in V8 global declaration resolution and flips
+// strict-mode undeclared assignments (the secondary-realm test caught it).
+// Named accessors are defined per name on this level; unregistered names stay
+// invisible, so global binding semantics are untouched.
+let _windowPropertiesLevelInstance = null;
+function _windowPropertiesLevel() {
+  if (_windowPropertiesLevelInstance) return _windowPropertiesLevelInstance;
+  // A plain prototype object: a proxy here (even get-only) participates in V8
+  // global declaration resolution and flips strict-mode undeclared assignments
+  // (the secondary-realm test caught it). Named accessors are defined per name
+  // on this level instead of Window.prototype, so Window.prototype's own
+  // surface stays the Chrome 149 three-member set; the level accumulates the
+  // page's named elements where Chromium answers them dynamically -- a bounded,
+  // known divergence at exactly one depth.
+  const level = Object.create(globalThis.EventTarget.prototype);
+  _windowPropertiesLevelInstance = level;
+  Object.setPrototypeOf(globalThis.Window.prototype, level);
+  return level;
 }
 function _windowNamedNamesInTree(root) {
   const names = new Set();

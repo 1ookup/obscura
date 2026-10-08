@@ -2266,6 +2266,31 @@ const _navigatorMemberLengths = {
   }
 })();
 
+// Math.sumPrecise (proposal-math-sum, shipped in the reference V8): sums an
+// iterable of Numbers; only Number elements are accepted, empty answers -0.
+// The vendored V8 predates it (test262 SKIPs), so the surface is filled here
+// with the native-marked shape and the straightforward accumulation.
+if (typeof Math.sumPrecise !== 'function') {
+  Math.sumPrecise = _markNativeAs(function sumPrecise(items) {
+    if (arguments.length === 0) {
+      throw new TypeError("Math.sumPrecise requires that an iterable be not null or undefined");
+    }
+    let sum = -0;
+    let carries = 0;
+    for (const item of items) {
+      if (typeof item !== 'number') {
+        throw new TypeError("Math.sumPrecise: items of the iterable must be all numbers");
+      }
+      const total = sum + item;
+      if (Number.isFinite(sum) && Number.isFinite(item)) {
+        carries += (sum - total) + item;
+      }
+      sum = total;
+    }
+    return carries ? sum + carries : sum;
+  }, 'function sumPrecise() { [native code] }');
+}
+
 // A navigator object member is a WebIDL interface instance, not a plain object.
 // Its prototype is the interface prototype, the IDL operations are that
 // prototype's own members, and both `constructor.name` and
@@ -2618,23 +2643,38 @@ const _navigatorMemberLengths = {
   accessor('closed', function() { return false; }, null);
   try {
     if (globalThis.EventTarget?.prototype) {
-      Object.setPrototypeOf(globalThis.Window.prototype, globalThis.EventTarget.prototype);
+      // The prototype chain mirrors Chromium's: Window.prototype ->
+      // WindowProperties.prototype (named properties, dynamic) ->
+      // EventTarget.prototype -> Object.prototype. The extra level is
+      // observable -- a getPrototypeOf walk answers 5 objects, and
+      // Window.prototype's own surface stays the 3-member Chrome set.
+      if (typeof _windowPropertiesLevel === 'function') {
+        // Wire through the WindowProperties level; the factory is idempotent
+        // and owns the Window.prototype -> level -> EventTarget chain.
+        Object.setPrototypeOf(globalThis.Window.prototype, _windowPropertiesLevel());
+      } else {
+        Object.setPrototypeOf(globalThis.Window.prototype, globalThis.EventTarget.prototype);
+      }
     }
   } catch (_) {}
+  // The three EventTarget methods ride the WindowProperties level, not
+  // Window.prototype: Chromium's Window.prototype answers exactly
+  // [TEMPORARY, PERSISTENT, constructor] (measured 2026-10-08). They keep
+  // their realm-targeting wrappers (a bare strict-mode call can arrive with
+  // an undefined receiver; the level's accessors are called with the global
+  // as receiver in every resolution path).
+  const levelHolder = typeof _windowPropertiesLevel === 'function'
+    ? _windowPropertiesLevel() : globalThis.Window.prototype;
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
     const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
     if (!descriptor || typeof descriptor.value !== 'function') continue;
     try { delete globalThis[name]; } catch (_) { continue; }
-    // A bare call in a strict page script can arrive with an undefined
-    // receiver. The Window methods therefore target this realm explicitly,
-    // while DOM EventTargets continue using EventTarget.prototype's receiver-aware
-    // implementations.
     const method = name === 'addEventListener'
       ? function addEventListener(type, fn) { return _eventTargetAdd(globalThis, type, fn, arguments[2]); }
       : name === 'removeEventListener'
         ? function removeEventListener(type, fn) { return _eventTargetRemove(globalThis, type, fn, arguments[2]); }
         : function dispatchEvent(event) { return _eventTargetDispatch(globalThis, event); };
-    Object.defineProperty(globalThis.Window.prototype, name, {
+    Object.defineProperty(levelHolder, name, {
       value: _markNative(method), writable: true, enumerable: true, configurable: true,
     });
   }

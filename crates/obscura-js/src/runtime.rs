@@ -7479,6 +7479,104 @@ mod tests {
     /// empty while the buffered observer receives all of them, and 'first-input'
     /// is the opposite (one global entry). The surplus here was the challenge
     /// context's ~2x performance-entry count (valuediff B2 companion finding).
+    /// The Window prototype chain mirrors Chromium's five levels -- window /
+    /// Window.prototype (TEMPORARY/PERSISTENT/constructor only) /
+    /// WindowProperties.prototype (named properties, dynamic, empty own
+    /// surface) / EventTarget.prototype / Object.prototype -- and named
+    /// elements answer through the chain without leaking their ids onto
+    /// Window.prototype (a page with id=f/s/t elements used to mint f/s/t
+    /// accessors there, and the iframe accessor threw on read).
+    #[tokio::test(flavor = "current_thread")]
+    async fn window_properties_level_carries_named_elements_off_the_prototype() {
+        let mut rt = setup_secure_runtime(
+            "<html><body><iframe id=f></iframe><svg id=s></svg><span id=t>x</span></body></html>",
+        );
+        rt.evaluate("globalThis.__obscura_webgl_enabled = true;").unwrap();
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const chain = [];
+                    let o = globalThis;
+                    while (o) { chain.push(Object.getOwnPropertyNames(o)); o = Object.getPrototypeOf(o); }
+                    return JSON.stringify({
+                        depth1: chain[1],
+                        depth2: chain[2],
+                        depth3: chain[3],
+                        depth1HasNamed: chain[1].includes('f') || chain[1].includes('s') || chain[1].includes('t'),
+                        namedReadable: [
+                            typeof window.f, typeof window.s, typeof window.t,
+                        ],
+                        fNotTheElement: window.f !== document.getElementById('f'),
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let result: serde_json::Value = match result.as_str() {
+            Some(s) => serde_json::from_str(s).unwrap(),
+            None => serde_json::json!({"nonString": format!("{:?}", result)}),
+        };
+        assert_eq!(
+            result["depth1"],
+            serde_json::json!(["constructor", "TEMPORARY", "PERSISTENT"]),
+            "Window.prototype carries only the Chrome 149 three-member set",
+        );
+        // The level carries the named accessors (f/s/t) plus the three
+        // realm-targeting EventTarget wrappers where Chromium serves them
+        // dynamically/prototypally -- a bounded, known divergence at exactly
+        // this depth; the Chrome-critical surfaces are depth1 and the protos.
+        assert_eq!(
+            result["depth2"],
+            serde_json::json!(["addEventListener", "removeEventListener",
+                "dispatchEvent", "f", "s", "t"]),
+            "the WindowProperties level carries the named accessors and the realm-targeting methods",
+        );
+        assert_eq!(
+            result["namedReadable"],
+            serde_json::json!(["object", "object", "object"]),
+            "named elements answer through the chain without throwing"
+        );
+        assert_eq!(
+            result["fNotTheElement"],
+            serde_json::json!(true),
+            "the iframe named accessor answers the frame's WindowProxy, not the element"
+        );
+    }
+
+    /// Math.sumPrecise: the reference V8's iterable sum (Chromium 149 has it,
+    /// the vendored V8 predates it). Numbers only; empty answers -0; the
+    /// low-entropy set of Math members otherwise stays as the intrinsics ship.
+    #[tokio::test(flavor = "current_thread")]
+    async fn math_sum_precise_sums_numbers_and_rejects_non_numbers() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const out = {};
+                    out.basic = Math.sumPrecise([1, 2, 3]);
+                    out.empty = Object.is(Math.sumPrecise([]), -0) ? 'negzero' : 'other';
+                    out.name = Math.sumPrecise.name;
+                    out.length = Math.sumPrecise.length;
+                    out.throwed = (() => { try { Math.sumPrecise([1, 'x']); return 'no'; } catch (e) { return e.constructor.name; } })();
+                    out.iterable = Math.sumPrecise(new Set([0.1, 0.2]));
+                    return JSON.stringify(out);
+                })()"#,
+            )
+            .unwrap();
+        let result: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "basic": 6,
+                "empty": "negzero",
+                "name": "sumPrecise",
+                "length": 1,
+                "throwed": "TypeError",
+                "iterable": 0.30000000000000004,
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn event_timing_entries_stay_out_of_the_global_timeline() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");
@@ -36718,8 +36816,8 @@ mod secure_context_navigator_gate_probe {
         assert_eq!(f["stillCallable"], serde_json::json!(true),
             "the methods stay reachable through the prototype chain");
         assert_eq!(f["onWindowProto"],
-            serde_json::json!(["addEventListener", "dispatchEvent", "removeEventListener"]),
-            "the three methods ride Window.prototype; `when` rides EventTarget.prototype");
+            serde_json::json!([]),
+            "Window.prototype stays free of the EventTarget surface (Chromium 149: Window.prototype own = TEMPORARY/PERSISTENT/constructor only; the methods and `when` ride EventTarget.prototype)");
         let main = rt.evaluate(
             r#"(() => {
                 const four = ['addEventListener', 'dispatchEvent',
