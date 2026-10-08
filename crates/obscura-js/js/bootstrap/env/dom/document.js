@@ -741,7 +741,21 @@ var Document = _swappableInterface('Document', class extends Node {
     return new NodeIterator(_nodeIteratorKey, root, whatToShow, filter);
   }
   getSelection() { return this.defaultView ? _selectionFor(this) : null; }
-  get activeElement() { return globalThis[_inputFocusedSym] || this.body; }
+  get activeElement() {
+    // Chrome retargets focus across shadow boundaries: a focused element
+    // inside a shadow tree reports its shadow HOST at the document level, so
+    // a checkbox inside a closed shadow root hanging off <body> reads as
+    // body. The raw element stays visible only to ShadowRoot.activeElement.
+    let node = globalThis[_inputFocusedSym] || this.body;
+    const seen = new Set();
+    while (node && !seen.has(node)) {
+      seen.add(node);
+      const root = typeof node.getRootNode === 'function' ? node.getRootNode() : null;
+      if (!root || !root.host) break;
+      node = root.host;
+    }
+    return node;
+  }
   // The element that scrolls the viewport, and where the page offset lives
   // (issue #468). Standards mode, so documentElement — quirks mode would be
   // body, but we never parse in quirks mode.

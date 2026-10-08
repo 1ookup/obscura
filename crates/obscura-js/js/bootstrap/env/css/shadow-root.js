@@ -69,7 +69,22 @@ globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
   getRootNode(options) {
     return options?.composed ? this._host.getRootNode(options) : this;
   }
-  get activeElement() { return null; }
+  get activeElement() {
+    // Chrome scopes focus reporting to this tree: the raw focused element
+    // when it lives under this root, the host of a deeper tree when focus
+    // sits further down, and null when focus is outside entirely.
+    let current = globalThis[_inputFocusedSym];
+    if (!current) return null;
+    const seen = new Set();
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const root = typeof current.getRootNode === 'function' ? current.getRootNode() : null;
+      if (root === this) return current;
+      if (!root || !root.host) return null;
+      current = root.host;
+    }
+    return null;
+  }
   get styleSheets() {
     if (!this[_styleSheetListSym]) this[_styleSheetListSym] = new StyleSheetList(this);
     return this[_styleSheetListSym];
