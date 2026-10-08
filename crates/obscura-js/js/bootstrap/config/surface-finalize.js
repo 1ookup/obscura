@@ -2291,6 +2291,16 @@ if (typeof Math.sumPrecise !== 'function') {
   }, 'function sumPrecise() { [native code] }');
 }
 
+// Boot-order cover: realms whose surface landed before the SpeechSynthesis
+// interface prototype existed carry the members as instance owns; the hoist
+// is idempotent and moves them to the prototype (census P0-4).
+try {
+  if (typeof _installSpeechSynthesisPrototypeMembers === 'function'
+      && typeof globalThis.speechSynthesis === 'object' && globalThis.speechSynthesis) {
+    _installSpeechSynthesisPrototypeMembers(globalThis.speechSynthesis);
+  }
+} catch (_error) {}
+
 // A navigator object member is a WebIDL interface instance, not a plain object.
 // Its prototype is the interface prototype, the IDL operations are that
 // prototype's own members, and both `constructor.name` and
