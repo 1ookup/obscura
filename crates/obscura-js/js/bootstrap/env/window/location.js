@@ -193,6 +193,7 @@ function _ancestorOriginsList(ownRootNid) {
 }
 let _locationObj;
 const _ancestorOriginsCache = new WeakMap();
+const _locationProto = { valueOf() { return this; } };
 function registerLocationSurface() {
 globalThis.location = _bootstrapObject('location', () => ({
   // [SameObject]: every read returns the same list instance; the WeakMap
@@ -235,6 +236,10 @@ Object.defineProperty(globalThis, 'Location', {
 });
 _markNative(Location);
 Object.setPrototypeOf(_locationObj, Location.prototype);
+// Chrome carries Location.prototype.valueOf returning the location object
+// itself (a Location.prototype member, not an own of the instance).
+Location.prototype.valueOf = _markNativeAs(function valueOf() { return this; },
+  'function valueOf() { [native code] }');
 }
 
 registerLocationSurface();
