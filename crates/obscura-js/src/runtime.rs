@@ -7523,6 +7523,55 @@ mod tests {
         );
     }
 
+    /// A WebGL1 context answers null for the WebGL2-only parameter enums
+    /// (uniform blocks, transform feedback, draw buffers, combined component
+    /// counts -- Chromium 149 measured null for each over a 50-enum census),
+    /// and the UNMASKED adapter strings stay behind WEBGL_debug_renderer_info
+    /// (null until the extension is enabled, fingerprint values after). The
+    /// ddiv valuediff B4 hash input is exactly this parameter serialization.
+    #[tokio::test(flavor = "current_thread")]
+    async fn webgl1_context_answers_null_for_webgl2_only_parameters() {
+        let mut rt = setup_secure_runtime("<html><body><canvas id=c></canvas></body></html>");
+        rt.evaluate("globalThis.__obscura_webgl_enabled = true;").unwrap();
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const gl = document.getElementById('c').getContext('webgl');
+                    const read = e => gl.getParameter(e);
+                    const before = [read(0x9245), read(0x9246)];
+                    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+                    const after = ext ? [gl.getParameter(ext.UNMASKED_VENDOR_WEBGL),
+                                         gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)] : null;
+                    return JSON.stringify({
+                        webgl2Only: [
+                            read(0x8824), read(0x8A2B), read(0x8A2D), read(0x8A2E),
+                            read(0x8A2F), read(0x8A30), read(0x8A31), read(0x8A33),
+                            read(0x8A34), read(0x8B49), read(0x8B4A), read(0x8B4B),
+                            read(0x8C80), read(0x8C8A), read(0x8C8B),
+                        ],
+                        before, after,
+                        extCount: gl.getSupportedExtensions().length,
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let result: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "webgl2Only": [null, null, null, null, null, null, null,
+                               null, null, null, null, null, null, null, null],
+                "before": [null, null],
+                "after": ["Google Inc. (Apple)",
+                          "ANGLE (Apple, ANGLE Metal Renderer: Apple Paravirtual device, Unspecified Version)"],
+                "extCount": gl_ext_count(),
+            })
+        );
+    }
+
+    fn gl_ext_count() -> usize { 39 }
+
     #[tokio::test(flavor = "current_thread")]
     async fn webgpu_objects_json_to_an_empty_own_surface() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");

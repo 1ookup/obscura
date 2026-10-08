@@ -41,6 +41,11 @@ const _WEBGL2_EXTENSIONS = [
 ];
 // Every value a desktop ANGLE/D3D11 context reports. Shared by both context
 // versions; the WebGL 2 table below adds the ES 3.0 names on top.
+// WebGL2-only enums (uniform blocks, transform feedback, draw buffers,
+// combined component counts) are NOT answered here: Chromium 149 answers null
+// for each of them in a webgl1 context (measured 2026-10-08 over a 50-enum
+// census; 15 params removed after this exact diff). The webgl2 table carries
+// the values for webgl2 contexts.
 const _WEBGL1_PARAMETERS = {
   0x1F00: 'WebKit',                        // VENDOR
   0x1F01: 'WebKit WebGL',                  // RENDERER
@@ -92,13 +97,8 @@ const _WEBGL1_PARAMETERS = {
   0x84FD: 1,       // TEXTURE_MAX_ANISOTROPY_EXT (default)
   0x87FF: 519,     // transient enum state seen in a real capture
   0x8801: 7680,    // default enum state
-  0x8824: 8,       // MAX_DRAW_BUFFERS
   0x891E: 2048,
   0x8925: 7,
-  0x8A2B: 16, 0x8A2D: 16, 0x8A2E: 32, 0x8A2F: 32,
-  0x8A30: 16384, 0x8A31: 69632, 0x8A33: 69632, 0x8A34: 16,
-  0x8B49: 4096, 0x8B4A: 4096, 0x8B4B: 120,
-  0x8C80: 4, 0x8C8A: 128, 0x8C8B: 4,
   0x8D57: 8,
   0x8D7B: 256,     // UNIFORM_BUFFER_OFFSET_ALIGNMENT (D3D11)
   0x8FC9: false,
@@ -462,8 +462,14 @@ class _WebGLContext {
       if (!this._error) _hset(this, "_error", 0x0500);
       return null;
     }
-    // The adapter strings sit behind WEBGL_debug_renderer_info, never here.
+    // The adapter strings sit behind WEBGL_debug_renderer_info: Chrome answers
+    // null until the extension is enabled (measured: reading 0x9245/0x9246
+    // before getExtension returns null on Chromium 149).
     if (key === 0x9245 || key === 0x9246) {
+      if (!this._extensions.has('WEBGL_debug_renderer_info')) {
+        if (!this._error) _hset(this, "_error", 0x0500);
+        return null;
+      }
       const gpu = _fingerprint().gpu || {};
       return key === 0x9245 ? (gpu.vendor || '') : (gpu.renderer || '');
     }
