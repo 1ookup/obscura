@@ -46,7 +46,8 @@ function _queueEventTiming(event) {
       processingEnd: processingStart,
       cancelable: !!event.cancelable,
     });
-    _queuePerformanceEntry(entry);
+    // Observer-scoped: 'event' entries never join the global timeline.
+    _queueObserverOnlyEntry(entry);
     if (!_firstInputRecorded) {
       _firstInputRecorded = true;
       _queuePerformanceEntry(new PerformanceEventTiming({

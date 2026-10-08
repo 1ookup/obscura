@@ -7473,6 +7473,56 @@ mod tests {
     /// is not a page-visible member at all. The ddiv valuediff B3 catch --
     /// the WGSL source serialized out of createRenderPipeline's descriptor
     /// because the module carried label/code as own enumerable properties.
+    /// Event Timing entries are observer-scoped: they reach PerformanceObservers
+    /// (buffered replay included) but the global timeline answers nothing for
+    /// 'event' -- Chromium 149 measured: three clicks leave getEntriesByType('event')
+    /// empty while the buffered observer receives all of them, and 'first-input'
+    /// is the opposite (one global entry). The surplus here was the challenge
+    /// context's ~2x performance-entry count (valuediff B2 companion finding).
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_timing_entries_stay_out_of_the_global_timeline() {
+        let mut rt = setup_secure_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const seen = [];
+                    new PerformanceObserver(list => {
+                        for (const e of list.getEntries()) seen.push(e.entryType + ':' + e.name);
+                    }).observe({type: 'event', buffered: true});
+                    const click = {type: 'click', isTrusted: true, timeStamp: performance.now(),
+                        cancelable: true};
+                    globalThis.__obscura_queue_event_timing(click);
+                    globalThis.__obscura_queue_event_timing(click);
+                    await Promise.resolve();
+                    return JSON.stringify({
+                        observerSaw: seen,
+                        globalEvent: performance.getEntriesByType('event').length,
+                        globalFirstInput: performance.getEntriesByType('first-input').length,
+                        interactionId: performance.getEntriesByType('first-input')[0]
+                            ? performance.getEntriesByType('first-input')[0].interactionId > 0
+                            : null,
+                    });
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let result: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "observerSaw": ["event:click", "event:click"],
+                "globalEvent": 0,
+                "globalFirstInput": 1,
+                "interactionId": true,
+            })
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn webgpu_objects_json_to_an_empty_own_surface() {
         let mut rt = setup_secure_runtime("<html><body></body></html>");
@@ -31186,6 +31236,14 @@ RequestRedirect value",
                         // Chrome's internal hash order, not alphabetical:
                         // the snapshot serializes in iteration order.
                         firstFive: [...map.keys()].slice(0, 5).join(','),
+                        // Chrome 149: the map instance answers [] to own-key
+                        // reflection (state lives off-object), and Keyboard's
+                        // prototype carries exactly the four interface
+                        // members -- no event methods, Keyboard is not an
+                        // EventTarget.
+                        ownKeys: Object.getOwnPropertyNames(map),
+                        keyboardMembers:
+                            Object.getOwnPropertyNames(Keyboard.prototype).sort(),
                     };
                 }"#,
                 None,
@@ -31206,6 +31264,10 @@ RequestRedirect value",
                 "intlBackslash": "§",
                 "iterates": 48,
                 "firstFive": "KeyK,KeyG,Digit2,Digit0,KeyV",
+                "ownKeys": [],
+                "keyboardMembers": [
+                    "constructor", "getLayoutMap", "lock", "unlock",
+                ],
             })
         );
     }

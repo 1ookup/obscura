@@ -20,6 +20,8 @@ class PerformanceObserver {
     _performanceObservers.add(this);
     if (!hasTypes && options.buffered) {
       for (const entry of _performanceEntries) if (this._types.has(entry.entryType)) this._records.push(entry);
+      // Event Timing entries ride their own observer-scoped buffer.
+      if (this._types.has('event')) for (const entry of _eventTimingBuffer) this._records.push(entry);
       this._schedule();
     }
   }

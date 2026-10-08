@@ -22,6 +22,24 @@ function _queuePerformanceEntry(entry) {
     return entry;
   }
   _performanceEntries.push(entry);
+  return _deliverToObservers(entry);
+}
+
+// Event Timing entries are observer-scoped in Chrome: they reach
+// PerformanceObservers (buffered replay included, capped at 150 like the
+// reference) but never the global timeline -- getEntries()/getEntriesByType
+// answer nothing for 'event' (measured on Chromium 149: 3 clicks yield zero
+// 'event' entries in getEntries while the buffered observer receives all of
+// them; 'first-input' is the opposite and rides the global buffer).
+const _eventTimingBuffer = [];
+const _EVENT_TIMING_BUFFER_MAX = 150;
+function _queueObserverOnlyEntry(entry) {
+  _eventTimingBuffer.push(entry);
+  if (_eventTimingBuffer.length > _EVENT_TIMING_BUFFER_MAX) _eventTimingBuffer.shift();
+  return _deliverToObservers(entry);
+}
+
+function _deliverToObservers(entry) {
   for (const observer of _performanceObservers) {
     if (observer._types.has(entry.entryType)) {
       observer._records.push(entry);
