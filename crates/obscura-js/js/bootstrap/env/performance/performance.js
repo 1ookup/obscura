@@ -139,7 +139,11 @@ Object.defineProperty(Performance.prototype, 'onresourcetimingbufferfull', {
 // (__obscura_document_event_types), so size and get answer what the page
 // actually dispatched rather than a frozen zero.
 const _performanceEventCounts = (() => {
-  const counts = Object.create(null);
+  // The prototype chain must reach Object.prototype: a null-prototype counts
+  // object cannot convert to a primitive (no toString/valueOf), so String()
+  // threw -- the AWZLk9[118] bare-value shape. With Object.prototype the
+  // own toStringTag drives "[object EventCounts]" as on the reference.
+  const counts = Object.create(Object.prototype);
   Object.defineProperty(counts, Symbol.toStringTag, {
     value: 'EventCounts', writable: false, enumerable: false, configurable: true,
   });

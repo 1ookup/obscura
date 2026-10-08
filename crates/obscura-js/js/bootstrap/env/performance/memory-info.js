@@ -30,6 +30,15 @@ Object.defineProperty(_memoryInfoPrototype, Symbol.toStringTag, {
 });
 function _newMemoryInfo() {
   const info = Object.create(_memoryInfoPrototype);
+  // Chromium answers the three heap numbers as OWN data properties of the
+  // MemoryInfo instance (getOwnPropertyNames(performance.memory) = the three
+  // names); the prototype accessors stay for `instanceof`-shaped reads.
+  // defineProperty, not assignment: the prototype carries getter-only
+  // accessors, and the assembled scope is strict (an assignment through a
+  // getter-only accessor would throw).
+  Object.defineProperty(info, 'jsHeapSizeLimit', { value: _memoryInfoBacking.jsHeapSizeLimit });
+  Object.defineProperty(info, 'totalJSHeapSize', { value: _memoryInfoBacking.totalJSHeapSize });
+  Object.defineProperty(info, 'usedJSHeapSize', { value: _memoryInfoBacking.usedJSHeapSize });
   _memoryInfoInstances.add(info);
   return info;
 }

@@ -6955,7 +6955,9 @@ mod tests {
                 "fresh": true,
                 "crossFresh": true,
                 "samePrototype": true,
-                "ownNames": [],
+                "ownNames": [
+                    "jsHeapSizeLimit", "totalJSHeapSize", "usedJSHeapSize"
+                ],
                 "prototypeNames": [
                     "totalJSHeapSize", "usedJSHeapSize", "jsHeapSizeLimit"
                 ],
@@ -7573,6 +7575,41 @@ the event methods resolve through EventTarget.prototype",
                 "length": 1,
                 "throwed": "TypeError",
                 "iterable": 0.30000000000000004,
+            })
+        );
+    }
+
+    /// performance.eventCounts answers [object EventCounts] to String()
+    /// (the AWZLk9[118] bare-{} probe surface), and performance.memory
+    /// carries the three numeric heap fields as own members.
+    #[test]
+    fn event_counts_and_memory_shapes_match_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const out = {};
+                    const str = (x) => { try { return String(x); } catch (e) { return 'THREW:' + (e && e.message); } };
+                    out.eventCountsString = str(performance.eventCounts);
+                    out.eventCountsSize = (() => { try { return typeof performance.eventCounts.size; } catch (e) { return 'THREW'; } })();
+                    out.memoryType = typeof performance.memory;
+                    out.memoryOwn = performance.memory ? Object.getOwnPropertyNames(performance.memory) : null;
+                    out.memoryNumeric = performance.memory ? [typeof performance.memory.usedJSHeapSize,
+                        typeof performance.memory.totalJSHeapSize, typeof performance.memory.jsHeapSizeLimit] : null;
+                    return JSON.stringify(out);
+                })()"#,
+            )
+            .unwrap();
+        let result: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "eventCountsString": "[object EventCounts]",
+                "eventCountsSize": "number",
+                "memoryType": "object",
+                "memoryOwn": ["jsHeapSizeLimit", "totalJSHeapSize", "usedJSHeapSize"],
+                "memoryNumeric": ["number", "number", "number"],
             })
         );
     }
