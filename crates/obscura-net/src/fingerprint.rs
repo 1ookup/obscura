@@ -701,12 +701,12 @@ fn chromium_brands(major: u32, google_chrome: bool, full: bool, full_version: &s
     let version = if full { full_version.to_string() } else { major.to_string() };
     let chromium = BrandVersion { brand: "Chromium".to_string(), version: version.clone() };
     if !google_chrome {
-        // An unbranded Chromium build drops the product brand, leaving the
-        // grease pair and Chromium. Its two-entry branch of GetRandomOrder is
-        // `{seed % 2, (seed + 1) % 2}`, so even majors keep the grease brand
-        // first and odd majors put Chromium first.
-        let seed = major as usize;
-        return shuffle_brands([grease, chromium], [seed % 2, (seed + 1) % 2]);
+        // Measured wire order on the harness majors (149 on the 10-06
+        // reference payload, 154 on the 10-08 chrome-side payload):
+        // Chromium first, grease second, parity-independent. The old
+        // `{seed % 2, (seed + 1) % 2}` scatter branch answered grease first
+        // for even majors -- exactly the StmH7 order divergence.
+        return vec![chromium, grease];
     }
     let chrome = BrandVersion { brand: "Google Chrome".to_string(), version };
     shuffle_brands(
@@ -857,7 +857,9 @@ mod tests {
                 .map(|brand| brand.brand)
                 .collect()
         };
-        assert_eq!(brands(154), ["Not A(Brand", "Chromium"]);
+        // Chromium-first on both parities (measured wire 149/154; the
+        // grease-char selection still rotates with the major).
+        assert_eq!(brands(154), ["Chromium", "Not A(Brand"]);
         assert_eq!(brands(155), ["Chromium", "Not(A:Brand"]);
     }
 
@@ -870,7 +872,7 @@ mod tests {
         assert_eq!(fingerprint.architecture, "x86");
         assert_eq!(fingerprint.gpu.webgpu_profile, "intel");
         // The default derivation is the unbranded two-entry shape on every
-        // platform; 149 (odd) puts Chromium first.
+        // platform; Chromium first on both parities (measured 149 and 154).
         assert_eq!(fingerprint.brands, vec![
             BrandVersion { brand: "Chromium".to_string(), version: "149".to_string() },
             BrandVersion { brand: "Not)A;Brand".to_string(), version: "24".to_string() },
