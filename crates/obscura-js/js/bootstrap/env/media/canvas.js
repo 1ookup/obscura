@@ -1018,12 +1018,46 @@ function _canvas2dPaintStrokeAt(self, px, py) {
     return _canvas2dParseColor(self, stroke);
   }
 
+// The stroked region is measured in the space the CTM maps from, not in the
+// device space the path was flattened in. Path coordinates freeze in device
+// space as they are recorded, so a nib that follows the CTM is held in that
+// other space and the frozen path has to come back through the inverse to
+// meet it. A device space distance test is only the same thing when the CTM
+// is a similarity: under scale(2, 1) the reference nib is one device pixel
+// wide for a vertical line and half a pixel tall for a horizontal one, which
+// no single scalar half width can be. The nib also stops being a rectangle
+// under a shear, and the reference draws the sheared one. Rewrites the
+// subpath points in place and returns the device bounds the nib reaches
+// over them.
+function _canvas2dStrokePen(self, inv, subpaths, half) {
+  const [a, b, c, d] = _canvasStateOf(self).transform;
+  const [ia, ib, ic, id] = inv;
+  // A pen space offset no larger than half on either axis reaches no further
+  // than this in device x and y once the CTM is applied. A cap that extends
+  // along the path reaches no further than a unit direction does, which the
+  // same bound covers.
+  const ex = half * (Math.abs(a) + Math.abs(c));
+  const ey = half * (Math.abs(b) + Math.abs(d));
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const poly of subpaths) {
+    for (const point of poly) {
+      const x = point[0], y = point[1];
+      point[0] = ia * x + ic * y + inv[4];
+      point[1] = ib * x + id * y + inv[5];
+      if (x - ex < minX) minX = x - ex; if (x + ex > maxX) maxX = x + ex;
+      if (y - ey < minY) minY = y - ey; if (y + ey > maxY) maxY = y + ey;
+    }
+  }
+  return [minX, minY, maxX, maxY];
+}
+
 // Whether a coverage sample falls in the stroked region of any subpath. The
 // segment body is the butt ended rectangle, so a sample past an end counts
 // only when something covers that end: an interior vertex, where the two
 // segments meet and the join disc goes, or a subpath end, where the cap goes.
 // The default cap is butt, which stops dead at the end, and a closed subpath
-// has no ends at all.
+// has no ends at all. The subpaths and the sample are both pen space here,
+// see _canvas2dStrokePen, so half is the line width's own half.
 function _canvas2dStrokeHit(subpaths, sx, sy, half, cap) {
     for (const poly of subpaths) {
       const n = poly.length, closed = poly.closed === true;
@@ -2149,16 +2183,23 @@ class _Canvas2D {
     if (!state.path) return;
     const subpaths = _canvas2dFlattenPath(this, 2);
     if (!subpaths.length) return;
-    const half = Math.max(0.5, +state.lineWidth / 2 || 0.5);
+    // No floor under the half width: a CTM that shrinks the nib has to shrink
+    // it here too, and the old half pixel floor was what made a scale(0.384)
+    // stroke come out 2.6 times too wide on the live battery.
+    const half = +state.lineWidth / 2;
     const cap = state.lineCap;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const poly of subpaths) for (const [x, y] of poly) {
-      if (x - half < minX) minX = x - half; if (x + half > maxX) maxX = x + half;
-      if (y - half < minY) minY = y - half; if (y + half > maxY) maxY = y + half;
-    }
+    const inv = _canvas2dTransformInverse(this, null);
+    // The subpaths hold pen space points from here on and the bounds are the
+    // device space ones the nib reaches over, see _canvas2dStrokePen.
+    const [minX, minY, maxX, maxY] = _canvas2dStrokePen(this, inv, subpaths, half);
     const x0 = Math.max(0, Math.floor(minX)), y0 = Math.max(0, Math.floor(minY));
     const x1 = Math.min(state.w - 1, Math.ceil(maxX)), y1 = Math.min(state.h - 1, Math.ceil(maxY));
     const samples = _canvas2dCoverageSamples(this);
+    // The sample grid is the device pixel grid, so its offsets carry the same
+    // inverse through as the points did, linear part only: the translation is
+    // the pixel's own mapping inside the loop.
+    const penSamples = samples.map(([ox, oy]) =>
+      [inv[0] * ox + inv[2] * oy, inv[1] * ox + inv[3] * oy]);
     // Same split as fill(): a live shadow turns the stroke's distance coverage
     // into the looper's mask and the stroke repaints on top of it.
     const shadow = _canvas2dShadowPlan(this, state.strokeStyle);
@@ -2177,9 +2218,11 @@ class _Canvas2D {
     for (let py = my0; py <= my1; py++) {
       const maskRow = mask ? (py - box[1]) * bw - box[0] : 0;
       for (let px = mx0; px <= mx1; px++) {
+        const ux = inv[0] * px + inv[2] * py + inv[4];
+        const uy = inv[1] * px + inv[3] * py + inv[5];
         let inside = 0;
-        for (const [ox, oy] of samples) {
-          if (_canvas2dStrokeHit(subpaths, px + ox, py + oy, half, cap)) inside++;
+        for (const [ox, oy] of penSamples) {
+          if (_canvas2dStrokeHit(subpaths, ux + ox, uy + oy, half, cap)) inside++;
         }
         if (!inside) continue;
         if (mask) { mask[maskRow + px] = inside / samples.length; continue; }

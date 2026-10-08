@@ -25561,6 +25561,47 @@ RequestRedirect value",
         );
     }
 
+    /// The stroked nib is measured in the space the CTM maps from, not in the
+    /// device space the path was flattened in: under scale(2, 1) a vertical
+    /// stroke two pen space units thick covers four device columns, which no
+    /// single device space half width scalar can produce, and under
+    /// scale(0.5, 0.5) a lineWidth of 4 covers exactly two device columns.
+    /// The device space reader the old path used answered two columns for the
+    /// first case and four for the second.
+    #[test]
+    fn canvas_stroke_nib_follows_the_ctm_through_the_inverse() {
+        let mut rt = setup_runtime("<html><body><canvas width=40 height=24></canvas></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const ctx = document.querySelector('canvas').getContext('2d');
+                    const colAlphas = (y, x0, n) => {
+                        const data = ctx.getImageData(x0, y, n, 1).data;
+                        return Array.from({ length: n }, (_, i) => data[i * 4 + 3]);
+                    };
+                    ctx.strokeStyle = 'red';
+                    ctx.lineWidth = 2;
+                    ctx.resetTransform(); ctx.scale(2, 1);
+                    ctx.beginPath(); ctx.moveTo(10, 0); ctx.lineTo(10, 11); ctx.stroke();
+                    const stretchedVertical = colAlphas(5, 16, 8);
+
+                    ctx.resetTransform(); ctx.clearRect(0, 0, 40, 24);
+                    ctx.lineWidth = 4; ctx.scale(0.5, 0.5);
+                    ctx.beginPath(); ctx.moveTo(10, 0); ctx.lineTo(10, 20); ctx.stroke();
+                    const shrunkenVertical = colAlphas(3, 2, 7);
+                    return { stretchedVertical, shrunkenVertical };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "stretchedVertical": [0, 0, 255, 255, 255, 255, 0, 0],
+                "shrunkenVertical": [0, 0, 255, 255, 0, 0, 0],
+            })
+        );
+    }
+
     /// Chrome reads an interface prototype's own keys as members first and
     /// `constructor` last (WebIDL declaration order); the class-shaped
     /// bootstrap interfaces used to read constructor-first, and the bench8
