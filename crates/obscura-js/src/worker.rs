@@ -2812,9 +2812,9 @@ mod tests {
         ).unwrap();
         pump_until(&mut rt, "globalThis.__got.length", &serde_json::json!(1.0)).await;
         // The derived identity is the unbranded two-entry shape on every
-        // platform; 146 (even) keeps the grease brand first.
+        // platform; Chromium first, parity-independent (measured 149/154).
         assert_eq!(rt.evaluate("JSON.stringify(globalThis.__got[0])").unwrap(), serde_json::json!(
-            r#"{"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36","platform":"Linux x86_64","hardwareConcurrency":12,"userAgentData":{"brands":[{"brand":"Not-A.Brand","version":"24"},{"brand":"Chromium","version":"146"}],"mobile":false,"platform":"Linux"}}"#
+            r#"{"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36","platform":"Linux x86_64","hardwareConcurrency":12,"userAgentData":{"brands":[{"brand":"Chromium","version":"146"},{"brand":"Not-A.Brand","version":"24"}],"mobile":false,"platform":"Linux"}}"#
         ));
     }
 
