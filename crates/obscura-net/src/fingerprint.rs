@@ -424,14 +424,16 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
                 device_memory: 16.0,
                 screen: ScreenFingerprint {
                     // The default is the live Chromium 149 baseline host's
-                    // desktop, read out of the gsLi5 reverse table of a real
-                    // passing-round payload (ref-live-r1, 2026-10-06):
-                    // s.width/s.availWidth 1720, s.height 1260,
+                    // desktop: s.width/s.availWidth 1720, s.height 1260,
                     // s.availHeight 1140, s.availTop 30, devicePixelRatio 1,
                     // and the window geometry outerWidth 1720 /
                     // outerHeight 1119 (a windowed window, not maximized:
-                    // outerHeight sits below availHeight) with
-                    // screenY/screenTop 51 and screenX/screenLeft 0.
+                    // outerHeight sits below availHeight). The window
+                    // placement screenX/screenLeft 22 and screenY/screenTop
+                    // 52 is the harness reference window's stable position
+                    // across every round captured 10-06..10-08 (the ddiv
+                    // value-bucket census reads window.screenX into the
+                    // payload; the older 0/51 reading predates it).
                     width: 1720,
                     height: 1260,
                     avail_width: 1720,
@@ -441,8 +443,8 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
                     device_scale_factor: 1.0,
                     outer_width: 1720,
                     outer_height: 1119,
-                    screen_x: 0,
-                    screen_y: 51,
+                    screen_x: 22,
+                    screen_y: 52,
                 },
                 gpu: GpuFingerprint {
                     vendor: "Google Inc. (Apple)".to_string(),
@@ -791,7 +793,7 @@ mod tests {
         assert_eq!(screen.device_scale_factor, 1.0);
         assert_eq!(
             (screen.outer_width, screen.outer_height, screen.screen_x, screen.screen_y),
-            (1720, 1119, 0, 51)
+            (1720, 1119, 22, 52)  /* harness reference window 10-06..10-08 */
         );
     }
 
