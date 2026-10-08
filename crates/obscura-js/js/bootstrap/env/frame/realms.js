@@ -11,6 +11,13 @@
 const _scopedDocs = new Map();
 let _iframeContentDocsSeen = false;
 
+function _scopeInfoFor(doc) {
+  const root = doc && doc[_scopeRootSym];
+  return root !== undefined
+    ? _domParse("document_scope_info", root)
+    : null;
+}
+
 // Same-origin test between a frame content document and the calling realm.
 // The comparison runs in Rust on the typed Origin enum; JS never compares
 // serialized origins (two "null" strings are not same-origin). A nested
@@ -99,7 +106,10 @@ class _ScopedDocument extends Document {
     super(rootNid);
     this[_scopeRootSym] = rootNid;
   }
-  _scopeInfo() { return _domParse("document_scope_info", this[_scopeRootSym]); }
+  // _scopeInfo is a module helper (see _scopeInfoFor), not a prototype
+  // member: a string-keyed method here leaked an internal name into
+  // getOwnPropertyNames of every scoped document's prototype level (the
+  // frame document census caught it next to Chrome's lone `constructor`).
   get title() {
     const t = _internalQuerySelector(this, "title");
     if (!t) return "";
@@ -124,7 +134,7 @@ class _ScopedDocument extends Document {
     // The frame document's own host, not the embedder's: the base class
     // routes non-top documents through the incumbent (top) document.
     if (typeof this[_effectiveDomainSym] === 'string') return this[_effectiveDomainSym];
-    const info = this._scopeInfo();
+    const info = _scopeInfoFor(this);
     if (!info || !info.url) return '';
     if (info.sandboxActive && !info.allowSameOrigin) return '';
     try {
@@ -143,7 +153,7 @@ class _ScopedDocument extends Document {
     this[_effectiveDomainSym] = candidate;
   }
   get compatMode() {
-    const info = this._scopeInfo();
+    const info = _scopeInfoFor(this);
     return info && info.quirks ? "BackCompat" : "CSS1Compat";
   }
   // Editing the whole document is not implemented, but the attribute is not
@@ -152,7 +162,7 @@ class _ScopedDocument extends Document {
   get designMode() { return "off"; }
   set designMode(_value) {}
   get referrer() {
-    const info = this._scopeInfo();
+    const info = _scopeInfoFor(this);
     return (info && info.referrer) || "";
   }
   // Wired by the contentDocument/contentWindow getters; null for a document

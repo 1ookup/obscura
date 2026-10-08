@@ -7680,6 +7680,63 @@ mod tests {
         );
     }
 
+    /// Screen's prototype chain matches Chromium's (Screen.prototype ->
+    /// EventTarget.prototype with the five own members), and the scoped
+    /// frame document's prototype carries no internal helper names (the
+    /// frame-document census caught `_scopeInfo` next to Chrome's lone
+    /// `constructor`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn screen_chain_and_scoped_document_prototype_match_chromium() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.run_event_loop_bounded(20).await.unwrap();
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    document.body.appendChild(document.createElement('iframe')).id = 'f';
+                    document.body.appendChild(Object.assign(document.createElement('b'), {id: 'b'}));
+                    try {
+                    const chain = [];
+                    let o = screen;
+                    while (o) { chain.push(Object.getOwnPropertyNames(o)); o = Object.getPrototypeOf(o); }
+                    const f = document.getElementById('f');
+                    const cd = f.contentDocument;
+                        if (!cd) return JSON.stringify({noContentDocument: true});
+                        const docProto = Object.getOwnPropertyNames(
+                            Object.getPrototypeOf(cd));
+                    const scopedClean = !docProto.includes('_scopeInfo');
+                    return JSON.stringify({
+                        screenL1Len: chain[1].length,
+                        screenL2: chain[2],
+                        scopedDocProtoHead: docProto.slice(0, 4),
+                        scopedClean,
+                    });
+                    } catch (e) { return JSON.stringify({threw: String(e && e.message)}); }
+                })()"#,
+            )
+            .unwrap();
+        println!("SCREEN-CHAIN-RAW={:?}", result);
+        let result: serde_json::Value = match result.as_str() {
+            Some(s) => serde_json::from_str(s).unwrap(),
+            None => serde_json::json!({"nonString": true}),
+        };
+        assert_eq!(
+            result["screenL1Len"],
+            serde_json::json!(12),
+            "Screen.prototype keeps its twelve accessors",
+        );
+        assert_eq!(
+            result["screenL2"],
+            serde_json::json!(["addEventListener", "constructor", "dispatchEvent",
+                "removeEventListener", "when"]),
+            "Screen.prototype sits on the full EventTarget.prototype",
+        );
+        assert_eq!(
+            result["scopedClean"],
+            serde_json::json!(true),
+            "no internal helper names on the scoped document prototype"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn webgl1_context_answers_null_for_webgl2_only_parameters() {
         let mut rt = setup_secure_runtime("<html><body><canvas id=c></canvas></body></html>");

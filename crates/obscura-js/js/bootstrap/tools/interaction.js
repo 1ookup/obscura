@@ -560,8 +560,9 @@ function _documentPrivacyRoot(value, method) {
     throw new TypeError("Failed to execute '" + method + "' on 'Document': Illegal invocation");
   }
   if (value === globalThis.document) return _callingFrameRoot();
-  if (typeof value[_scopeRootSym] === "number" && value._scopeInfo && value._scopeInfo()) {
-    return value[_scopeRootSym];
+  if (typeof value[_scopeRootSym] === "number") {
+    const info = _domParse("document_scope_info", value[_scopeRootSym]);
+    if (info) return value[_scopeRootSym];
   }
   return -1;
 }

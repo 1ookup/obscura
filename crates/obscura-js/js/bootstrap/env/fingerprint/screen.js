@@ -103,15 +103,16 @@ class Screen {
 // enumeration a page can read, so they move onto a base prototype, which leaves
 // `screen.addEventListener` a function (as Chrome's is) without the extra owns.
 if (typeof EventTarget === 'function' && EventTarget.prototype) {
-  var _screenEventBase = Object.create(EventTarget.prototype);
-  ['addEventListener', 'removeEventListener', 'dispatchEvent', 'when'].forEach(function(k) {
-    var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
-    if (d) {
-      Object.defineProperty(_screenEventBase, k, d);
-      delete Screen.prototype[k];
-    }
-  });
-  Object.setPrototypeOf(Screen.prototype, _screenEventBase);
+  // Chrome's Screen.prototype sits directly on EventTarget.prototype, whose
+  // own members are exactly [addEventListener, constructor, dispatchEvent,
+  // removeEventListener, when] (measured Chromium 149) -- no intermediate
+  // base object (one that showed up as a 3-member prototype level in
+  // deep-enumeration censuses).
+  Object.setPrototypeOf(Screen.prototype, EventTarget.prototype);
+  delete Screen.prototype.addEventListener;
+  delete Screen.prototype.removeEventListener;
+  delete Screen.prototype.dispatchEvent;
+  delete Screen.prototype.when;
 }
 globalThis.Screen = Screen;
 globalThis.__obscura_set_screen_override = function(w, h, emulated) {
