@@ -6,6 +6,11 @@ if (typeof globalThis.speechSynthesis === 'undefined') {
   // a plain object, so bind the interface prototype for instanceof parity.
   if (typeof globalThis.SpeechSynthesis === 'function') {
     Object.setPrototypeOf(synth, globalThis.SpeechSynthesis.prototype);
+    // Chromium 149: the instance answers [] to own-key reflection -- every
+    // member (methods and the tri-state flags as get-accessors) lives on
+    // SpeechSynthesis.prototype (census P0-4). State is static false in the
+    // no-op host service.
+    _installSpeechSynthesisPrototypeMembers(synth);
     // Chrome carries the voices-changed event handler on the interface
     // prototype as an accessor (`'onvoiceschanged' in SpeechSynthesis.prototype`
     // is true on the reference; the sAMar8 boolean probe reads exactly this).

@@ -88,23 +88,55 @@ function _speechSynthesisVoices() {
   return _SPEECH_VOICES.slice();
 }
 
+// Moves the SpeechSynthesis surface from the instance to the interface
+// prototype: Chromium 149 answers [] to instance own-key reflection -- every
+// member (methods and the tri-state flags as get-accessors over the no-op
+// host state) lives on SpeechSynthesis.prototype (census P0-4). Idempotent.
+function _installSpeechSynthesisPrototypeMembers(synth) {
+  const proto = globalThis.SpeechSynthesis && globalThis.SpeechSynthesis.prototype;
+  if (!proto) return false;
+  if (!Object.prototype.hasOwnProperty.call(proto, 'getVoices')) {
+    proto.getVoices = _markNativeAs(function getVoices() { return _speechSynthesisVoices(); },
+      'function getVoices() { [native code] }');
+    proto.speak = _markNativeAs(function speak() {}, 'function speak() { [native code] }');
+    proto.cancel = _markNativeAs(function cancel() {}, 'function cancel() { [native code] }');
+    proto.pause = _markNativeAs(function pause() {}, 'function pause() { [native code] }');
+    proto.resume = _markNativeAs(function resume() {}, 'function resume() { [native code] }');
+    for (const flag of ['speaking', 'pending', 'paused']) {
+      Object.defineProperty(proto, flag, {
+        get: _markNativeAs(function get() { return false; },
+          'function get ' + flag + '() { [native code] }'),
+        configurable: true, enumerable: true,
+      });
+    }
+  }
+  for (const member of ['getVoices', 'speak', 'cancel', 'pause', 'resume',
+      'speaking', 'pending', 'paused', 'addEventListener',
+      'removeEventListener']) {
+    try { delete synth[member]; } catch (_error) {}
+  }
+  return true;
+}
+
 function _makeSpeechSynthesis() {
-  return {
-    [Symbol.toStringTag]: 'SpeechSynthesis',
-    speaking: false,
-    pending: false,
-    paused: false,
-    getVoices() { return _speechSynthesisVoices(); },
-    speak() {},
-    cancel() {},
-    pause() {},
-    resume() {},
-    addEventListener() {},
-    removeEventListener() {},
-    // onvoiceschanged is a SpeechSynthesis.prototype accessor (installed in
-    // speech-synthesis.js), not an own property -- the reference prototype
-    // answers `'onvoiceschanged' in SpeechSynthesis.prototype` with true.
-  };
+  // Chromium 149: the SpeechSynthesis instance answers [] to own-key
+  // reflection -- every member lives on the interface prototype, with the
+  // tri-state members as prototype get-accessors over the no-op host state
+  // (census P0-4). The on* handler surface is installed by
+  // speech-synthesis.js alongside onvoiceschanged.
+  const synth = {};
+  synth[Symbol.toStringTag] = 'SpeechSynthesis';
+  synth.speaking = false;
+  synth.pending = false;
+  synth.paused = false;
+  synth.getVoices = function getVoices() { return _speechSynthesisVoices(); };
+  synth.speak = function speak() {};
+  synth.cancel = function cancel() {};
+  synth.pause = function pause() {};
+  synth.resume = function resume() {};
+  synth.addEventListener = function addEventListener() {};
+  synth.removeEventListener = function removeEventListener() {};
+  return synth;
 }
 
 // The utterance keeps its state behind one symbol slot: WebIDL puts every

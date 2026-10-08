@@ -134,9 +134,19 @@ function _idbDatabase(name, version) {
 }
 
 function registerIndexedDbSurface() {
-globalThis.indexedDB = {
-  [Symbol.toStringTag]: 'IDBFactory',
-  open(name, version) {
+  // Chromium 149: the IDBFactory instance answers [] to own-key reflection --
+  // every member lives on IDBFactory.prototype (census P0-4). The interface
+  // object is minted here because the factory singleton is the only instance.
+  if (typeof globalThis.IDBFactory !== 'function') {
+    globalThis.IDBFactory = function IDBFactory() {
+      throw new TypeError("Failed to construct 'IDBFactory': Illegal constructor");
+    };
+    Object.defineProperty(globalThis.IDBFactory.prototype, Symbol.toStringTag, {
+      value: 'IDBFactory', configurable: true,
+    });
+  }
+  const proto = globalThis.IDBFactory.prototype;
+  proto.open = function open(name, version) {
     const dbName = String(name);
     const requested = version === undefined ? 1 : Number(version);
     const state = _idbState(dbName);
@@ -157,11 +167,11 @@ globalThis.indexedDB = {
       if (typeof req.onsuccess === 'function') { try { req.onsuccess({ target: req, type: 'success' }); } catch (e) {} }
     });
     return req;
-  },
-  deleteDatabase(name) { __obscura_idb.delete(String(name)); try { Deno.core.ops.op_indexeddb_delete(String(name)); } catch (e) {} return _idbRequest(() => undefined); },
-  databases() { return Promise.resolve([...__obscura_idb.keys()].map(name => ({ name, version: _idbState(name).version }))); },
-  cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
-};
+  };
+  proto.deleteDatabase = function deleteDatabase(name) { __obscura_idb.delete(String(name)); try { Deno.core.ops.op_indexeddb_delete(String(name)); } catch (e) {} return _idbRequest(() => undefined); };
+  proto.databases = function databases() { return Promise.resolve([...__obscura_idb.keys()].map(name => ({ name, version: _idbState(name).version }))); };
+  proto.cmp = function cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; };
+  globalThis.indexedDB = Object.create(proto);
 }
 registerIndexedDbSurface();
 const _idbKeyRangeState = new WeakMap();
@@ -219,20 +229,31 @@ Object.defineProperty(globalThis, 'IDBKeyRange', {
 });
 
 function registerCacheSurface() {
-globalThis.caches = {
-  // Each open() hands back a fresh Cache-shaped object; its methods are own
-  // properties minted after the finalize sweeps, so mark them per instance.
-  open() { return Promise.resolve(_markNativeObject({
+  // Chromium 149: the CacheStorage instance answers [] to own-key reflection
+  // and carries the [object CacheStorage] tag from the interface prototype
+  // (census P0-4). Each open() hands back a fresh Cache-shaped object whose
+  // methods are own properties minted after the finalize sweeps, so mark
+  // them per instance.
+  if (typeof globalThis.CacheStorage !== 'function') {
+    globalThis.CacheStorage = function CacheStorage() {
+      throw new TypeError("Failed to construct 'CacheStorage': Illegal constructor");
+    };
+    Object.defineProperty(globalThis.CacheStorage.prototype, Symbol.toStringTag, {
+      value: 'CacheStorage', configurable: true,
+    });
+  }
+  const proto = globalThis.CacheStorage.prototype;
+  proto.open = function open() { return Promise.resolve(_markNativeObject({
     match() { return Promise.resolve(undefined); },
     put() { return Promise.resolve(); },
     delete() { return Promise.resolve(false); },
     keys() { return Promise.resolve([]); },
-  })); },
-  match() { return Promise.resolve(undefined); },
-  has() { return Promise.resolve(false); },
-  delete() { return Promise.resolve(false); },
-  keys() { return Promise.resolve([]); },
-};
+  })); };
+  proto.match = function match() { return Promise.resolve(undefined); };
+  proto.has = function has() { return Promise.resolve(false); };
+  proto.delete = function() { return Promise.resolve(false); };
+  proto.keys = function keys() { return Promise.resolve([]); };
+  globalThis.caches = Object.create(proto);
 }
 registerCacheSurface();
 
