@@ -77,7 +77,7 @@ function _serializeBody(initBody, headers) {
   return String(initBody);
 }
 
-globalThis.fetch = async (input, init = {}) => {
+async function __obscuraFetch(input, init = {}) {
   init = init || {};
   const inputRequest = input instanceof Request ? _requestData(input) : null;
   let url = typeof input === "string"
@@ -272,5 +272,14 @@ globalThis.fetch = async (input, init = {}) => {
       performanceStart, pageOrigin, bodySize);
   }
   return response;
-};
+}
+
+// The exposed `fetch` is a concise method, not the async function itself:
+// Chrome's fetch is a native method, and the function kind is observable
+// (`Object.getPrototypeOf`, the `Object.prototype.toString` tag, construct-
+// ability). The method forwards to the async implementation and returns the
+// same promise.
+globalThis.fetch = {
+  fetch(input, init = {}) { return __obscuraFetch(input, init); },
+}.fetch;
 

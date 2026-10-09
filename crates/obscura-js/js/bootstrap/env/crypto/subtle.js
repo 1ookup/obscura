@@ -312,8 +312,7 @@ if (!globalThis.crypto.subtle) {
     }
   }
 
-  const subtle = {
-    async digest(algorithm, data) {
+  async function _subtleDigest(algorithm, data) {
       const name = (typeof algorithm === "string" ? algorithm : algorithm && algorithm.name || "").toUpperCase().replace("_", "-");
       if (name !== "SHA-1" && name !== "SHA-256" && name !== "SHA-384" && name !== "SHA-512" &&
           name !== "SHA-512/224" && name !== "SHA-512/256") {
@@ -352,7 +351,13 @@ if (!globalThis.crypto.subtle) {
         } catch (_) {}
       }
       return bufferOf(Deno.core.ops.op_subtle_digest(name, bytes));
-    },
+  }
+
+  const subtle = {
+    // Not `async`: Chrome's SubtleCrypto methods are native, and an async
+    // method's kind (AsyncFunction) is observable to a function-object probe.
+    // The wrapper keeps the rejection semantics for the validation throws.
+    digest(algorithm, data) { return _subtleDigest(algorithm, data); },
 
     async importKey(format, keyData, algorithm, extractable, keyUsages) {
       const alg = normalizeAlgo(algorithm);

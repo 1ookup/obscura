@@ -13,10 +13,18 @@ if (typeof navigator.credentials === 'undefined') {
   navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
 }
 
+// Concise methods, not `async` methods: Chrome's MediaCapabilities methods are
+// native, and an AsyncFunction's kind is observable to a function-object probe
+// (prototype chain, `Object.prototype.toString` tag). The async wrapper keeps
+// the rejection semantics the `async` keyword gave the validation throws.
+async function _mediaCapabilitiesInfoAsync(instance, configuration, method) {
+  return _mediaCapabilitiesInfo(instance, configuration, method);
+}
+
 globalThis.MediaCapabilities = class MediaCapabilities {
   constructor(token) { _mediaCapabilitiesInitialize(this, token); }
-  async decodingInfo(configuration) { return _mediaCapabilitiesInfo(this, configuration, 'decodingInfo'); }
-  async encodingInfo(configuration) { return _mediaCapabilitiesInfo(this, configuration, 'encodingInfo'); }
+  decodingInfo(configuration) { return _mediaCapabilitiesInfoAsync(this, configuration, 'decodingInfo'); }
+  encodingInfo(configuration) { return _mediaCapabilitiesInfoAsync(this, configuration, 'encodingInfo'); }
   get [Symbol.toStringTag]() { return 'MediaCapabilities'; }
 };
 const _mediaCapabilitiesConstructor = Object.getOwnPropertyDescriptor(

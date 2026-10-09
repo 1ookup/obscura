@@ -4,7 +4,9 @@ if (typeof ReadableStream === 'undefined') {
     get locked() { return _readableLocked(this); }
     getReader() { return _readableGetReader(this); }
     cancel(reason) { return _readableCancel(this, reason); }
-    async pipeTo(destination) { return _readablePipeTo(this, destination); }
+    // Not `async`: the body already returns pipeTo's promise, and an async
+    // method's kind (AsyncFunction) is observable to a function-object probe.
+    pipeTo(destination) { return _readablePipeTo(this, destination); }
     pipeThrough(transform) { return _readablePipeThrough(this, transform); }
     tee() { return _readableTee(this); }
     values(options = undefined) { return _readableAsyncIterator(this, options); }
