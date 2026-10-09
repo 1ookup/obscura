@@ -426,14 +426,15 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
                     // The default is the live Chromium 149 baseline host's
                     // desktop: s.width/s.availWidth 1720, s.height 1260,
                     // s.availHeight 1140, s.availTop 30, devicePixelRatio 1,
-                    // and the window geometry outerWidth 1720 /
-                    // outerHeight 1119 (a windowed window, not maximized:
-                    // outerHeight sits below availHeight). The window
-                    // placement screenX/screenLeft 22 and screenY/screenTop
-                    // 52 is the harness reference window's stable position
-                    // across every round captured 10-06..10-08 (the ddiv
-                    // value-bucket census reads window.screenX into the
-                    // payload; the older 0/51 reading predates it).
+                    // and the window geometry outerWidth 1200 /
+                    // outerHeight 1096 -- the harness reference window's
+                    // stable shape across every captured round (the earlier
+                    // 1720x1119 reading was a different window state; it
+                    // also made outerWidth equal the screen width, which the
+                    // payload's value-grouped fingerprint pins as the one
+                    // stable engine difference). The window placement
+                    // screenX/screenLeft 22 and screenY/screenTop 52 is the
+                    // same reference window's position, unchanged.
                     width: 1720,
                     height: 1260,
                     avail_width: 1720,
@@ -441,8 +442,8 @@ pub fn from_user_agent(user_agent: impl Into<String>) -> Self {
                     avail_top: 30,
                     avail_left: 0,
                     device_scale_factor: 1.0,
-                    outer_width: 1720,
-                    outer_height: 1119,
+                    outer_width: 1200,
+                    outer_height: 1096,
                     screen_x: 22,
                     screen_y: 52,
                 },
@@ -793,7 +794,7 @@ mod tests {
         assert_eq!(screen.device_scale_factor, 1.0);
         assert_eq!(
             (screen.outer_width, screen.outer_height, screen.screen_x, screen.screen_y),
-            (1720, 1119, 22, 52)  /* harness reference window 10-06..10-08 */
+            (1200, 1096, 22, 52)  /* harness reference window, every captured round */
         );
     }
 
