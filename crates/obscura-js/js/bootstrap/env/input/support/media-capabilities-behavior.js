@@ -167,10 +167,14 @@ function _mediaCapabilitiesInfo(instance, configuration, method) {
     decoding ? null : _MEDIA_ENCODING_ACCEPTED);
   const supported = _mediaConfigurationSupported(configuration);
   const powerEfficient = supported && _mediaConfigurationPowerEfficient(configuration);
-  // Chrome answers `accelerated` on MediaCapabilitiesInfo alongside the
-  // other three; capability probes key off its presence (the challenge
-  // records an `mc_acc_p` marker when the field exists and reports hardware
-  // decoding).
-  const accelerated = supported && _mediaConfigurationPowerEfficient(configuration);
-  return {supported, smooth: supported, powerEfficient, accelerated, keySystemAccess: null};
+  // Chromium 149 measured on the reference machine: MediaCapabilitiesInfo
+  // owns powerEfficient, smooth, supported, keySystemAccess — in that key
+  // order and with no `accelerated` field. A capability probe in the
+  // challenge records an `mc_acc_p` marker when the field exists, so the
+  // extra key was itself the tell (bLwNX7 ["mc_acc_p"] vs the reference's
+  // empty list).
+  if (decoding) {
+    return {powerEfficient, smooth: supported, supported, keySystemAccess: null};
+  }
+  return {powerEfficient, smooth: supported, supported};
 }
