@@ -147,3 +147,18 @@ run covers are then removed.
   1 skipped; the four-API filter 37/37) + obscura-browser (141: 140
   passed, blob iframe red pre-existing at 03d271a). Full gate deferred to
   the next backfill.
+
+- Window accessor names (10-10, r12 sibling 2767 finding): the
+  isSecureContext, crossOriginIsolated, event and origin accessors were
+  installed with bare function expressions, so their getter names read
+  without V8's "get " prefix (and the event/origin setters without "set "),
+  while every Chrome accessor half carries it. The method-literal wrapper
+  copies the expression name verbatim, so the name is now set on the
+  expression first, as installWindowLegacySurface already did. Audit probe:
+  Chrome reports zero accessor halves missing the prefix, obscura had
+  exactly these six, now zero. Scoped: obscura-js (779: 774 passed, four
+  documented pre-existing reds -- canvas emoji x2, webgpu x2 -- plus
+  frame_realm_timers_carry_the_configured_dispatch_floor as a load flake,
+  pass 3/3 in isolation; same timer-floor family as the earlier
+  jitter-sample flake; 1 skipped) + obscura-browser (141: 140 passed,
+  blob iframe red pre-existing). Full gate deferred to the next backfill.
