@@ -14663,6 +14663,191 @@ RequestRedirect value",
         }
     }
 
+    /// Phase-time direction ①: a multiprocess browser pays scheduler IPC on
+    /// every iframe timer dispatch, so a cross-origin frame's timer chain
+    /// paces past its authored delay there while this single-process engine
+    /// fires it exactly. With a floor configured, a frame realm's
+    /// `setTimeout(4)` chain paces at authored + floor while the top page's
+    /// identical chain keeps its authored cadence.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_timers_carry_the_configured_dispatch_floor() {
+        std::env::set_var("OBSCURA_TIMER_DISPATCH_FLOOR_MS", "6");
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://creator.example/parent/path");
+        rt.evaluate(r#"(() => {
+            globalThis.__mainPacing = [];
+            let last = Date.now();
+            const step = () => {
+                const now = Date.now();
+                __mainPacing.push(now - last);
+                last = now;
+                setTimeout(step, 4);
+            };
+            setTimeout(step, 4);
+        })()"#).unwrap();
+        rt.run_event_loop_for_duration(60).await.unwrap();
+        let main: Vec<f64> = rt.evaluate("__mainPacing")
+            .unwrap()
+            .as_array()
+            .expect("main pacing samples")
+            .iter()
+            .map(|sample| sample.as_f64().expect("main pacing sample"))
+            .collect();
+        assert!(
+            main.len() >= 6,
+            "main-realm chain should keep running: {main:?}"
+        );
+        // Sample 0 measures schedule-to-first-fire (event-loop startup), not
+        // pacing; the rest are consecutive fire intervals.
+        for elapsed in main.iter().skip(1).copied() {
+            assert!(
+                elapsed >= 3.5 && elapsed < 9.5,
+                "main-realm 4ms timer interval {elapsed}ms: \
+                 the floor must not reach the top page"
+            );
+        }
+        let root = rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.append(frame);
+            return Number(Deno.core.ops.op_dom('iframe_content_document_root',
+                String(frame[Symbol.for('obscura.nid')]), ''));
+        })()"#).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("floor-frame", 1, root, "about:blank").unwrap();
+        rt.evaluate_in_frame_realm_for_cdp(
+            "floor-frame", 1, crate::realm::MAIN_WORLD,
+            r#"(() => {
+                globalThis.__pacing = [];
+                let last = Date.now();
+                const step = () => {
+                    const now = Date.now();
+                    __pacing.push(now - last);
+                    last = now;
+                    setTimeout(step, 4);
+                };
+                setTimeout(step, 4);
+            })()"#,
+            true, true, 2_000,
+        ).await.unwrap().value.unwrap();
+        rt.run_event_loop_for_duration(150).await.unwrap();
+        let frame = rt.evaluate_in_frame_realm_for_cdp(
+            "floor-frame", 1, crate::realm::MAIN_WORLD, "__pacing",
+            true, true, 2_000,
+        ).await.unwrap().value.unwrap();
+        let frame = frame.as_array().expect("frame pacing samples");
+        assert!(
+            frame.len() >= 6,
+            "frame-realm chain should keep running: {frame:?}"
+        );
+        for sample in frame.iter().skip(1) {
+            let elapsed = sample.as_f64().expect("frame pacing sample");
+            assert!(
+                elapsed >= 9.0 && elapsed < 40.0,
+                "frame-realm 4ms timer interval {elapsed}ms; \
+                 expected authored 4ms + floor 6ms"
+            );
+        }
+    }
+
+    /// The floor is opt-in per process: without the env a frame realm's timer
+    /// chain keeps its authored cadence, byte-identical to the top page.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_timer_floor_stays_off_without_the_env() {
+        std::env::remove_var("OBSCURA_TIMER_DISPATCH_FLOOR_MS");
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://creator.example/parent/path");
+        let root = rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.append(frame);
+            return Number(Deno.core.ops.op_dom('iframe_content_document_root',
+                String(frame[Symbol.for('obscura.nid')]), ''));
+        })()"#).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("nofloor-frame", 1, root, "about:blank").unwrap();
+        rt.evaluate_in_frame_realm_for_cdp(
+            "nofloor-frame", 1, crate::realm::MAIN_WORLD,
+            r#"(() => {
+                globalThis.__pacing = [];
+                let last = Date.now();
+                const step = () => {
+                    const now = Date.now();
+                    __pacing.push(now - last);
+                    last = now;
+                    setTimeout(step, 4);
+                };
+                setTimeout(step, 4);
+            })()"#,
+            true, true, 2_000,
+        ).await.unwrap().value.unwrap();
+        rt.run_event_loop_for_duration(120).await.unwrap();
+        let frame = rt.evaluate_in_frame_realm_for_cdp(
+            "nofloor-frame", 1, crate::realm::MAIN_WORLD, "__pacing",
+            true, true, 2_000,
+        ).await.unwrap().value.unwrap();
+        let frame = frame.as_array().expect("frame pacing samples");
+        assert!(
+            frame.len() >= 4,
+            "frame-realm chain should keep running: {frame:?}"
+        );
+        for sample in frame.iter().skip(1) {
+            let elapsed = sample.as_f64().expect("frame pacing sample");
+            assert!(
+                elapsed >= 3.5 && elapsed < 9.5,
+                "unfloored frame-realm 4ms timer interval {elapsed}ms: \
+                 the floor must stay off without the env"
+            );
+        }
+    }
+
+    /// The jitter span samples uniformly on top of the base, so a floored
+    /// chain paces inside [authored + base, authored + base + jitter] per
+    /// step rather than at one fixed interval.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_realm_timer_floor_jitter_samples_across_the_span() {
+        std::env::set_var("OBSCURA_TIMER_DISPATCH_FLOOR_MS", "3");
+        std::env::set_var("OBSCURA_TIMER_DISPATCH_FLOOR_JITTER_MS", "4");
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url("https://creator.example/parent/path");
+        let root = rt.evaluate(r#"(() => {
+            const frame = document.createElement('iframe');
+            document.body.append(frame);
+            return Number(Deno.core.ops.op_dom('iframe_content_document_root',
+                String(frame[Symbol.for('obscura.nid')]), ''));
+        })()"#).unwrap().as_f64().unwrap() as u32;
+        rt.ensure_frame_realm("jitter-frame", 1, root, "about:blank").unwrap();
+        rt.evaluate_in_frame_realm_for_cdp(
+            "jitter-frame", 1, crate::realm::MAIN_WORLD,
+            r#"(() => {
+                globalThis.__pacing = [];
+                let last = Date.now();
+                const step = () => {
+                    const now = Date.now();
+                    __pacing.push(now - last);
+                    last = now;
+                    setTimeout(step, 4);
+                };
+                setTimeout(step, 4);
+            })()"#,
+            true, true, 2_000,
+        ).await.unwrap().value.unwrap();
+        rt.run_event_loop_for_duration(150).await.unwrap();
+        let frame = rt.evaluate_in_frame_realm_for_cdp(
+            "jitter-frame", 1, crate::realm::MAIN_WORLD, "__pacing",
+            true, true, 2_000,
+        ).await.unwrap().value.unwrap();
+        let frame = frame.as_array().expect("frame pacing samples");
+        assert!(
+            frame.len() >= 4,
+            "frame-realm chain should keep running: {frame:?}"
+        );
+        for sample in frame.iter().skip(1) {
+            let elapsed = sample.as_f64().expect("frame pacing sample");
+            assert!(
+                elapsed >= 6.5 && elapsed < 13.0,
+                "jittered 4ms timer interval {elapsed}ms; \
+                 expected within authored 4ms + [3, 3+4]ms floor"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn scheduler_post_task_observes_priority_fifo_and_task_boundaries() {
         let mut rt = setup_runtime("<html><body></body></html>");

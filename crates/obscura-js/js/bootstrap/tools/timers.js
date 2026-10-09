@@ -58,6 +58,37 @@ function _clampHiddenPageDelay(delay) {
   return delay;
 }
 
+// Dispatch-latency floor for frame-realm HTML timers. A multiprocess browser
+// pays scheduler IPC on every iframe timer dispatch, so a cross-origin
+// frame's `setTimeout(4)` chain paces well past its authored delay there;
+// this single-process engine fires frame timers exactly, and that pacing gap
+// is itself measurable. When the embedder configures a floor
+// (OBSCURA_TIMER_DISPATCH_FLOOR_MS, plus OBSCURA_TIMER_DISPATCH_FLOOR_JITTER_MS
+// of uniform jitter), timers scheduled inside a frame realm carry the
+// dispatch latency so cross-timer Date.now() pacing lands in the reference
+// band. Top-page timers keep their authored delays, the config is parsed
+// once per process, and an unset floor changes nothing.
+const _frameRealmTimers = typeof __obscura_frame_document_nid !== "undefined";
+let _timerFloorBase = null;
+let _timerFloorJitter = 0;
+function _frameDispatchFloor() {
+  if (!_frameRealmTimers) return 0;
+  if (_timerFloorBase === null) {
+    let base = 0;
+    let jitter = 0;
+    try {
+      base = Deno.core.ops.op_timer_dispatch_floor();
+      jitter = Deno.core.ops.op_timer_dispatch_floor_jitter();
+    } catch (_e) {}
+    _timerFloorBase = base > 0 ? base : 0;
+    _timerFloorJitter = jitter > 0 ? jitter : 0;
+  }
+  if (_timerFloorBase === 0) return 0;
+  return _timerFloorJitter > 0
+    ? _timerFloorBase + Math.random() * _timerFloorJitter
+    : _timerFloorBase;
+}
+
 // Runs `f` at the nesting level its own timer scheduled, so timers it starts
 // nest deeper while unrelated work on the task queue keeps counting from zero.
 function _runAtNesting(level, f, args, invoker) {
@@ -91,7 +122,8 @@ _defineWindowValue('setTimeout', (fn, delay = 0, ...args) => {
   const nesting = _timerNesting + 1;
   const normalizedDelay = _clampHiddenPageDelay(
     _clampNestedDelay(Math.max(0, Number(delay) || 0)));
-  const nativeId = _scheduleAfter(normalizedDelay, () => {
+  const effectiveDelay = normalizedDelay + _frameDispatchFloor();
+  const nativeId = _scheduleAfter(effectiveDelay, () => {
     _nativeTimerIds.delete(id);
     __obscuraPendingTimeoutDeadlines.delete(id);
     if (_clearedTimers.has(id)) return;
@@ -99,7 +131,7 @@ _defineWindowValue('setTimeout', (fn, delay = 0, ...args) => {
   });
   if (nativeId !== undefined) {
     _nativeTimerIds.set(id, nativeId);
-    __obscuraPendingTimeoutDeadlines.set(id, performance.now() + normalizedDelay);
+    __obscuraPendingTimeoutDeadlines.set(id, performance.now() + effectiveDelay);
   }
   return id;
 });
@@ -135,11 +167,11 @@ _defineWindowValue('setInterval', (fn, delay = 0, ...args) => {
     if (!_intervals.has(id)) return;
     // The background clamp re-evaluates per tick: visibility is not frozen
     // at the interval's creation.
-    const tickDelay = _clampHiddenPageDelay(normalizedDelay);
+    const tickDelay = _clampHiddenPageDelay(normalizedDelay) + _frameDispatchFloor();
     const nativeId = _scheduleAfter(tickDelay, tick);
     if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   };
-  const nativeId = _scheduleAfter(normalizedDelay, tick);
+  const nativeId = _scheduleAfter(normalizedDelay + _frameDispatchFloor(), tick);
   if (nativeId !== undefined) _nativeTimerIds.set(id, nativeId);
   return id;
 });

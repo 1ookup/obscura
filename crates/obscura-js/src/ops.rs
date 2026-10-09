@@ -6497,6 +6497,45 @@ fn op_async_runtime_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }
 
+/// Embedder-configured dispatch-latency floor for frame-realm HTML timers,
+/// parsed once per process. A multiprocess browser pays scheduler IPC on
+/// every iframe timer dispatch, so a cross-origin frame's `setTimeout(4)`
+/// chain paces well past its authored delay there while this single-process
+/// engine fires frame timers exactly, and that pacing gap is itself
+/// measurable. Setting OBSCURA_TIMER_DISPATCH_FLOOR_MS (> 0) makes frame
+/// realms inflate each setTimeout/setInterval wait by that base, plus
+/// OBSCURA_TIMER_DISPATCH_FLOOR_JITTER_MS of uniform jitter when set, so
+/// cross-timer Date.now() pacing lands in the reference band. Unset keeps
+/// behavior byte-identical.
+fn timer_dispatch_floor_config() -> (f64, f64) {
+    static CONFIG: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    *CONFIG.get_or_init(|| {
+        let parse = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(0.0)
+        };
+        (
+            parse("OBSCURA_TIMER_DISPATCH_FLOOR_MS"),
+            parse("OBSCURA_TIMER_DISPATCH_FLOOR_JITTER_MS"),
+        )
+    })
+}
+
+/// Base dispatch-latency floor (ms) added to frame-realm HTML timer waits.
+#[op2(fast)]
+fn op_timer_dispatch_floor() -> f64 {
+    timer_dispatch_floor_config().0
+}
+
+/// Uniform-jitter span (ms) sampled on top of the dispatch-latency floor.
+#[op2(fast)]
+fn op_timer_dispatch_floor_jitter() -> f64 {
+    timer_dispatch_floor_config().1
+}
+
 #[op2(fast)]
 fn op_browser_timer_schedule(state: &OpState, native_id: f64, delay_ms: f64) {
     if !native_id.is_finite() || native_id < 0.0 || !delay_ms.is_finite() {
@@ -8709,6 +8748,8 @@ pub fn build_extension() -> Extension {
         op_async_runtime_available(),
         op_browser_timer_schedule(),
         op_browser_timer_complete(),
+        op_timer_dispatch_floor(),
+        op_timer_dispatch_floor_jitter(),
         op_page_hidden(),
         op_set_page_hidden(),
         op_posted_task(),
