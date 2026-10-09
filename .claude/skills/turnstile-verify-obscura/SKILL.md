@@ -74,7 +74,7 @@ SERVE_LOG=/tmp/obscura-verify-serve.log
 BRIDGE_LOG=/tmp/obscura-verify-bridge.log
 TARGET_URL="https://www.thelancet.com/123.txt"
 SITEKEY=0x4AAAAAAADnPIDROrmt1Wwj
-REF_UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36'
+REF_UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36'
 REQABLE_CA="$HOME/Library/Application Support/com.reqable.macosx/certificate/reqable-root.crt"
 ```
 
