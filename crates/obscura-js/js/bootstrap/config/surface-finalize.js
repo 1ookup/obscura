@@ -111,8 +111,13 @@
     return _isPotentiallyTrustworthy(href);
   }
 
+  // The method-literal wrapper copies the expression's `name` verbatim, and
+  // V8's interface getters carry the "get " prefix, so the name must be set
+  // on the expression before the wrapper sees it.
+  const _isSecureContextGetter = function isSecureContext() { return _secureNow(); };
+  Object.defineProperty(_isSecureContextGetter, 'name', { value: 'get isSecureContext', configurable: true });
   Object.defineProperty(globalThis, 'isSecureContext', {
-    get: _obscuraMethodLiteral(function isSecureContext() { return _secureNow(); }),
+    get: _obscuraMethodLiteral(_isSecureContextGetter),
     set: undefined,
     enumerable: true,
     configurable: true,
@@ -120,8 +125,10 @@
 
   // The navigation layer derives this from COOP+COEP and Permissions-Policy.
   // Drive this getter and the SAB global from one per-document value.
+  const _crossOriginIsolatedGetter = function crossOriginIsolated() { return _crossOriginIsolatedValue; };
+  Object.defineProperty(_crossOriginIsolatedGetter, 'name', { value: 'get crossOriginIsolated', configurable: true });
   Object.defineProperty(globalThis, 'crossOriginIsolated', {
-    get: _obscuraMethodLiteral(function crossOriginIsolated() { return _crossOriginIsolatedValue; }),
+    get: _obscuraMethodLiteral(_crossOriginIsolatedGetter),
     set: undefined,
     enumerable: true,
     configurable: true,
@@ -156,11 +163,15 @@
   // absent. `event` reads undefined outside dispatch, while `origin` reads the
   // serialized environment origin; both keep a native no-op setter in Chrome.
   if (!('event' in globalThis)) {
+    const _legacyEventGetter = function event() {
+      return _legacyWindowEvent || (_legacyEventStickyEligible() ? _legacyStickyWindowEvent : undefined);
+    };
+    Object.defineProperty(_legacyEventGetter, 'name', { value: 'get event', configurable: true });
+    const _legacyEventSetter = function event(value) { _legacyWindowEvent = value; };
+    Object.defineProperty(_legacyEventSetter, 'name', { value: 'set event', configurable: true });
     Object.defineProperty(globalThis, 'event', {
-      get: _obscuraMethodLiteral(function event() {
-        return _legacyWindowEvent || (_legacyEventStickyEligible() ? _legacyStickyWindowEvent : undefined);
-      }),
-      set: _markNativeAs(function event(value) { _legacyWindowEvent = value; },
+      get: _obscuraMethodLiteral(_legacyEventGetter),
+      set: _markNativeAs(_legacyEventSetter,
         'function set event() { [native code] }'),
       enumerable: true,
       configurable: true,
@@ -170,20 +181,23 @@
   // `origin` is a WindowOrWorkerGlobalScope attribute that Chrome exposes on
   // every global. An opaque origin reads "null".
   if (!('origin' in globalThis)) {
-    const originSetter = _markNativeAs(function origin(value) {},
-      'function set origin() { [native code] }');
+    const _windowOriginSetter = function origin(value) {};
+    Object.defineProperty(_windowOriginSetter, 'name', { value: 'set origin', configurable: true });
+    const _windowOriginGetter = function origin() {
+      try {
+        // about:blank/srcdoc inherit their creator's origin, while their
+        // location.origin remains "null". Sandboxed scopes stay opaque.
+        const info = _domParse('document_scope_info', _callingFrameRoot());
+        if (info && typeof info.origin === 'string') return info.origin;
+        const value = globalThis.location?.origin;
+        return value === undefined || value === '' ? 'null' : value;
+      } catch (_error) { return 'null'; }
+    };
+    Object.defineProperty(_windowOriginGetter, 'name', { value: 'get origin', configurable: true });
     Object.defineProperty(globalThis, 'origin', {
-      get: _obscuraMethodLiteral(function origin() {
-        try {
-          // about:blank/srcdoc inherit their creator's origin, while their
-          // location.origin remains "null". Sandboxed scopes stay opaque.
-          const info = _domParse('document_scope_info', _callingFrameRoot());
-          if (info && typeof info.origin === 'string') return info.origin;
-          const value = globalThis.location?.origin;
-          return value === undefined || value === '' ? 'null' : value;
-        } catch (_error) { return 'null'; }
-      }),
-      set: originSetter,
+      get: _obscuraMethodLiteral(_windowOriginGetter),
+      set: _markNativeAs(_windowOriginSetter,
+        'function set origin() { [native code] }'),
       enumerable: true,
       configurable: true,
     });
