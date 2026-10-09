@@ -3177,10 +3177,18 @@ impl Page {
             }
         }
         // A sandbox without allow-scripts suppresses author scripts after the
-        // realm exists. Nested frames carry their parent's merged flags.
+        // realm exists. Nested frames carry their parent's merged flags. The
+        // document lifecycle still finishes: Chrome parses the frame's
+        // document, advances readyState through interactive to complete, and
+        // fires DOMContentLoaded/load in the parentless realm, and the embedder
+        // observes the load on the iframe element. A parent that probes the
+        // child's readyState (the challenge's expectation table) retries the
+        // frame when it stays "loading", so the completion hooks must run.
         if scope.sandbox.active
             && !scope.sandbox.allows(obscura_dom::SandboxFlags::ALLOW_SCRIPTS)
         {
+            self.frame_ready_state_interactive(frame_id, generation);
+            self.frame_dom_content_loaded_and_load(frame_id, generation);
             return;
         }
         // Subresource initiator/referrer: the frame document's URL when it is
@@ -3712,15 +3720,7 @@ impl Page {
         // Parsing is done; deferred scripts and non-async modules below still
         // gate DOMContentLoaded but observe `interactive`. Mirrors the main
         // path's <ready-state-interactive> point.
-        if let Some(js) = self.js.as_mut() {
-            let _ = js.execute_script_in_frame_realm(
-                frame_id,
-                generation,
-                "<frame-ready-state-interactive>",
-                "globalThis.__documentReadyState__ = 'interactive';\n\
-                 try { document.dispatchEvent(new Event('readystatechange', {bubbles:false,cancelable:false})); } catch(e) {}",
-            );
-        }
+        self.frame_ready_state_interactive(frame_id, generation);
 
         for scheduled in post_parse {
             if tokio::time::Instant::now() >= deadline {
@@ -3758,6 +3758,28 @@ impl Page {
         // in child realms leaves readyState/performance paint entries stale
         // and changes what frame scripts observe. Dynamic async scripts still
         // follow the same load-delaying rules as the main document.
+        self.frame_dom_content_loaded_and_load(frame_id, generation);
+    }
+
+    /// The `interactive` step of a frame document's lifecycle, shared by the
+    /// script-running path and the sandboxed-no-scripts path (a sandbox
+    /// suppresses scripts, not the document lifecycle).
+    fn frame_ready_state_interactive(&mut self, frame_id: &str, generation: u64) {
+        if let Some(js) = self.js.as_mut() {
+            let _ = js.execute_script_in_frame_realm(
+                frame_id,
+                generation,
+                "<frame-ready-state-interactive>",
+                "globalThis.__documentReadyState__ = 'interactive';\n\
+                 try { document.dispatchEvent(new Event('readystatechange', {bubbles:false,cancelable:false})); } catch(e) {}",
+            );
+        }
+    }
+
+    /// The DOMContentLoaded + `complete`/load tail of a frame document's
+    /// lifecycle, shared by the script-running path and the
+    /// sandboxed-no-scripts path.
+    fn frame_dom_content_loaded_and_load(&mut self, frame_id: &str, generation: u64) {
         if let Some(js) = self.js.as_mut() {
             let _ = js.execute_script_in_frame_realm(
                 frame_id,
