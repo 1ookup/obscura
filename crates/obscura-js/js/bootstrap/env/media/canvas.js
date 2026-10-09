@@ -3040,8 +3040,8 @@ _markNative(Element.prototype.setHTMLUnsafe);
 _markNative(Element.prototype.getHTML);
 // Document.parseHTMLUnsafe(html): static that parses into a new HTML document.
 if (typeof Document !== 'undefined' && typeof Document.parseHTMLUnsafe !== 'function') {
-  Document.parseHTMLUnsafe = function parseHTMLUnsafe(html) {
+  // A static interface operation: [length, name], no prototype slot.
+  Document.parseHTMLUnsafe = _obscuraMethodLiteral(function parseHTMLUnsafe(html) {
     return new DOMParser().parseFromString(String(html == null ? "" : html), "text/html");
-  };
-  _markNative(Document.parseHTMLUnsafe);
+  });
 }

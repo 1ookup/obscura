@@ -41,6 +41,15 @@
     });
   }
 
+  // Every member of this family is an interface function: [length, name],
+  // no prototype slot, native toString. Accessor halves follow Chrome's
+  // naming ("get name"), which the method-literal wrapper copies off
+  // fn.name.
+  function _getterHalf(name, fn) {
+    Object.defineProperty(fn, 'name', { value: 'get ' + name, configurable: true });
+    return _obscuraMethodLiteral(fn);
+  }
+
   function _trustedTypeInterface(name) {
     const ctor = function () {
       throw new TypeError("Failed to construct '" + name + "': Illegal constructor");
@@ -54,10 +63,10 @@
       if (held === undefined) throw new TypeError('Illegal invocation @env/security/trusted-types.js:54');
       return held;
     };
-    _defineHidden(ctor.prototype, 'toString', _markNative(function toString() {
+    _defineHidden(ctor.prototype, 'toString', _obscuraMethodLiteral(function toString() {
       return read(this);
     }));
-    _defineHidden(ctor.prototype, 'toJSON', _markNative(function toJSON() {
+    _defineHidden(ctor.prototype, 'toJSON', _obscuraMethodLiteral(function toJSON() {
       return read(this);
     }));
     return _markNative(ctor);
@@ -94,7 +103,7 @@
     value: 'TrustedTypePolicy', configurable: true,
   });
   Object.defineProperty(TrustedTypePolicy.prototype, 'name', {
-    get: _markNative(function name() { return _policyName.get(this); }),
+    get: _getterHalf('name', function () { return _policyName.get(this); }),
     enumerable: true,
     configurable: true,
   });
@@ -216,7 +225,7 @@
     throw new TypeError('This document requires Trusted Types for script sinks.');
   }
 
-  _defineHidden(_factoryProto, 'createPolicy', _markNative(function createPolicy(policyName, policyOptions) {
+  _defineHidden(_factoryProto, 'createPolicy', _obscuraMethodLiteral(function createPolicy(policyName, policyOptions) {
     if (arguments.length < 1) {
       throw new TypeError(
         "Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': " +
@@ -262,13 +271,13 @@
   }));
 
   _defineHidden(_factoryProto, 'isHTML',
-    _markNative(function isHTML(value) { return _isKind('html', value); }));
+    _obscuraMethodLiteral(function isHTML(value) { return _isKind('html', value); }));
   _defineHidden(_factoryProto, 'isScript',
-    _markNative(function isScript(value) { return _isKind('script', value); }));
+    _obscuraMethodLiteral(function isScript(value) { return _isKind('script', value); }));
   _defineHidden(_factoryProto, 'isScriptURL',
-    _markNative(function isScriptURL(value) { return _isKind('scripturl', value); }));
+    _obscuraMethodLiteral(function isScriptURL(value) { return _isKind('scripturl', value); }));
 
-  _defineHidden(_factoryProto, 'getAttributeType', _markNative(function getAttributeType(tagName, attribute) {
+  _defineHidden(_factoryProto, 'getAttributeType', _obscuraMethodLiteral(function getAttributeType(tagName, attribute) {
     if (arguments.length < 2) {
       throw new TypeError(
         "Failed to execute 'getAttributeType' on 'TrustedTypePolicyFactory': " +
@@ -281,7 +290,7 @@
     return _ATTRIBUTE_SINKS[element + ' ' + name] || null;
   }));
 
-  _defineHidden(_factoryProto, 'getPropertyType', _markNative(function getPropertyType(tagName, property) {
+  _defineHidden(_factoryProto, 'getPropertyType', _obscuraMethodLiteral(function getPropertyType(tagName, property) {
     if (arguments.length < 2) {
       throw new TypeError(
         "Failed to execute 'getPropertyType' on 'TrustedTypePolicyFactory': " +
@@ -297,15 +306,15 @@
   const _emptyHTML = _mint(TrustedHTML, '');
   const _emptyScript = _mint(TrustedScript, '');
   Object.defineProperty(_factoryProto, 'emptyHTML', {
-    get: _markNative(function emptyHTML() { return _emptyHTML; }),
+    get: _getterHalf('emptyHTML', function () { return _emptyHTML; }),
     enumerable: true, configurable: true,
   });
   Object.defineProperty(_factoryProto, 'emptyScript', {
-    get: _markNative(function emptyScript() { return _emptyScript; }),
+    get: _getterHalf('emptyScript', function () { return _emptyScript; }),
     enumerable: true, configurable: true,
   });
   Object.defineProperty(_factoryProto, 'defaultPolicy', {
-    get: _markNative(function defaultPolicy() { return _defaultPolicy; }),
+    get: _getterHalf('defaultPolicy', function () { return _defaultPolicy; }),
     enumerable: true, configurable: true,
   });
 

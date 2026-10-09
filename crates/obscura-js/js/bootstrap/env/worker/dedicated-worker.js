@@ -552,7 +552,11 @@ function _blobUrlId() {
   } catch (e) {}
   return 'blob:' + origin + '/' + uuid;
 }
-URL.createObjectURL = function(blob) {
+// The blob-URL store override replaces the class-static shim with a plain
+// expression, which would strip the interface shape (Chrome's statics own
+// [length, name] and no prototype slot); the method-literal wrapper keeps
+// both the shape and this body.
+URL.createObjectURL = _obscuraMethodLiteral(function createObjectURL(blob) {
   if (blob) {
     const id = _blobUrlId();
     // Store synchronously so a Worker built from the blob URL in the same
@@ -575,12 +579,12 @@ URL.createObjectURL = function(blob) {
     return id;
   }
   return _blobUrlId();
-};
-URL.revokeObjectURL = function(url) {
+});
+URL.revokeObjectURL = _obscuraMethodLiteral(function revokeObjectURL(url) {
   delete globalThis.__blobStore[url];
   delete globalThis.__blobBytesStore[url];
   delete globalThis.__blobTypeStore[url];
-};
+});
 
 // The text of a script-created blob document, or null when this realm's blob
 // URL store has no entry for the URL. This is the same store fetch() and XHR

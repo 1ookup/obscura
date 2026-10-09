@@ -287,7 +287,7 @@
     if (typeof ctor.availability !== 'function') {
       try {
         Object.defineProperty(ctor, 'availability', {
-          value: _markNative(function availability() {
+          value: _obscuraMethodLiteral(function availability() {
             return Promise.resolve('unavailable');
           }),
           writable: true, enumerable: true, configurable: true,
@@ -297,7 +297,7 @@
     if (typeof ctor.create !== 'function') {
       try {
         Object.defineProperty(ctor, 'create', {
-          value: _markNative(function create() {
+          value: _obscuraMethodLiteral(function create() {
             return Promise.reject(new DOMException(
               'Not supported', 'NotSupportedError'));
           }),
