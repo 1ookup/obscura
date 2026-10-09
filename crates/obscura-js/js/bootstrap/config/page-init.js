@@ -61,6 +61,12 @@ globalThis.__obscura_core_init = function() {
     // to at boot (the value the challenge's embed probe reads). "same"
     // records the same-origin verdict so a wrong element answer is visible
     // next to its cause.
+    var _feSandbox = null;
+    try {
+      if (typeof container.host === "number" && container.host > 0) {
+        _feSandbox = JSON.parse(_dom("get_attribute", container.host, "sandbox") || "null");
+      }
+    } catch (_feSb) {}
     try {
       window.external && window.external.tracelog && window.external.tracelog(
         'fe.init',
@@ -69,6 +75,7 @@ globalThis.__obscura_core_init = function() {
           host: typeof container.host === "number" ? container.host : null,
           parentRoot: parentRoot || null,
           same: _feSame,
+          sandbox: _feSandbox,
         }));
     } catch (_feReport) {}
   } else {
@@ -346,6 +353,12 @@ globalThis.__obscura_init = function() {
     // to at boot (the value the challenge's embed probe reads). "same"
     // records the same-origin verdict so a wrong element answer is visible
     // next to its cause.
+    var _feSandbox = null;
+    try {
+      if (typeof container.host === "number" && container.host > 0) {
+        _feSandbox = JSON.parse(_dom("get_attribute", container.host, "sandbox") || "null");
+      }
+    } catch (_feSb) {}
     try {
       window.external && window.external.tracelog && window.external.tracelog(
         'fe.init',
@@ -354,6 +367,7 @@ globalThis.__obscura_init = function() {
           host: typeof container.host === "number" ? container.host : null,
           parentRoot: parentRoot || null,
           same: _feSame,
+          sandbox: _feSandbox,
         }));
     } catch (_feReport) {}
   } else {
