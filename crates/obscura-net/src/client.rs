@@ -436,7 +436,13 @@ impl ResourceRequest {
         }
         match self.initiator.as_ref() {
             Some(initiator) => initiator.origin() == target.origin(),
-            None => true,
+            // The no-initiator escape hatch exists so Accept-CH survives a
+            // navigation. A subresource with no recorded initiator answers
+            // low-entropy: measured on Chromium 149 in the embedded-challenge
+            // topology, the same-origin image (`Sec-Fetch-Dest: image`) and
+            // worker-issued fetch carry the low-entropy trio only, even with
+            // the origin's hints already cached.
+            None => self.mode == RequestMode::Navigate,
         }
     }
 

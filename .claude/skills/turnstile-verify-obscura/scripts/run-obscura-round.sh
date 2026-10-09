@@ -19,7 +19,7 @@ PORT=9311
 TRACE="$ROOT/traces/obscura-$TAG.jsonl"
 TARGET_URL="https://www.thelancet.com/123.txt"
 SITEKEY="0x4AAAAAAADnPIDROrmt1Wwj"
-REF_UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36'
+REF_UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36'
 REQABLE_CA="$HOME/Library/Application Support/com.reqable.macosx/certificate/reqable-root.crt"
 PREFLIGHT="$SCRIPT_DIR/preflight.sh"
 SUMMARY="$SCRIPT_DIR/trace-summary.py"
@@ -66,7 +66,7 @@ grep -m1 -i 'fingerprint\|tracker\|stealth' "$ROOT/reports/obscura-$TAG.serve.lo
 cd /Users/l9h8/obscura
 DRIVE_LOG="$ROOT/reports/obscura-$TAG.drive.log"
 # 不能 disown：bash 对 disown 过的 pid wait 立即返回 rc=0（实测），会掐死整轮
-nohup python3 -u "$DRIVE" --port "$PORT" --url "$TARGET_URL" --deadline 45 >"$DRIVE_LOG" 2>&1 &
+nohup python3 -u "$DRIVE" --port "$PORT" --url "$TARGET_URL" --deadline 45 --max-clicks 1 >"$DRIVE_LOG" 2>&1 &
 DRIVE_PID=$!
 sleep 8
 grep -m2 'harness:' "$DRIVE_LOG" || echo "[obscura-round] WARN: 8s 内未见 harness: 行（ws 未连上 9001？）"

@@ -53,11 +53,15 @@ pub(crate) enum ChromeRequestShape {
 /// exactly where the POST measurement put them. On the GET they are absent, so
 /// the same table yields the GET order Chrome sent.
 ///
-/// Re-measured against Chrome 154.0.8037.93 over HTTP/2 through a MITM
-/// observatory: the client-hint block is a fixed enumeration order (mobile,
-/// full-version, arch, platform, platform-version, model, bitness,
-/// full-version-list), not a sorted one, and every high-entropy name sits in
-/// its own slot now that the hint set is table-driven.
+/// Re-measured against the production reference (Chromium 149) over HTTP/2 on
+/// the challenge frame navigation: `accept-language` sits directly after the
+/// low-entropy trio and before `Upgrade-Insecure-Requests` (the 154
+/// measurement had it last), and `Sec-Fetch-Storage-Access` occupies a slot
+/// after `Sec-Fetch-Dest` (sent on the cross-site credentialed frame
+/// navigation). The high-entropy slots keep the fixed enumeration order the
+/// 154 observatory measured (mobile, full-version, arch, platform,
+/// platform-version, model, bitness, full-version-list); they stay empty in
+/// the low-entropy state.
 ///
 /// `referer` is absent from both measurements because neither driving
 /// navigation carried one; its slot is the one Chrome uses on the subresource
@@ -74,6 +78,7 @@ pub(crate) const NAVIGATION_ORDER: &[&str] = &[
     "sec-ch-ua-model",
     "sec-ch-ua-bitness",
     "sec-ch-ua-full-version-list",
+    "accept-language",
     "upgrade-insecure-requests",
     "content-type",
     "user-agent",
@@ -83,9 +88,9 @@ pub(crate) const NAVIGATION_ORDER: &[&str] = &[
     "sec-fetch-mode",
     "sec-fetch-user",
     "sec-fetch-dest",
+    "sec-fetch-storage-access",
     "referer",
     "accept-encoding",
-    "accept-language",
     "cookie",
     "priority",
 ];
@@ -94,38 +99,42 @@ pub(crate) const NAVIGATION_ORDER: &[&str] = &[
 /// in the low-entropy state production runs in: no `Accept-CH` has been
 /// processed, so none of the high-entropy hints are sent.
 ///
-/// Measured over HTTP/2 against Chrome 154.0.8037.93, twice: on the Turnstile
-/// platform's `/fo/` POST and on a loopback fetch/XHR observatory.
-/// `content-length` comes first on a body, `sec-ch-ua-platform` leads,
-/// `user-agent` follows it, then `sec-ch-ua`, `content-type`, the two
-/// Cloudflare challenge headers, and `sec-ch-ua-mobile`; `priority` closes
-/// the list. The `cf-chl*` names get a slot so a page that sets them lands
-/// them where Chrome does, and they are skipped on every other request.
+/// Re-measured over HTTP/2 against the production reference (a Chromium 149
+/// build) on the Turnstile platform's `/fo/` POST, stable across all three
+/// POSTs of one round: `content-length` comes first on a body,
+/// `sec-ch-ua-platform` leads, `accept-language` follows it directly,
+/// `sec-ch-ua` next, then the caller-set `cf-chl-ra`, `sec-ch-ua-mobile`,
+/// `user-agent`, `content-type` and `cf-chl`; `accept` + `origin` precede the
+/// fetch-metadata block, and `priority` closes the list. This replaces the
+/// Chrome 154.0.8037.93 measurement, whose order placed `user-agent` third
+/// and `accept-language` last — the two builds order differently, and the
+/// 149 build is the one production is paired against. The `cf-chl*` names
+/// keep slots so a page that sets them lands them where Chrome does; they
+/// are skipped on every other request.
 ///
-/// The six high-entropy slots hold the positions the hint mechanism fills
-/// once an origin has accepted them; they are empty in the low-entropy state
-/// and do not affect the wire order. An earlier re-measurement (384171d)
-/// pinned the hints-accepted order in this table instead: its observatory
-/// presented a trusted certificate, which is what makes Chrome process
-/// `Accept-CH` at all, while production connections are untrusted and stay
-/// low-entropy. The two states place `user-agent` and `cf-chl-ra`
-/// differently and cannot share one table; production is low-entropy, so
-/// that is what is pinned here.
+/// The six high-entropy slots keep their old block (the hints-accepted
+/// observatory state asserts only presence, not order) but sit after
+/// `sec-ch-ua`, where they cannot disturb the measured low-entropy prefix:
+/// in the production topology the hint gate never opens for the challenge's
+/// no-initiator subresources (see `may_send_accepted_client_hints`), so the
+/// slots stay empty on the wire here. A hints-accepted subresource order for
+/// the 149 build is unmeasured.
 pub(crate) const SUBRESOURCE_ORDER: &[&str] = &[
     "content-length",
-    "sec-ch-ua-full-version-list",
     "sec-ch-ua-platform",
-    "user-agent",
+    "accept-language",
     "sec-ch-ua",
+    "sec-ch-ua-full-version-list",
     "sec-ch-ua-bitness",
-    "content-type",
-    "cf-chl",
-    "cf-chl-ra",
-    "sec-ch-ua-mobile",
     "sec-ch-ua-model",
     "sec-ch-ua-arch",
     "sec-ch-ua-full-version",
     "sec-ch-ua-platform-version",
+    "cf-chl-ra",
+    "sec-ch-ua-mobile",
+    "user-agent",
+    "content-type",
+    "cf-chl",
     "accept",
     "origin",
     "sec-fetch-site",
@@ -134,7 +143,6 @@ pub(crate) const SUBRESOURCE_ORDER: &[&str] = &[
     "sec-fetch-storage-access",
     "referer",
     "accept-encoding",
-    "accept-language",
     "cookie",
     "priority",
 ];
@@ -375,6 +383,7 @@ mod tests {
                 "sec-ch-ua",
                 "sec-ch-ua-mobile",
                 "sec-ch-ua-platform",
+                "accept-language",
                 "upgrade-insecure-requests",
                 "user-agent",
                 "accept",
@@ -383,7 +392,6 @@ mod tests {
                 "sec-fetch-user",
                 "sec-fetch-dest",
                 "accept-encoding",
-                "accept-language",
                 "priority",
             ],
         );
@@ -392,9 +400,12 @@ mod tests {
         assert_eq!(value(&build_chrome_headers(&plan), "sec-fetch-user"), Some("?1"));
     }
 
-    // The subresource shape, as Chrome 154 put it on the wire for a page
-    // `fetch()` to a cross-site origin with credentials. `content-length` is
-    // absent because this request carries no body.
+    // The subresource shape, as the production reference (Chromium 149) put
+    // it on the wire for a page `fetch()` to a cross-site origin with
+    // credentials. `content-length` is absent because this request carries no
+    // body. `accept-language` follows `sec-ch-ua-platform` directly and
+    // `user-agent` sits after `sec-ch-ua-mobile` — both differ from the 154
+    // measurement this table replaced.
     #[test]
     fn scripted_fetch_header_order_matches_chrome_h2() {
         let fingerprint = fingerprint();
@@ -417,9 +428,10 @@ mod tests {
             names(&build_chrome_headers(&plan)),
             vec![
                 "sec-ch-ua-platform",
-                "user-agent",
+                "accept-language",
                 "sec-ch-ua",
                 "sec-ch-ua-mobile",
+                "user-agent",
                 "accept",
                 "origin",
                 "sec-fetch-site",
@@ -428,15 +440,14 @@ mod tests {
                 "sec-fetch-storage-access",
                 "referer",
                 "accept-encoding",
-                "accept-language",
                 "priority",
             ],
         );
     }
 
-    // A body moves `content-length` to the front; `content-type` sits between
-    // `sec-ch-ua` and `sec-ch-ua-mobile`, which is where Chromium 154 puts it
-    // and where no hand-rolled list would guess.
+    // A body moves `content-length` to the front; with the caller's
+    // `content-type` set, Chromium 149 orders the block platform,
+    // accept-language, sec-ch-ua, sec-ch-ua-mobile, user-agent, content-type.
     #[test]
     fn a_body_puts_content_length_first_and_content_type_in_chromes_slot() {
         let fingerprint = fingerprint();
@@ -456,12 +467,14 @@ mod tests {
         plan.body_len = Some(5);
 
         assert_eq!(
-            names(&build_chrome_headers(&plan))[..5],
+            names(&build_chrome_headers(&plan))[..7],
             [
                 "content-length",
                 "sec-ch-ua-platform",
-                "user-agent",
+                "accept-language",
                 "sec-ch-ua",
+                "sec-ch-ua-mobile",
+                "user-agent",
                 "content-type",
             ],
         );
@@ -469,7 +482,7 @@ mod tests {
         let names = names(&build_chrome_headers(&plan));
         let ua = names.iter().position(|name| name == "user-agent").unwrap();
         let ct = names.iter().position(|name| name == "content-type").unwrap();
-        assert_eq!(ct, ua + 2);
+        assert_eq!(ct, ua + 1);
     }
 
     // A form-submission navigation is the same shape as a GET navigation with
@@ -509,6 +522,7 @@ mod tests {
                 "sec-ch-ua",
                 "sec-ch-ua-mobile",
                 "sec-ch-ua-platform",
+                "accept-language",
                 "upgrade-insecure-requests",
                 "content-type",
                 "user-agent",
@@ -518,9 +532,9 @@ mod tests {
                 "sec-fetch-mode",
                 "sec-fetch-user",
                 "sec-fetch-dest",
+                "sec-fetch-storage-access",
                 "referer",
                 "accept-encoding",
-                "accept-language",
                 "priority",
             ],
         );
@@ -589,7 +603,7 @@ mod tests {
         assert_eq!(value(&built, "accept"), Some("application/json"));
         assert_eq!(
             names(&built)[..4],
-            ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "upgrade-insecure-requests"],
+            ["sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "accept-language"],
         );
     }
 
