@@ -8586,8 +8586,9 @@ fn op_post_to_frame(
             return "dropped".into();
         }
         if __dbg {
-            eprintln!("[pmsg] post_to_frame host={} -> queued payload_bytes={} payload={}",
-                host_nid, payload.len(), payload);
+            eprintln!("[pmsg] post_to_frame host={} -> queued root={:?} frame={} gen={} scope_url={} payload_bytes={} payload={}",
+                host_nid, target_root, target_scope.frame_id, target_scope.document_generation,
+                target_scope.url, payload.len(), payload);
         }
         // MessageEvent.source, reconstructed in the target realm: `parent`
         // when the sender document directly contains the host, `top` when the

@@ -804,6 +804,15 @@ impl DomTree {
         }
 
         let previous = inner.iframe_content_documents.insert(host, root);
+        if std::env::var_os("OBSCURA_DEBUG_TREE_DETACH").is_some() {
+            eprintln!(
+                "[attach-doc] t={:?} host={:?} root={:?} previous={:?}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()),
+                host,
+                root,
+                previous
+            );
+        }
         if let Some(previous) = previous {
             inner.iframe_content_documents_by_root.remove(&previous);
             // The superseded document is no longer connected to the page.
