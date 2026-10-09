@@ -268,3 +268,4 @@
 // @obscura-module env/html/table-element.js
 // @obscura-module config/typedarray-base64.js
 // @obscura-module config/proto-order-fixups.js
+// @obscura-module config/native-own-surface.js

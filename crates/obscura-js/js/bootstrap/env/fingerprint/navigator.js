@@ -272,7 +272,11 @@ registerNavigatorSurface();
   function defGetter(key, fn) {
     // The getter is exposed as a property of the interface: Chrome's own
     // surface is [length, name] with no prototype, so the value goes
-    // through the method-literal wrapper before install.
+    // through the method-literal wrapper before install. The wrapper's
+    // computed key carries the accessor naming ("get x") a page reads
+    // off Function.prototype.name; a plain fn.name fallback answers "fn".
+
+    Object.defineProperty(fn, 'name', { value: 'get ' + key, configurable: true });
     Object.defineProperty(_navProto, key, {
       get: _obscuraMethodLiteral(fn), set: undefined, enumerable: true, configurable: true,
     });

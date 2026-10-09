@@ -56,7 +56,10 @@ function _installWasmMemoryControl() {
     detach(old);
   };
 
-  proto.toFixedLengthBuffer = function toFixedLengthBuffer() {
+  // Both methods are interface members: [length, name], no prototype slot,
+  // native toString -- a bare expression carries the slot and stringifies
+  // as source. The method-literal wrapper keeps name and length.
+  proto.toFixedLengthBuffer = _obscuraMethodLiteral(function toFixedLengthBuffer() {
     const info = state.get(this);
     if (info === undefined && !(this instanceof WA.Memory)) {
       throw new TypeError(
@@ -68,9 +71,9 @@ function _installWasmMemoryControl() {
     info.resizable = false;
     replaceBuffer(this, fixed);
     return fixed;
-  };
+  });
 
-  proto.toResizableBuffer = function toResizableBuffer() {
+  proto.toResizableBuffer = _obscuraMethodLiteral(function toResizableBuffer() {
     const info = state.get(this);
     if (info === undefined && !(this instanceof WA.Memory)) {
       throw new TypeError(
@@ -96,7 +99,7 @@ function _installWasmMemoryControl() {
       return resizable;
     }
     return this.buffer;
-  };
+  });
 
   // Record each construction's declared maximum so toResizableBuffer can
   // answer the TypeError a memory without one owes. The native constructor
@@ -123,18 +126,22 @@ function _installWasmMemoryControl() {
 
   if (WA.Exception && WA.Exception.prototype
       && !('stack' in WA.Exception.prototype)) {
+    // The getter is an interface accessor half: "get stack", no prototype
+    // slot, native toString.
+    const stackGetter = function () {
+      if (!(this instanceof WA.Exception)) {
+        throw new TypeError(
+          'WebAssembly.Exception.stack(): '
+          + 'Receiver is not a WebAssembly.Exception');
+      }
+      // The wasm-thrown exceptions the engine produces answer undefined;
+      // {traceStack:true} is the only string case and the engine never
+      // constructs one, so the getter stays a constant read.
+      return undefined;
+    };
+    Object.defineProperty(stackGetter, 'name', { value: 'get stack', configurable: true });
     Object.defineProperty(WA.Exception.prototype, 'stack', {
-      get() {
-        if (!(this instanceof WA.Exception)) {
-          throw new TypeError(
-            'WebAssembly.Exception.stack(): '
-            + 'Receiver is not a WebAssembly.Exception');
-        }
-        // The wasm-thrown exceptions the engine produces answer undefined;
-        // {traceStack:true} is the only string case and the engine never
-        // constructs one, so the getter stays a constant read.
-        return undefined;
-      },
+      get: _obscuraMethodLiteral(stackGetter),
       enumerable: true, configurable: true,
     });
   }

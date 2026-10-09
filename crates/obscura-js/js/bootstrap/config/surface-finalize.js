@@ -2606,15 +2606,20 @@ try {
   let windowName = '';
   let windowStatus = '';
   const accessor = (name, getter, setter) => {
-    const get = _markNativeAs(getter, 'function get ' + name + '() { [native code] }');
-    Object.defineProperty(get, 'name', { value: 'get ' + name, configurable: true });
+    // Each half is an interface function: [length, name] with no prototype
+    // slot (a plain expression would carry a constructible slot Chrome never
+    // gives an accessor half). The name sits on the expression before the
+    // method-literal wrapper copies it.
+    Object.defineProperty(getter, 'name', { value: 'get ' + name, configurable: true });
+    const get = _markNativeAs(
+      _obscuraMethodLiteral(getter), 'function get ' + name + '() { [native code] }');
     const descriptor = {
       get, enumerable: true, configurable: true,
     };
     if (setter) {
-      const set = _markNativeAs(setter, 'function set ' + name + '() { [native code] }');
-      Object.defineProperty(set, 'name', { value: 'set ' + name, configurable: true });
-      descriptor.set = set;
+      Object.defineProperty(setter, 'name', { value: 'set ' + name, configurable: true });
+      descriptor.set = _markNativeAs(
+        _obscuraMethodLiteral(setter), 'function set ' + name + '() { [native code] }');
     } else {
       descriptor.set = undefined;
     }

@@ -100,7 +100,12 @@
   });
 
   function _policyFactoryMethod(method, ctor) {
-    return _markNative(function (input) {
+    // The policy methods are interface members: their own surface is
+    // [length, name] with no prototype slot (the r5/r6 family probed it);
+    // the factory closure goes through the method-literal wrapper. The
+    // wrapper takes its name from fn.name, so the factory carries the
+    // method name first -- an anonymous expression would answer 'fn'.
+    const factory = function (input) {
       if (arguments.length < 1) {
         throw new TypeError(
           "Failed to execute '" + method + "' on 'TrustedTypePolicy': " +
@@ -116,7 +121,9 @@
       }
       const extra = Array.prototype.slice.call(arguments, 1);
       return _mint(ctor, callback.apply(undefined, [String(input)].concat(extra)));
-    });
+    };
+    Object.defineProperty(factory, 'name', { value: method, configurable: true });
+    return _obscuraMethodLiteral(factory);
   }
   _defineHidden(TrustedTypePolicy.prototype, 'createHTML',
     _policyFactoryMethod('createHTML', TrustedHTML));

@@ -17,11 +17,18 @@ function _webgpuInstallLimitsMembers(names) {
     if (name !== 'constructor') delete proto[name];
   }
   for (const name of names) {
+    // Each member is an interface accessor half: Chrome answers
+    // 'function get maxTextureDimension1D() { [native code] }' with
+    // [length, name] owned and no prototype slot. A bare method shorthand
+    // keeps the shape but stringifies as source, so the getter is named
+    // after its kind and goes through the method-literal wrapper.
+    const getter = function () {
+      const vals = this[_gpuLimitValues];
+      return vals ? vals[name] : undefined;
+    };
+    Object.defineProperty(getter, 'name', { value: 'get ' + name, configurable: true });
     Object.defineProperty(proto, name, {
-      get() {
-        const vals = this[_gpuLimitValues];
-        return vals ? vals[name] : undefined;
-      },
+      get: _obscuraMethodLiteral(getter),
       enumerable: true, configurable: true,
     });
   }
