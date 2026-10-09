@@ -162,3 +162,18 @@ run covers are then removed.
   pass 3/3 in isolation; same timer-floor family as the earlier
   jitter-sample flake; 1 skipped) + obscura-browser (141: 140 passed,
   blob iframe red pre-existing). Full gate deferred to the next backfill.
+
+- Worker constructor chain (10-10, k118 r9/r10 finding): the class was a
+  bare `class Worker` with only the prototype side bridged to
+  EventTarget.prototype, so Object.getPrototypeOf(Worker) answered
+  Function.prototype where Chrome's class Worker extends EventTarget
+  answers EventTarget; the challenge's Worker node reads that slot (r9
+  here where Chrome appends r10). The constructor side is now linked the
+  same way. Probe: chain fields match Chrome exactly, construction and
+  instanceof EventTarget unchanged. Scoped: obscura-js (779: 773 passed,
+  four documented pre-existing reds -- canvas emoji x2, webgpu x2 -- plus
+  frame_realm_timers_carry_the_configured_dispatch_floor and
+  timing_edits_preserve_identity_and_pause_holds_then_resumes as load
+  flakes, both pass 3/3 in isolation; 1 skipped) + obscura-browser (141:
+  140 passed, blob iframe red pre-existing). Full gate deferred to the
+  next backfill.
