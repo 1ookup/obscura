@@ -253,6 +253,57 @@ const MACOS_SANS_SHARED_EMOJI_INK: Option<(f32, f32, f32, f32)> =
 /// The emoji the identity sans face covers, read off the reference's
 /// `TextMetrics` at 16px. A base character and its emoji presentation selector
 /// shape as one cluster, so the cluster's first character decides.
+/// A pure-emoji string's metrics from the identity sans table, scaled to the
+/// requested size. The bundled faces carry no emoji outlines, so shaping
+/// yields no glyphs and the canvas measure answers all zeros where the
+/// reference reports the emoji's own advance and ink box. Mixed strings stay
+/// with the shaped answer (their emoji share is a rarer probe).
+pub fn emoji_only_metrics(text: &str, font_size: f32) -> Option<(f32, f32, f32, f32, f32)> {
+    if font_platform() != FontPlatform::MacOs {
+        return None;
+    }
+    let scale = font_size / 16.0;
+    let mut width = 0.0f32;
+    let mut ink: Option<(f32, f32, f32, f32)> = None;
+    let mut clusters = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(first) = chars.next() {
+        // A base character plus its emoji presentation selector is one
+        // cluster, same as the shaper would group it.
+        let mut cluster = String::new();
+        cluster.push(first);
+        while let Some(&next) = chars.peek() {
+            if next == '\u{FE0F}' {
+                cluster.push(next);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        clusters += 1;
+        let metric = macos_sans_emoji_metric(&cluster)?;
+        width += metric.advance * scale;
+        // The box is placed once per run: a repeated emoji widens the width
+        // but reports the single-glyph box, like the reference.
+        if ink.is_none() {
+            ink = metric.ink;
+        }
+    }
+    if clusters == 0 {
+        return None;
+    }
+    // The table's tuple is the paint path's `(left, right, top, bottom)` in
+    // identity units; the same px conversion applies.
+    let (left, right, top, bottom) = ink?;
+    Some((
+        width,
+        top * scale,
+        bottom * scale,
+        right * scale,
+        left * scale,
+    ))
+}
+
 fn macos_sans_emoji_metric(cluster: &str) -> Option<EmojiMetric> {
     let (advance, ink) = match cluster.chars().next()? {
         '\u{1F600}' => (28.70400047302246, MACOS_SANS_SHARED_EMOJI_INK),

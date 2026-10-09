@@ -231,13 +231,24 @@ impl CanvasTextMeasurer {
     /// cannot contradict the element heights the engine produces next door.
     pub fn measure_metrics(&mut self, text: &str, font: &str) -> CanvasTextMetrics {
         let style = self.style_for(font);
-        let width = if text.is_empty() {
+        let mut width = if text.is_empty() {
             0.0
         } else {
             self.engine.measure_canvas_text(text, &style)
         };
-        let (ink_left, ink_right, ink_ascent, ink_descent) =
-            self.engine.measure_canvas_ink(text, &style);
+        let mut ink = self.engine.measure_canvas_ink(text, &style);
+        // The bundled faces carry no emoji outlines, so a pure-emoji string
+        // shapes to no glyphs and measures all zeros where the reference
+        // reports the identity face's own advance and ink box. Mixed strings
+        // keep the shaped answer.
+        let size = style.font_size.unwrap_or(10.0);
+        if let Some((w, ascent, descent, right, left)) =
+            inline::emoji_only_metrics(text, size)
+        {
+            width = w;
+            ink = (left, right, ascent, descent);
+        }
+        let (ink_left, ink_right, ink_ascent, ink_descent) = ink;
         let (font_ascent, font_descent) = self.engine.inline_font_box_metrics(&style);
         let (hanging_baseline, ideographic_baseline) = self.engine.canvas_baselines(&style);
         CanvasTextMetrics {

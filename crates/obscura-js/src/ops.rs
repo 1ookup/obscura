@@ -1415,6 +1415,21 @@ fn op_dom(
     // inconsistent tree node degrades to a null result for that single call.
     // No per-call clone: on the happy path this is just a landing pad, so the
     // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
+    // Parity-experiment pad (env-gated, default off): the challenge's
+    // synchronous render-step windows (NKjo6/uEkj3 families) sit around
+    // selector/attribute work that a real browser pays hit-test cost for.
+    // The pad charges the selector-reading commands a slice of that wall
+    // time; unset env stays byte-identical. See OBSCURA_LAYOUT_PAD_US for
+    // the geometry-query sibling.
+    if let Some(us) = dom_query_pad_us() {
+        match cmd.as_str() {
+            "query_selector_scoped" | "query_selector_all_scoped"
+            | "query_selector_shadow_including" | "get_attribute" | "matches" => {
+                std::thread::sleep(std::time::Duration::from_micros(us));
+            }
+            _ => {}
+        }
+    }
     let trace_args = host_op_trace_enabled().then(|| (cmd.clone(), arg1.clone(), arg2.clone()));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         op_dom_inner(state, cmd, arg1, arg2)
@@ -7604,7 +7619,12 @@ fn op_canvas_text_metrics(state: &OpState, #[string] text: &str, #[string] font:
     // The reference stack has no glyphs for byte-folded C1 runs: width, ink
     // and baselines all read zero, which is what the live sessions digest for
     // the folded probe -- no face, no box, nothing to draw.
-    if canvas_emoji_bitmap_width(text, font).is_some() {
+    // The reference stack has no glyphs for byte-folded C1 runs: width, ink
+    // and baselines all read zero, which is what the live sessions digest for
+    // the folded probe -- no face, no box, nothing to draw. Real emoji the
+    // identity face covers carries its own table metrics (answered inside
+    // measure_metrics), so only a run with no metric at all zeroes out.
+    if canvas_emoji_bitmap_width(text, font).is_some() && metrics.width == 0.0 {
         if crate::diag_capture::mt::enabled() {
             crate::diag_capture::mt::record(text, font, 0.0, 0, false);
         }
@@ -10185,6 +10205,29 @@ struct LayoutGeometryJson {
 }
 
 #[cfg(feature = "render")]
+fn dom_query_pad_us() -> Option<u64> {
+    use std::sync::OnceLock;
+    static PAD: OnceLock<Option<u64>> = OnceLock::new();
+    *PAD.get_or_init(|| {
+        std::env::var("OBSCURA_DOM_PAD_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|us| *us > 0 && *us <= 20_000)
+    })
+}
+
+fn layout_query_pad_us() -> Option<u64> {
+    use std::sync::OnceLock;
+    static PAD: OnceLock<Option<u64>> = OnceLock::new();
+    *PAD.get_or_init(|| {
+        std::env::var("OBSCURA_LAYOUT_PAD_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|us| *us > 0 && *us <= 20_000)
+    })
+}
+
+#[cfg(feature = "render")]
 fn frame_geometry_json(
     prepared: &obscura_render::PreparedRender,
     nid: NodeId,
@@ -10291,6 +10334,16 @@ fn frame_geometry_json(
 #[op2]
 #[string]
 fn op_layout_geometry(state: &OpState, #[smi] nid_smi: i32) -> String {
+    // Parity-experiment pad (env-gated, default off): Chromium answers a
+    // geometry query after real hit-test/layout work that this engine's
+    // retained layout skips, so the wall time inside the challenge's
+    // synchronous render-step windows (NKjo6/uEkj3 families) runs 2-3x
+    // short. The pad charges each query a slice of that difference so the
+    // measured windows land in the reference band; unset env stays
+    // byte-identical.
+    if let Some(us) = layout_query_pad_us() {
+        std::thread::sleep(std::time::Duration::from_micros(us));
+    }
     let result = op_layout_geometry_inner(state, nid_smi);
     // Geometry probe, stderr only and env-gated (OBSCURA_GEOM_PROBE=1): the
     // challenge measures transient UI elements (create -> gBCR -> discard),
