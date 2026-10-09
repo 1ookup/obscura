@@ -129,3 +129,21 @@ run covers are then removed.
   render-repros fixture suite renders 63/63 on the obscura side, chromium
   baseline capture missing playwright). Full workspace run deferred to
   the next backfill.
+
+- Promise-API function kinds (10-10, r12 finding from cfov2): fetch,
+  MediaCapabilities.decodingInfo/encodingInfo, ReadableStream.pipeTo and
+  SubtleCrypto.digest were async functions, so the AsyncFunction kind was
+  observable (prototype chain, constructor.name, Object.prototype.toString
+  tag) where Chrome's counterparts are native methods; the challenge's
+  environment loop appends a per-node anomaly code for each (652/860/1148/
+  1340 in sObF6). They are now concise methods forwarding to async
+  implementations, so rejection semantics and API shape are unchanged.
+  Local dual-engine probe: the old build reported AsyncFunction /
+  [object AsyncFunction] for all four, the new build matches Chrome field
+  for field; functional probe 6/6 (fetch, digest, decodingInfo key order,
+  both rejection paths, pipeTo). Scoped: obscura-js (779: 774 passed, four
+  documented pre-existing reds -- canvas emoji x2, webgpu x2 -- plus
+  frame_realm_timer_floor_jitter as a load flake, pass 3/3 in isolation;
+  1 skipped; the four-API filter 37/37) + obscura-browser (141: 140
+  passed, blob iframe red pre-existing at 03d271a). Full gate deferred to
+  the next backfill.
