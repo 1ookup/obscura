@@ -7205,7 +7205,27 @@ impl Page {
         // Even an empty HTML response is a complete Document with an html,
         // head and body. Skipping the parser left about:blank and empty
         // srcdoc documents as bare Document nodes after the async commit.
-        let quirks = obscura_dom::parse_into_subtree(dom, content_root, &html);
+        let mut quirks = obscura_dom::parse_into_subtree(dom, content_root, &html);
+        // A srcdoc document inherits its embedder's quirks mode unless the
+        // srcdoc itself opens with a doctype (Chromium 149 measured: a
+        // doctypeless srcdoc under a standards-mode parent answers compatMode
+        // CSS1Compat, while an initial about:blank document answers
+        // BackCompat regardless of the parent -- which is why only the srcdoc
+        // path takes the inheritance). The challenge's parent-side probe
+        // reads the child's compatMode and rebuilds the frame when it
+        // disagrees with the embedder's mode.
+        if request.srcdoc.is_some() && quirks {
+            let trimmed = html.trim_start();
+            if !trimmed.starts_with("<!doctype") && !trimmed.starts_with("<!DOCTYPE") {
+                let parent_quirks = dom
+                    .containing_document_root_shadow_including(host_nid)
+                    .or_else(|| dom.host_frame_parent_root(host_nid))
+                    .and_then(|root| dom.document_scope(root).map(|scope| scope.quirks));
+                if let Some(parent_quirks) = parent_quirks {
+                    quirks = parent_quirks;
+                }
+            }
+        }
         document_csp = effective_document_csp(dom, content_root, document_csp);
         // A CSP sandbox declared in metadata takes effect once the parser has
         // seen the meta element. It must update the security context as well
