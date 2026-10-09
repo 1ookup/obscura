@@ -60,11 +60,15 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
     if (legacy.offerToReceiveVideo && !slots.transceivers.some(item => item.kind === 'video')) {
       slots.transceivers.push({ kind: 'video', mid: null, direction: 'recvonly', currentDirection: null, stop() {} });
     }
-    return Promise.resolve(new RTCSessionDescription({ type: 'offer', sdp: _rtcBuildOffer(slots) }));
+    // Chrome hands back a plain object from createOffer (constructor Object,
+    // own keys type/sdp); only the stored localDescription is an
+    // RTCSessionDescription. A page that stringifies or constructors the
+    // argument it passes to setLocalDescription reads the difference.
+    return Promise.resolve({ type: 'offer', sdp: _rtcBuildOffer(slots) });
   }
   createAnswer() {
     const slots = _rtcSlots(this);
-    return Promise.resolve(new RTCSessionDescription({ type: 'answer', sdp: _rtcBuildOffer(slots) }));
+    return Promise.resolve({ type: 'answer', sdp: _rtcBuildOffer(slots) });
   }
   setLocalDescription(description) {
     const slots = _rtcSlots(this);
