@@ -6366,6 +6366,12 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 /// order of 100; this is deliberately lower but far above real embed stacks.
 pub const MAX_FRAME_DEPTH: usize = 32;
 
+/// Slice length for the frame-document fetch pump. While a child frame's
+/// document is in flight the page realm's event loop gets a bounded turn
+/// every slice, so timers keep firing on schedule the way Chrome's do
+/// during a frame navigation.
+const FRAME_FETCH_JS_SLICE_MS: u64 = 25;
+
 /// OBSCURA_DEBUG_FRAMES=1 reports every frame-navigation route. Two routes can
 /// both discover the same newly connected iframe, and a discovered navigation
 /// followed by an explicit one for the same frame fetches its document twice.
@@ -6973,63 +6979,90 @@ impl Page {
                     let frame_referrer = inherited_referrer
                         .as_deref()
                         .and_then(|value| Url::parse(value).ok());
+                    // Timers must keep running while a child frame's document
+                    // is in flight. Chrome services the page realm's event
+                    // loop during a frame navigation; awaiting this fetch
+                    // inline starved it until the response landed (in the
+                    // freeze fixture a parent setTimeout(100) fired 1.4s
+                    // late, shifting every timer-driven schedule on the
+                    // page). Slice the fetch and give the realm a bounded
+                    // pump turn between slices. The future owns cloned
+                    // handles so it does not borrow the page across the
+                    // await; a superseded navigation is still refused below.
+                    let fetch_client = self.http_client.clone();
+                    let fetch_callbacks = self.callbacks.clone();
                     #[cfg(feature = "stealth")]
-                    let response = if method == Method::GET {
-                        if let Some(stealth) = &self.stealth_client {
-                            stealth
-                                .fetch_frame_document_with_referrer_headers(
-                                    &resolved,
-                                    frame_referrer.clone(),
-                                    frame_initiator.clone(),
-                                    frame_policy,
-                                    navigation_headers.clone(),
-                                    Some(&self.callbacks),
-                                )
-                                .await
-                        } else {
-                            self.http_client
-                                .fetch_frame_document_with_method_referrer_headers(
-                                    method,
-                                    &resolved,
-                                    request.body.clone(),
-                                    frame_referrer.clone(),
-                                    frame_initiator.clone(),
-                                    frame_policy,
-                                    navigation_headers.clone(),
-                                    Some(&self.callbacks),
-                                )
-                                .await
+                    let fetch_stealth = self.stealth_client.clone();
+                    let fetch_url = resolved.clone();
+                    let fetch_body = request.body.clone();
+                    let fetch_referrer = frame_referrer.clone();
+                    let fetch_initiator = frame_initiator.clone();
+                    let fetch_headers = navigation_headers.clone();
+                    let fetch = async move {
+                        #[cfg(feature = "stealth")]
+                        if method == Method::GET {
+                            if let Some(stealth) = &fetch_stealth {
+                                return stealth
+                                    .fetch_frame_document_with_referrer_headers(
+                                        &fetch_url,
+                                        fetch_referrer.clone(),
+                                        fetch_initiator.clone(),
+                                        frame_policy,
+                                        fetch_headers.clone(),
+                                        Some(&fetch_callbacks),
+                                    )
+                                    .await;
+                            }
                         }
-                    } else {
-                        self.http_client
+                        fetch_client
                             .fetch_frame_document_with_method_referrer_headers(
                                 method,
-                                &resolved,
-                                request.body.clone(),
-                                frame_referrer,
-                                frame_initiator,
+                                &fetch_url,
+                                fetch_body,
+                                fetch_referrer,
+                                fetch_initiator,
                                 frame_policy,
-                                navigation_headers,
-                                Some(&self.callbacks),
+                                fetch_headers,
+                                Some(&fetch_callbacks),
                             )
                             .await
-                    }
-                    .map_err(|error| FrameNavigateError::Fetch(error.to_string()))?;
-                    #[cfg(not(feature = "stealth"))]
-                    let response = self
-                        .http_client
-                        .fetch_frame_document_with_method_referrer_headers(
-                            method,
-                            &resolved,
-                            request.body.clone(),
-                            frame_referrer,
-                            frame_initiator,
-                            frame_policy,
-                            navigation_headers,
-                            Some(&self.callbacks),
+                    };
+                    let mut fetch = std::pin::pin!(fetch);
+                    let response = loop {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(FRAME_FETCH_JS_SLICE_MS),
+                            &mut fetch,
                         )
                         .await
-                        .map_err(|error| FrameNavigateError::Fetch(error.to_string()))?;
+                        {
+                            Ok(result) => break result,
+                            Err(_) => {
+                                // The drain holds the DOM tree (borrowed
+                                // from the realm); hand it back for the
+                                // slice so timers can touch document, then
+                                // take it again for the continuation.
+                                if let Some(dom) = self.dom.take() {
+                                    if let Some(js) = self.js.as_ref() {
+                                        js.return_borrowed_dom(dom);
+                                    }
+                                }
+                                if let Some(js) = self.js.as_mut() {
+                                    let _ = js
+                                        .run_event_loop_until_quiescent(
+                                            FRAME_FETCH_JS_SLICE_MS,
+                                            0,
+                                        )
+                                        .await;
+                                }
+                                if self.dom.is_none() {
+                                    if let Some(js) = self.js.as_ref() {
+                                        self.dom = js.take_dom();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .map_err(|error| FrameNavigateError::Fetch(error.to_string()))?;
                     // A stale navigation must not commit, parse or execute.
                     if !self
                         .frames
