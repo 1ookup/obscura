@@ -388,6 +388,7 @@ pub struct ObscuraState {
     pub(crate) canvas_text_measurer: obscura_render::CanvasTextMeasurer,
     /// Color-emoji raster for canvas fillText (sbix strikes from the host's
     /// Apple Color Emoji collection, isolated from the shaping database).
+    #[cfg(feature = "render")]
     pub(crate) canvas_emoji_raster: obscura_render::CanvasEmojiRaster,
     #[cfg(feature = "render")]
     pub viewport: (f32, f32),
@@ -590,6 +591,7 @@ impl ObscuraState {
             canvas_surfaces: HashMap::new(),
             #[cfg(feature = "render")]
             canvas_text_measurer: obscura_render::CanvasTextMeasurer::new(),
+            #[cfg(feature = "render")]
             canvas_emoji_raster: obscura_render::CanvasEmojiRaster::new(),
             #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
@@ -1421,6 +1423,7 @@ fn op_dom(
     // The pad charges the selector-reading commands a slice of that wall
     // time; unset env stays byte-identical. See OBSCURA_LAYOUT_PAD_US for
     // the geometry-query sibling.
+    #[cfg(feature = "render")]
     if let Some(us) = dom_query_pad_us() {
         match cmd.as_str() {
             "query_selector_scoped" | "query_selector_all_scoped"
@@ -10406,6 +10409,7 @@ fn op_layout_geometry(state: &OpState, #[smi] nid_smi: i32) -> String {
     result
 }
 
+#[cfg(feature = "render")]
 fn op_layout_geometry_inner(state: &OpState, nid_smi: i32) -> String {
     let shared = state.borrow::<SharedState>().clone();
     let nid = obscura_dom::tree::NodeId::new(nid_smi.max(0) as u32);
