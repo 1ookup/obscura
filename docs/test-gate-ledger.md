@@ -177,3 +177,13 @@ run covers are then removed.
   flakes, both pass 3/3 in isolation; 1 skipped) + obscura-browser (141:
   140 passed, blob iframe red pre-existing). Full gate deferred to the
   next backfill.
+
+- Obstacle-course backfill (10-10, after cloning the public companion repo
+  github.com/h4ckf0r0day/obscura-benchmark): 32/33. The one red is the
+  fingerprint stage, and it is not a regression: four generations of the
+  binary (2fcc828, f83abcb, c9058682, deployed) all report the same
+  host-derived persona (plat=MacIntel, lang=zh-CN, tz=Asia/Shanghai) where
+  the upstream manifest expects Win32/en-US/Europe/Berlin; TZ=Europe/Berlin
+  in the environment flips only the timezone, --stealth changes none of the
+  three. Persona default/profile config is a separate item. All 32 other
+  stages pass (median 3.2s/stage).
