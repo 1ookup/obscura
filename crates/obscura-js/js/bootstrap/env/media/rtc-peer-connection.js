@@ -115,7 +115,14 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
       } catch (_error) {}
     };
     _rtcGatherCandidates(this, slots);
-    return Promise.resolve().then(announceGathering);
+    // Chrome fires the gathering announcement after the caller's promise
+    // reactions (setLocalDescription resolves at 121.9ms, gathering at
+    // 122.2ms on the reference): a VM that attaches its listener inside
+    // its own .then would miss an announcement that ran first. A queued
+    // task lands after every pending reaction and still long before the
+    // gather loop's complete (single-digit ms here, 140ms there).
+    setTimeout(() => { try { announceGathering(); } catch (_e) {} }, 0);
+    return Promise.resolve();
   }
   setRemoteDescription(description) {
     _rtcSlots(this).remoteDescription = description ? new RTCSessionDescription(description) : null;
