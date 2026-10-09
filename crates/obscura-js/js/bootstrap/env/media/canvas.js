@@ -2955,38 +2955,55 @@ function _svgAdvanceTo(element, count) {
   return _measureTextBox(_svgTextContent(element).slice(0, count), _svgMeasurementFont(element)).width;
 }
 
-Element.prototype.attachShadow = function attachShadow(opts) {
-  var _mode = opts == null ? undefined : opts.mode;
-  if (_mode !== 'open' && _mode !== 'closed') {
-    throw new TypeError('Failed to execute attachShadow on Element: the mode value is not a valid ShadowRootMode.');
-  }
-  var _ln = (this.localName || '').toLowerCase();
-  if (!globalThis.__obscura_shadowHostNames.has(_ln) && _ln.indexOf('-') === -1) {
-    throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
-  }
-  if (Deno.core.ops.op_shadow_root_info(this[_nidSym])) {
-    throw new DOMException('Failed to execute attachShadow on Element: the element already hosts a shadow tree.', 'NotSupportedError');
-  }
-  const rootNid = Deno.core.ops.op_shadow_attach(this[_nidSym], _mode);
-  if (rootNid < 0) {
-    throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
-  }
-  const shadow = new ShadowRoot(rootNid, this, opts);
-  _treeMutationEpoch++;
-  _hset(shadow, "_treeDetachedExact", false);
-  shadow[_treeParentSym] = null;
-  shadow[_treeParentEpochSym] = _treeMutationEpoch;
-  _hset(shadow, "_treeConnected", this.isConnected);
-  _hset(shadow, "_treeConnectedEpoch", _treeMutationEpoch);
-  _cache.set(rootNid, shadow);
-  try {
-    const registry = shadow.customElementRegistry;
-    const state = _customElementRegistryData(registry);
-    state.roots.add(shadow);
-    _customElementUpgradeRoot(registry, shadow);
-  } catch (_error) {}
-  return shadow;
+// Chrome's Element.prototype.attachShadow is a method on the interface
+// literal: its own properties are exactly length and name, with no
+// constructible prototype. A function expression carries a prototype own
+// property a real builtin does not have ('prototype' in f answers true),
+// which is a probe a page can read without any observable call -- the
+// sObF6 hit family's suspected r5/r6 pair. Defined as a property of an
+// object literal and copied over, which mints a shorthand-shaped function.
+const _attachShadowShorthand = {
+  attachShadow(opts) {
+    var _mode = opts == null ? undefined : opts.mode;
+    if (_mode !== 'open' && _mode !== 'closed') {
+      throw new TypeError('Failed to execute attachShadow on Element: the mode value is not a valid ShadowRootMode.');
+    }
+    var _ln = (this.localName || '').toLowerCase();
+    if (!globalThis.__obscura_shadowHostNames.has(_ln) && _ln.indexOf('-') === -1) {
+      throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
+    }
+    if (Deno.core.ops.op_shadow_root_info(this[_nidSym])) {
+      throw new DOMException('Failed to execute attachShadow on Element: the element already hosts a shadow tree.', 'NotSupportedError');
+    }
+    const rootNid = Deno.core.ops.op_shadow_attach(this[_nidSym], _mode);
+    if (rootNid < 0) {
+      throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
+    }
+    const shadow = new ShadowRoot(rootNid, this, opts);
+    _treeMutationEpoch++;
+    _hset(shadow, "_treeDetachedExact", false);
+    shadow[_treeParentSym] = null;
+    shadow[_treeParentEpochSym] = _treeMutationEpoch;
+    _hset(shadow, "_treeConnected", this.isConnected);
+    _hset(shadow, "_treeConnectedEpoch", _treeMutationEpoch);
+    _cache.set(rootNid, shadow);
+    try {
+      const registry = shadow.customElementRegistry;
+      const state = _customElementRegistryData(registry);
+      state.roots.add(shadow);
+      _customElementUpgradeRoot(registry, shadow);
+    } catch (_error) {}
+    return shadow;
+  },
 };
+// A method shorthand carries no own prototype, but copying the property
+// value keeps the constructor-function shape (V8 still allocates the
+// .prototype slot for any non-arrow function). Deleting the slot makes the
+// own-property surface exactly [length, name], matching Chrome's method on
+// the interface literal; the prototype chain stays reachable for instanceof
+// through Object.getPrototypeOf(f).
+Element.prototype.attachShadow = _attachShadowShorthand.attachShadow;
+try { delete Element.prototype.attachShadow.prototype; } catch (_error) {}
 
 _markNative(Element.prototype.attachShadow);
 
