@@ -117,3 +117,15 @@ run covers are then removed.
 (none)
 
 - Cross-origin window writes (10-10, fcPost setcast finding from cfov2): the frame-side and ancestor-side WindowProxy facades gated sets on an allowlist that let an allowlisted own member through -- a cross-origin caller assigning parent.postMessage got a plain success where Chrome refuses with SecurityError (the challenge's fcPost hook reads exactly that). Cross-origin sets now accept location only (it navigates) and refuse every other member; the allowlist Set had no other reader. Local two-port fixture: cross-origin SecurityError with the member intact and callable, same-origin unchanged. Scoped: obscura-js + obscura-browser + obscura-cdp (7 pre-existing reds unchanged). Full gate deferred to the next backfill.
+
+- Frame-fetch pump slicing (10-10, fork-A freeze finding): frame-document
+  fetches now run in 25ms slices with a bounded realm pump turn between
+  them, and the frame-navigation drain returns the borrowed DOM to the
+  realm for each slice. Scoped: obscura-browser + obscura-dom +
+  obscura-js (1014: 5 pre-existing/environment reds -- blob iframe nav
+  reproduced red at 03d271a; canvas emoji/SVG/webgpu reds in a crate with
+  no dependency edge to the change). no-default-features check passed.
+  obstacle course unavailable in this environment (companion repo absent;
+  render-repros fixture suite renders 63/63 on the obscura side, chromium
+  baseline capture missing playwright). Full workspace run deferred to
+  the next backfill.
