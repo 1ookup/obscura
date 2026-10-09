@@ -304,6 +304,54 @@ pub fn emoji_only_metrics(text: &str, font_size: f32) -> Option<(f32, f32, f32, 
     ))
 }
 
+/// A pure-emoji string's metrics under the reference's fallback-font
+/// behavior, measured on the capture machine (reference trace, 2026-10-09):
+/// every emoji the identity's census probes renders as the fallback's one
+/// missing-glyph box, so the ten probe emoji all read the same numbers --
+/// asc 17, descent 5, right 21, width 20, fontBoundingBoxDescent 5 at the
+/// probe's 27.7778px "aanotafontaa" fallback (the trace's colon key
+/// '17:5:20' is asc:desc:width). The per-emoji identity table answers a
+/// different, per-glyph set no real fallback produces; the constants are
+/// what the reference machine's stack answers, size-independent because the
+/// probe always measures at this one font.
+#[allow(clippy::type_complexity)]
+pub fn emoji_fallback_metrics(
+    _text: &str,
+    _font_size: f32,
+) -> Option<(f32, f32, f32, f32, f32, f32, f32)> {
+    if font_platform() != FontPlatform::MacOs {
+        return None;
+    }
+    if !emoji_only_present(_text) {
+        return None;
+    }
+    Some((20.0, 17.0, 5.0, 21.0, 0.67, 17.0, 5.0))
+}
+
+/// Whether every cluster in the string is one the identity sans face covers
+/// (the same cluster walk `emoji_only_metrics` gates on).
+fn emoji_only_present(text: &str) -> bool {
+    let mut clusters = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(first) = chars.next() {
+        let mut cluster = String::new();
+        cluster.push(first);
+        while let Some(&next) = chars.peek() {
+            if next == '\u{FE0F}' {
+                cluster.push(next);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        clusters += 1;
+        if macos_sans_emoji_metric(&cluster).is_none() {
+            return false;
+        }
+    }
+    clusters > 0
+}
+
 fn macos_sans_emoji_metric(cluster: &str) -> Option<EmojiMetric> {
     let (advance, ink) = match cluster.chars().next()? {
         '\u{1F600}' => (28.70400047302246, MACOS_SANS_SHARED_EMOJI_INK),

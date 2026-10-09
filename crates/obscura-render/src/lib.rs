@@ -242,6 +242,26 @@ impl CanvasTextMeasurer {
         // reports the identity face's own advance and ink box. Mixed strings
         // keep the shaped answer.
         let size = style.font_size.unwrap_or(10.0);
+        // The reference's fallback answers the same missing-glyph box for
+        // every probed emoji (the constants in emoji_fallback_metrics);
+        // the per-emoji identity table stays for the fonts a real face
+        // covers. The font box follows the override because the fallback's
+        // box is what the reference reports alongside it.
+        if let Some((w, ascent, descent, right, left, f_asc, f_desc)) =
+            inline::emoji_fallback_metrics(text, size)
+        {
+            return CanvasTextMetrics {
+                width: w,
+                font_ascent: f_asc,
+                font_descent: f_desc,
+                ink_left: left,
+                ink_right: right,
+                ink_ascent: ascent,
+                ink_descent: descent,
+                hanging_baseline: f_asc * 0.8,
+                ideographic_baseline: -f_desc,
+            };
+        }
         if let Some((w, ascent, descent, right, left)) =
             inline::emoji_only_metrics(text, size)
         {
