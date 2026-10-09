@@ -46,7 +46,7 @@ base64 = { workspace = true }
 # `oid` gives `AssociatedOid`, which the RSA pkcs1v15/pss key types
 # require; SHA-1 is a legal WebCrypto RSA hash, so it has to be selectable.
 sha1 = { version = "0.10", features = ["oid"] }
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 # WebCrypto (crypto.subtle) primitives. RustCrypto, pure Rust, no CMake/OpenSSL,
 # and they unify on the digest 0.10 / cipher 0.4 stack already in the tree.
 hmac = "0.12"
