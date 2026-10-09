@@ -424,7 +424,7 @@ function _rtcGatherCandidates(connection, slots) {
   if (slots.iceGatheringState !== 'new' || slots.closed) return;
   const kinds = _rtcKinds(slots);
   if (!kinds.length) return;
-  slots.iceGatheringState = 'gathering';
+  if (slots.iceGatheringState === 'new') slots.iceGatheringState = 'gathering';
   const emit = (type, event) => {
     const handler = slots['on' + type];
     if (typeof handler === 'function') { try { handler.call(connection, event); } catch (error) { console.error(error); } }

@@ -9,7 +9,7 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
   get remoteDescription() { return _rtcSlots(this).remoteDescription; }
   get iceConnectionState() { return 'new'; }
   get iceGatheringState() { return _rtcSlots(this).iceGatheringState; }
-  get signalingState() { return _rtcSlots(this).localDescription ? 'have-local-offer' : 'stable'; }
+  get signalingState() { const s = _rtcSlots(this); return s.signalingState === 'have-local-offer' || s.localDescription ? 'have-local-offer' : 'stable'; }
   get connectionState() { return 'new'; }
   // Spec/Chrome: null until a remote description is set, then whether that
   // description advertises trickle ICE (`a=ice-options:trickle`). Measured on
@@ -25,6 +25,10 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
   get onicegatheringstatechange() { return _rtcSlots(this).onicegatheringstatechange; }
   set onicegatheringstatechange(value) {
     _rtcSlots(this).onicegatheringstatechange = typeof value === 'function' ? value : null;
+  }
+  get onsignalingstatechange() { return _rtcSlots(this).onsignalingstatechange; }
+  set onsignalingstatechange(value) {
+    _rtcSlots(this).onsignalingstatechange = typeof value === 'function' ? value : null;
   }
   addTransceiver(trackOrKind, init) {
     const slots = _rtcSlots(this);
@@ -64,11 +68,50 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
   }
   setLocalDescription(description) {
     const slots = _rtcSlots(this);
+    const wasStable = slots.signalingState !== 'have-local-offer';
     slots.localDescription = description
       ? new RTCSessionDescription(description)
       : new RTCSessionDescription({ type: 'offer', sdp: _rtcBuildOffer(slots) });
+    slots.signalingState = 'have-local-offer';
+    // Chrome fires the signaling-state transition synchronously inside the
+    // operation (the listener runs before the returned promise's reactions)
+    // and the gathering phase is announced right after the promise settles.
+    // The event system carries both, endpoints on the connection.
+    if (wasStable) {
+      try {
+        const event = new Event('signalingstatechange');
+        _eventSetEndpoints(event, this, this);
+        globalThis.__obscura_markTrusted(event);
+        const handler = slots.onsignalingstatechange;
+        if (typeof handler === 'function') { try { handler.call(this, event); } catch (e) { console.error(e); } }
+        for (const l of (slots.listeners['signalingstatechange'] || []).slice()) {
+          try { l.call(this, event); } catch (e) { console.error(e); }
+        }
+      } catch (_error) {}
+    }
+    const announceGathering = () => {
+      // _rtcGatherCandidates flips the slot to 'gathering' synchronously, so
+      // the state check here only guards against a completed or closed
+      // connection: the announcement itself must fire on the promise
+      // reaction, after setLocalDescription resolves, the way Chrome paces
+      // it. A VM that waits for the 'gathering' phase before arming its
+      // completion window reads the transition straight to 'complete' as a
+      // failed gather.
+      if (slots.closed || slots.iceGatheringState === 'complete') return;
+      slots.iceGatheringState = 'gathering';
+      try {
+        const event = new Event('icegatheringstatechange');
+        _eventSetEndpoints(event, this, this);
+        globalThis.__obscura_markTrusted(event);
+        const handler = slots.onicegatheringstatechange;
+        if (typeof handler === 'function') { try { handler.call(this, event); } catch (e) { console.error(e); } }
+        for (const l of (slots.listeners['icegatheringstatechange'] || []).slice()) {
+          try { l.call(this, event); } catch (e) { console.error(e); }
+        }
+      } catch (_error) {}
+    };
     _rtcGatherCandidates(this, slots);
-    return Promise.resolve();
+    return Promise.resolve().then(announceGathering);
   }
   setRemoteDescription(description) {
     _rtcSlots(this).remoteDescription = description ? new RTCSessionDescription(description) : null;
