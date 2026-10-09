@@ -2388,6 +2388,12 @@ fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> Str
                     // that case and left the frame with no ancestors.
                     let parent_root = dom
                         .containing_document_root_shadow_including(host)
+                        // A navigation that committed while the host sat in a
+                        // detached subtree leaves the live walk without a
+                        // parent to follow; the attach-time record keeps
+                        // answering the embedder document (frameElement's
+                        // same-origin answer depends on this).
+                        .or_else(|| dom.host_frame_parent_root(host))
                         .map(|id| id.index() as i64)
                         .unwrap_or(0);
                     serde_json::json!({ "host": host.index(), "parentRoot": parent_root })

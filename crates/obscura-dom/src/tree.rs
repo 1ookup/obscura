@@ -558,6 +558,13 @@ pub(crate) struct DomTreeInner {
     /// maps hold only the *active* content document per host.
     iframe_content_documents: HashMap<NodeId, NodeId>,
     iframe_content_documents_by_root: HashMap<NodeId, NodeId>,
+    /// The document root containing each iframe host, recorded at content
+    /// attach time. Navigations can commit while the host sits in a detached
+    /// subtree (a script removes the frame and re-appends it around the
+    /// navigation), and then the live ancestor walk has no parent to follow;
+    /// this is the fallback that keeps `frame_container_info` answering the
+    /// embedder document instead of "unknown".
+    host_frame_parent_roots: HashMap<NodeId, NodeId>,
     /// Scope state for every live content root, active or superseded by a
     /// later navigation. An entry lives until its root is removed from the
     /// arena, so retained wrappers of a detached document keep their URL,
@@ -598,6 +605,7 @@ impl DomTree {
                 shadow_roots_by_host: HashMap::new(),
                 iframe_content_documents: HashMap::new(),
                 iframe_content_documents_by_root: HashMap::new(),
+                host_frame_parent_roots: HashMap::new(),
                 document_scopes: HashMap::new(),
                 allow_declarative_shadow_roots: false,
                 quirks: false,
@@ -802,6 +810,9 @@ impl DomTree {
             Self::set_subtree_connected(&mut inner, previous, false);
         }
         inner.iframe_content_documents_by_root.insert(root, host);
+        if let Some(parent) = Self::containing_document_root_of(&inner, host) {
+            inner.host_frame_parent_roots.insert(host, parent);
+        }
         let connected = inner
             .nodes
             .get(host.index())
@@ -849,7 +860,12 @@ impl DomTree {
     /// root back to its host. This is the document ownership walk browser
     /// subsystems need for nodes in open or closed shadow trees.
     pub fn containing_document_root_shadow_including(&self, node: NodeId) -> Option<NodeId> {
-        let inner = self.inner.borrow();
+        Self::containing_document_root_of(&self.inner.borrow(), node)
+    }
+
+    /// Borrow-free core of the walk above, callable while the tree is
+    /// already mutably borrowed (attach time).
+    fn containing_document_root_of(inner: &DomTreeInner, node: NodeId) -> Option<NodeId> {
         let mut current = node;
         for _ in 0..=inner.nodes.len() {
             inner.nodes.get(current.index())?.as_ref()?;
@@ -859,9 +875,23 @@ impl DomTree {
             {
                 return Some(current);
             }
-            current = Self::host_including_parent_without_iframe(&inner, current)?;
+            current = Self::host_including_parent_without_iframe(inner, current)?;
         }
         None
+    }
+
+    /// The document root that contained `host` when its content was last
+    /// attached: the fallback for `frame_container_info` when a navigation
+    /// committed while the host was detached and the live walk has nothing
+    /// to follow. The recorded parent must still be a live document node;
+    /// arena slots are reused, so a stale id must never answer.
+    pub fn host_frame_parent_root(&self, host: NodeId) -> Option<NodeId> {
+        let inner = self.inner.borrow();
+        let parent = inner.host_frame_parent_roots.get(&host).copied()?;
+        match inner.nodes.get(parent.index()).and_then(|n| n.as_ref()) {
+            Some(node) if matches!(node.data, NodeData::Document) => Some(parent),
+            _ => None,
+        }
     }
 
     pub fn document_scope(&self, root: NodeId) -> Option<DocumentScope> {
@@ -1469,6 +1499,9 @@ impl DomTree {
             if let Some(root_id) = inner.iframe_content_documents.remove(&id) {
                 inner.iframe_content_documents_by_root.remove(&root_id);
             }
+            // The attach-time parent record dies with its host element; a
+            // reused NodeId must not inherit the old embedding.
+            inner.host_frame_parent_roots.remove(&id);
             inner.document_scopes.remove(&id);
             inner.source_lines.remove(&id);
         }
@@ -3363,5 +3396,67 @@ mod tests {
         dest.import_children_from(dest_doc, &source, source.document());
 
         assert!(dest.len() >= 100_000);
+    }
+
+    #[test]
+    fn detached_renavigation_keeps_frame_parent_root() {
+        // A script's remove/append dance around a navigation detaches the
+        // host iframe while the new content document commits. The live
+        // ancestor walk then has no parent to follow; the attach-time record
+        // must keep answering the embedder document so the frame realm's
+        // frameElement does not flip from element to null on re-init
+        // (the challenge's embed probe treated that flip as an anomaly).
+        let tree = DomTree::new();
+        let host = iframe_with_host(&tree);
+        let (root, _) = tree.create_iframe_content_document(host).unwrap();
+        // Attached host: the live walk already answers the tree document.
+        assert_eq!(
+            tree.containing_document_root_shadow_including(host),
+            Some(tree.document())
+        );
+
+        // Detach the host (remove frees the owned content document with it).
+        tree.remove(host);
+        assert!(tree.get_node(root).is_none());
+
+        // Re-attach the host detached and navigate: a fresh content root
+        // commits while the host still sits outside the document.
+        let host2 = element(&tree, "iframe");
+        let (root2, _) = tree.create_iframe_content_document(host2).unwrap();
+        assert_eq!(
+            tree.containing_document_root_shadow_including(host2),
+            None,
+            "live walk has nothing to follow for a detached host"
+        );
+        assert_eq!(
+            tree.host_frame_parent_root(host2),
+            None,
+            "host attached while detached records no parent"
+        );
+
+        // Now the same host attached once (parent recorded), then detached,
+        // then re-navigated: the record must survive the re-navigation.
+        let host3 = element(&tree, "iframe");
+        tree.append_child(tree.document(), host3);
+        let (root3, _) = tree.create_iframe_content_document(host3).unwrap();
+        assert_eq!(
+            tree.containing_document_root_shadow_including(host3),
+            Some(tree.document())
+        );
+        tree.detach(host3);
+        let fresh = tree.new_node(NodeData::Document);
+        tree.attach_iframe_content_document(host3, fresh)
+            .expect("navigation commits on the detached host");
+        assert_eq!(
+            tree.containing_document_root_shadow_including(host3),
+            None,
+            "detached again: live walk fails"
+        );
+        assert_eq!(
+            tree.host_frame_parent_root(host3),
+            Some(tree.document()),
+            "attach-time record answers the embedder document"
+        );
+        let _ = root3;
     }
 }

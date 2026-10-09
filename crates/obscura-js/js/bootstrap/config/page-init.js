@@ -49,12 +49,28 @@ globalThis.__obscura_core_init = function() {
     _bindWindowAttribute('parent',
       parentRoot > 0 ? _ancestorWindowRef(frameRootNid, parentRoot, false) : topRef);
     globalThis.frameElement = null;
+    var _feSame = false;
     try {
       if (typeof container.host === "number" && container.host > 0
           && _dom("iframe_scopes_same_origin", frameRootNid, parentRoot) === "true") {
         globalThis.frameElement = _wrapEl(container.host);
+        _feSame = true;
       }
     } catch (e) {}
+    // Diagnostic twin of csp.gate: what this realm's frameElement resolved
+    // to at boot (the value the challenge's embed probe reads). "same"
+    // records the same-origin verdict so a wrong element answer is visible
+    // next to its cause.
+    try {
+      window.external && window.external.tracelog && window.external.tracelog(
+        'fe.init',
+        JSON.stringify({
+          root: frameRootNid,
+          host: typeof container.host === "number" ? container.host : null,
+          parentRoot: parentRoot || null,
+          same: _feSame,
+        }));
+    } catch (_feReport) {}
   } else {
     _bindWindowAttribute('document', new Document(documentNid));
     _cache.set(documentNid, globalThis.document);
@@ -318,12 +334,28 @@ globalThis.__obscura_init = function() {
     _bindWindowAttribute('parent',
       parentRoot > 0 ? _ancestorWindowRef(frameRootNid, parentRoot, false) : topRef);
     globalThis.frameElement = null;
+    var _feSame = false;
     try {
       if (typeof container.host === "number" && container.host > 0
           && _dom("iframe_scopes_same_origin", frameRootNid, parentRoot) === "true") {
         globalThis.frameElement = _wrapEl(container.host);
+        _feSame = true;
       }
     } catch (e) {}
+    // Diagnostic twin of csp.gate: what this realm's frameElement resolved
+    // to at boot (the value the challenge's embed probe reads). "same"
+    // records the same-origin verdict so a wrong element answer is visible
+    // next to its cause.
+    try {
+      window.external && window.external.tracelog && window.external.tracelog(
+        'fe.init',
+        JSON.stringify({
+          root: frameRootNid,
+          host: typeof container.host === "number" ? container.host : null,
+          parentRoot: parentRoot || null,
+          same: _feSame,
+        }));
+    } catch (_feReport) {}
   } else {
     _bindWindowAttribute('document', new Document(documentNid));
     // parentNode on <html> reaches the backing document node. Keep that wrapper
