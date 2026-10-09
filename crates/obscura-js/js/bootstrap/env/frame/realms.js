@@ -194,12 +194,12 @@ _markNative(_ScopedDocument.prototype.querySelectorAll);
 _markNative(_ScopedDocument.prototype.getElementById);
 
 
-// HTML cross-origin Window property allowlist. Everything else on a
-// cross-origin WindowProxy throws SecurityError.
-const _crossOriginWindowProps = new Set([
-  "window", "self", "frames", "length", "top", "parent", "opener", "closed",
-  "location", "postMessage", "blur", "focus", "close",
-]);
+// The cross-origin gate lives on the facades themselves: their own member
+// set is the HTML cross-origin Window surface (reads of anything else throw
+// SecurityError from the get traps), and the set traps accept writes to
+// `location` only. The old separate allowlist Set was consulted by the set
+// traps alone and let an allowlisted own member be overwritten; it is gone
+// with the fix.
 
 // host nid -> WindowProxy facade. The proxy identity is stable across the
 // frame's navigations; every access re-reads the active content root.
@@ -1183,9 +1183,14 @@ function _frameWindowProxyFor(hostEl) {
     },
     set(t, key, value) {
       let st;
-      if (typeof key === "string" && !_crossOriginWindowProps.has(key)
-          && !(st ??= frameState()).same) {
-        throw securityError();
+      if (typeof key === "string" && !(st ??= frameState()).same) {
+        // Cross-origin [[Set]]: only `location` takes a write (the
+        // assignment navigates). Everything else refuses with
+        // SecurityError, Chrome's answer. The earlier allowlist-only
+        // check let a cross-origin caller overwrite an allowlisted OWN
+        // member -- assigning parent.postMessage got a plain success no
+        // browser produces (a challenge probe reads exactly that).
+        if (key !== "location") throw securityError();
       }
       if (Reflect.has(t, key)) return Reflect.set(t, key, value);
       if ((st ??= frameState()).same) {
@@ -1482,8 +1487,12 @@ function _ancestorWindowRef(selfRoot, targetRoot /* 0 = top document */, toTop) 
       return realmGlobal ? Reflect.get(realmGlobal, key, realmGlobal) : undefined;
     },
     set(t, key, value) {
-      if (typeof key === "string" && !_crossOriginWindowProps.has(key) && !sameOrigin()) {
-        throw securityError();
+      if (typeof key === "string" && !sameOrigin()) {
+        // Cross-origin [[Set]]: only `location` takes a write; every other
+        // member refuses with SecurityError (see the frame-side twin in
+        // _frameWindowProxyFor -- the allowlist check alone let an
+        // allowlisted own member like postMessage be assigned).
+        if (key !== "location") throw securityError();
       }
       if (Reflect.has(t, key)) return Reflect.set(t, key, value);
       const realmGlobal = sameOrigin() ? targetGlobal() : null;

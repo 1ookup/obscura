@@ -115,3 +115,5 @@ run covers are then removed.
 ## Deferred
 
 (none)
+
+- Cross-origin window writes (10-10, fcPost setcast finding from cfov2): the frame-side and ancestor-side WindowProxy facades gated sets on an allowlist that let an allowlisted own member through -- a cross-origin caller assigning parent.postMessage got a plain success where Chrome refuses with SecurityError (the challenge's fcPost hook reads exactly that). Cross-origin sets now accept location only (it navigates) and refuse every other member; the allowlist Set had no other reader. Local two-port fixture: cross-origin SecurityError with the member intact and callable, same-origin unchanged. Scoped: obscura-js + obscura-browser + obscura-cdp (7 pre-existing reds unchanged). Full gate deferred to the next backfill.
