@@ -6545,6 +6545,42 @@ fn timer_dispatch_floor_config() -> (f64, f64) {
     })
 }
 
+/// Embedder-configured parity pad for WebAssembly compilation in worker
+/// realms (the tcfQ8 experiment): the reference browser's compile pipeline
+/// costs several times what this engine's native path does, so a worker
+/// program timing `instantiate` records deltas several times short of the
+/// reference distribution. The pad charges each worker-realm compile a
+/// calibrated slice. Unset keeps behavior byte-identical.
+fn wasm_compile_pad_config() -> (f64, f64) {
+    static CONFIG: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    *CONFIG.get_or_init(|| {
+        let parse = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(|v| v.min(20.0))
+                .unwrap_or(0.0)
+        };
+        (
+            parse("OBSCURA_WASM_COMPILE_PAD_MS"),
+            parse("OBSCURA_WASM_COMPILE_PAD_JITTER_MS"),
+        )
+    })
+}
+
+/// Base pad (ms) charged to worker-realm wasm compiles.
+#[op2(fast)]
+fn op_wasm_compile_pad() -> f64 {
+    wasm_compile_pad_config().0
+}
+
+/// Uniform-jitter span (ms) sampled on top of the wasm compile pad.
+#[op2(fast)]
+fn op_wasm_compile_pad_jitter() -> f64 {
+    wasm_compile_pad_config().1
+}
+
 /// Base dispatch-latency floor (ms) added to frame-realm HTML timer waits.
 #[op2(fast)]
 fn op_timer_dispatch_floor() -> f64 {
@@ -8787,6 +8823,8 @@ pub fn build_extension() -> Extension {
         op_async_runtime_available(),
         op_browser_timer_schedule(),
         op_browser_timer_complete(),
+        op_wasm_compile_pad(),
+        op_wasm_compile_pad_jitter(),
         op_timer_dispatch_floor(),
         op_timer_dispatch_floor_jitter(),
         op_page_hidden(),

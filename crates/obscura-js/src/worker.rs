@@ -2333,6 +2333,16 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     } catch (e) {}
   }
 
+  // WebAssembly is minted per context, so the compile pad the window realms
+  // install from page-init's intrinsic loop has not reached this isolate.
+  // Worker realms are the pad's only target (the tcfQ8 experiment); the
+  // installer is idempotent and a no-op without the env.
+  try {
+    if (typeof G.__obscura_install_wasm_compile_pad === 'function') {
+      G.__obscura_install_wasm_compile_pad();
+    }
+  } catch (e) {}
+
   // ---------------------------------------------------------------------
   // 7. Native-presentation sweep. Last: it marks what the steps above
   // installed.

@@ -227,6 +227,7 @@
 // @obscura-module env/media/support/webgpu-collections.js
 // @obscura-module env/media/gpu-constants.js
 // @obscura-module env/media/wasm-memory-control.js
+// @obscura-module env/media/wasm-compile-pad.js
 // @obscura-module env/media/webgpu.js
 // @obscura-module env/media/gpu-supported-limits.js
 // @obscura-module env/media/gpu-supported-features.js

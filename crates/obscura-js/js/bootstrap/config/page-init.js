@@ -874,9 +874,14 @@ globalThis.__obscura_init = function() {
           _markNativeObject(holder, 2);
           // V8 mints WebAssembly per context, so the memory-control surface
           // shimmed on the snapshot's intrinsic never reaches this one.
-          if (intrinsic === 'WebAssembly'
-              && typeof globalThis.__obscura_install_wasm_surface === 'function') {
-            try { globalThis.__obscura_install_wasm_surface(); } catch (_e2) {}
+          if (intrinsic === 'WebAssembly') {
+            if (typeof globalThis.__obscura_install_wasm_surface === 'function') {
+              try { globalThis.__obscura_install_wasm_surface(); } catch (_e2) {}
+            }
+            if (typeof globalThis.__obscura_install_wasm_compile_pad
+                === 'function') {
+              try { globalThis.__obscura_install_wasm_compile_pad(); } catch (_e3) {}
+            }
           }
         }
       }
