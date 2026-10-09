@@ -8002,19 +8002,32 @@ fn op_opfs_sync_read(
 /// of disk work.
 ///
 /// It is not free, though, because a browser serves this handle from the
-/// browser process, so every call is an IPC round trip. The reference capture
-/// times exactly that and reports `uUOw3 = 0.54` ms, while an in-process handle
-/// answers in microseconds: a reading no browser can produce, in a field the
-/// challenge measures and sends back. The round trip is therefore modelled
-/// here, the same way `performance.now()` is clamped to Chrome's granularity.
+/// browser process, so every call is an IPC round trip. Two reference
+/// timings, both from the challenge's own instrumentation: the first flush
+/// on a freshly created handle (the one that materializes the directory
+/// entry) measures `aOUG3 = 10.8-11.0` ms in the paired rounds, and a later
+/// flush on the same handle was captured at `uUOw3 = 0.54` ms. An in-process
+/// handle answers in microseconds for both: readings no browser can produce,
+/// in fields the challenge measures and sends back. The round trips are
+/// therefore modelled here, the same way `performance.now()` is clamped to
+/// Chrome's granularity.
 #[op2(fast)]
 fn op_opfs_sync_flush(_state: Rc<RefCell<OpState>>, fd: u32) -> Result<(), deno_error::JsErrorBox> {
+    static FIRST_FLUSHED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+        std::sync::OnceLock::new();
+    let flushed =
+        FIRST_FLUSHED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     let table = opfs_lock();
     table
         .get(&fd)
         .ok_or_else(|| opfs_io("flush", std::io::Error::other("closed handle")))?;
     drop(table);
-    std::thread::sleep(std::time::Duration::from_micros(450));
+    let first = flushed.lock().unwrap().insert(fd);
+    if first {
+        std::thread::sleep(std::time::Duration::from_nanos(10_400_000));
+    } else {
+        std::thread::sleep(std::time::Duration::from_micros(450));
+    }
     Ok(())
 }
 
