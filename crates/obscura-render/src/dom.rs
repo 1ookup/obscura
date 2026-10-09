@@ -3796,10 +3796,25 @@ pub(crate) fn resolved_transform_matrix(
         crate::Dimension::Percent(0.5),
         crate::Dimension::Percent(0.5),
     ));
-    matrix.around((
+    let matrix = matrix.around((
         rect.x + resolve_translate(origin_x, rect.width),
         rect.y + resolve_translate(origin_y, rect.height),
-    ))
+    ));
+    // A resolved component that is non-finite or absurdly large (a calc
+    // dividing by a zero-size viewport, an inf propagating through the
+    // origin wrap) makes the whole transform invalid at computed-value
+    // time in a browser -- Chromium drops it to none and the element
+    // answers its untransformed geometry. Saturating instead once poisoned
+    // every viewport measurement of the element (x -3.4e32, width 6.8e32)
+    // in a 0x0 iframe. Anything a real browser renders stays far below
+    // this bound.
+    let components = [
+        matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f,
+    ];
+    if !components.iter().all(|v| v.is_finite() && v.abs() < 1.0e7) {
+        return crate::Affine2::IDENTITY;
+    }
+    matrix
 }
 
 /// Resolved value of the `transform` property alone. Individual transform

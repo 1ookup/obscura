@@ -14,10 +14,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const PAGE: &str = r#"<html><body>
-<iframe id="f" sandbox="allow-same-origin" srcdoc="<b>hello</b>"></iframe>
 <script>
+// A static iframe fires its load during the initial parse, before this
+// script's listener could attach (Chromium behaves the same), so the frame
+// is created dynamically with the listener attached pre-insertion -- the
+// shape the embedder can actually observe.
 window.__ev = [];
-var f = document.getElementById('f');
+var f = document.createElement('iframe');
+f.setAttribute('sandbox', 'allow-same-origin');
+f.srcdoc = '<b>hello</b>';
 f.addEventListener('load', function(){ window.__ev.push('iframe-load'); });
 setTimeout(function(){
   var d = null;
@@ -28,6 +33,7 @@ setTimeout(function(){
     visibility: d ? d.visibilityState : 'noDoc',
   };
 }, 700);
+document.body.appendChild(f);
 </script>
 </body></html>"#;
 

@@ -7758,8 +7758,12 @@ the event methods resolve through EventTarget.prototype",
         };
         assert_eq!(
             result["screenL1Len"],
-            serde_json::json!(10),
-            "Screen.prototype keeps its ten accessors (no isExtended/onchange per the RE-149 oracle)",
+            serde_json::json!(12),
+            "Screen.prototype carries the twelve Chromium 149 accessors \
+             (isExtended and onchange included: the live reference answers \
+             s.isExtended false and s.onchange null, which the payload's \
+             value-grouped fingerprint reads -- the earlier RE-149 oracle \
+             that omitted them was stale)",
         );
         let mut screen_l2 = result["screenL2"].clone();
         screen_l2
@@ -37223,10 +37227,14 @@ mod secure_context_navigator_gate_probe {
             .map(|remote| remote.value.unwrap())
         }
         let hidden = probe(&mut rt, "hidden-frame").await.unwrap();
+        // Chromium 149 measures a nested document's visibilityState as the
+        // page's: a display:none frame of a visible page answers visible
+        // while its animation callbacks still never fire (the rendering-box
+        // gate is an engine concern separate from the visibility surface).
         assert_eq!(
             hidden,
-            serde_json::json!(["hidden", true, false]),
-            "unrendered frame: hidden document, no animation callbacks"
+            serde_json::json!(["visible", false, false]),
+            "unrendered frame: page-visible document, no animation callbacks"
         );
         let shown = probe(&mut rt, "shown-frame").await.unwrap();
         assert_eq!(
@@ -37626,8 +37634,11 @@ mod secure_context_navigator_gate_probe {
             .unwrap()
             .value
             .unwrap();
-        // The init snapshot caught the pre-layout (or display:none) moment.
-        assert_eq!(initial, serde_json::json!("hidden"));
+        // Chromium 149 answers a nested document's visibilityState as the
+        // page's -- "visible" even while the host has no layout. The
+        // rendering-box state gates animation callbacks instead; this test's
+        // cadence half below is what still observes the box flip.
+        assert_eq!(initial, serde_json::json!("visible"));
         // The host gains a rendered box after realm init, exactly as the
         // widget mount does.
         rt.evaluate(
