@@ -270,9 +270,11 @@ registerNavigatorSurface();
   var _navProto = Object.create(Navigator.prototype);
 
   function defGetter(key, fn) {
-    _markNative(fn);
+    // The getter is exposed as a property of the interface: Chrome's own
+    // surface is [length, name] with no prototype, so the value goes
+    // through the method-literal wrapper before install.
     Object.defineProperty(_navProto, key, {
-      get: fn, set: undefined, enumerable: true, configurable: true,
+      get: _obscuraMethodLiteral(fn), set: undefined, enumerable: true, configurable: true,
     });
   }
 

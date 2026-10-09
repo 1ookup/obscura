@@ -72,7 +72,11 @@ function _markWindowAttributeHalf(fn, kind, name) {
   try {
     Object.defineProperty(fn, 'name', { value: kind + ' ' + name, configurable: true });
   } catch (_error) {}
-  return _markNative(fn);
+  // The accessor half a page reads owns [length, name] with no prototype
+  // slot, like every Chrome interface function; the closure here is a
+  // plain function expression, so it goes through the method-literal
+  // wrapper (native mark carried inside).
+  return _obscuraMethodLiteral(fn);
 }
 
 function _obscuraInstallWindowAttributeAccessors(target) {
@@ -103,7 +107,7 @@ function _obscuraInstallWindowAttributeAccessors(target) {
       slot.value = descriptor.value;
       getter = function () { return slot.value; };
     }
-    _markWindowAttributeHalf(getter, 'get', name);
+    getter = _markWindowAttributeHalf(getter, 'get', name);
     const aligned = {
       get: getter,
       enumerable: !_chromeNonEnumerableWindowAttributes.has(name),
@@ -112,9 +116,7 @@ function _obscuraInstallWindowAttributeAccessors(target) {
     if (replaceable) {
       // A realm that installs a live getter (a frame's viewport metrics) keeps
       // it: only the setter is minted here.
-      const setter = existingSetter || function (value) { slot.value = value; };
-      _markWindowAttributeHalf(setter, 'set', name);
-      aligned.set = setter;
+      aligned.set = _markWindowAttributeHalf(existingSetter || function (value) { slot.value = value; }, 'set', name);
     }
     try {
       Object.defineProperty(target, name, aligned);

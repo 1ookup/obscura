@@ -98,8 +98,7 @@ function _installSpeechSynthesisPrototypeMembers(synth) {
   if (!Object.prototype.hasOwnProperty.call(proto, 'getVoices')) {
     // RE-149 oracle: the reference environment answers an empty voice list
     // (cold headless profile; the 68-row host table is reversed/superseded).
-    proto.getVoices = _markNativeAs(function getVoices() { return []; },
-      'function getVoices() { [native code] }');
+    proto.getVoices = _obscuraMethodLiteral(function getVoices() { return []; });
     proto.speak = _markNativeAs(function speak() {}, 'function speak() { [native code] }');
     proto.cancel = _markNativeAs(function cancel() {}, 'function cancel() { [native code] }');
     proto.pause = _markNativeAs(function pause() {}, 'function pause() { [native code] }');

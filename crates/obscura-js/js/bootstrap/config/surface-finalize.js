@@ -112,8 +112,7 @@
   }
 
   Object.defineProperty(globalThis, 'isSecureContext', {
-    get: _markNativeAs(function isSecureContext() { return _secureNow(); },
-      'function get isSecureContext() { [native code] }'),
+    get: _obscuraMethodLiteral(function isSecureContext() { return _secureNow(); }),
     set: undefined,
     enumerable: true,
     configurable: true,
@@ -122,8 +121,7 @@
   // The navigation layer derives this from COOP+COEP and Permissions-Policy.
   // Drive this getter and the SAB global from one per-document value.
   Object.defineProperty(globalThis, 'crossOriginIsolated', {
-    get: _markNativeAs(function crossOriginIsolated() { return _crossOriginIsolatedValue; },
-      'function get crossOriginIsolated() { [native code] }'),
+    get: _obscuraMethodLiteral(function crossOriginIsolated() { return _crossOriginIsolatedValue; }),
     set: undefined,
     enumerable: true,
     configurable: true,
@@ -159,10 +157,9 @@
   // serialized environment origin; both keep a native no-op setter in Chrome.
   if (!('event' in globalThis)) {
     Object.defineProperty(globalThis, 'event', {
-      get: _markNativeAs(function event() {
+      get: _obscuraMethodLiteral(function event() {
         return _legacyWindowEvent || (_legacyEventStickyEligible() ? _legacyStickyWindowEvent : undefined);
-      },
-        'function get event() { [native code] }'),
+      }),
       set: _markNativeAs(function event(value) { _legacyWindowEvent = value; },
         'function set event() { [native code] }'),
       enumerable: true,
@@ -176,7 +173,7 @@
     const originSetter = _markNativeAs(function origin(value) {},
       'function set origin() { [native code] }');
     Object.defineProperty(globalThis, 'origin', {
-      get: _markNativeAs(function origin() {
+      get: _obscuraMethodLiteral(function origin() {
         try {
           // about:blank/srcdoc inherit their creator's origin, while their
           // location.origin remains "null". Sandboxed scopes stay opaque.
@@ -185,7 +182,7 @@
           const value = globalThis.location?.origin;
           return value === undefined || value === '' ? 'null' : value;
         } catch (_error) { return 'null'; }
-      }, 'function get origin() { [native code] }'),
+      }),
       set: originSetter,
       enumerable: true,
       configurable: true,
@@ -1919,7 +1916,9 @@ const _chromeInterfaceShells = new Set();
   const getter = (prototype, name, fn) => {
     Object.defineProperty(fn, 'name', { value: 'get ' + name, configurable: true });
     Object.defineProperty(prototype, name, {
-      get: _markNativeAs(fn, 'function get ' + name + '() { [native code] }'),
+      // The getter function a page reads off the interface owns
+      // [length, name] with no prototype slot, like a method literal.
+      get: _obscuraMethodLiteral(fn),
       set: undefined, enumerable: true, configurable: true,
     });
   };
