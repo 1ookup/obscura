@@ -229,10 +229,22 @@ function _runRenderingOpportunity() {
   }
 }
 
-function _rafDocumentVisibility() {
+// The animation-callback gate keys on the frame's RENDERING BOX, not the
+// document's visibilityState: Chromium answers a nested document's
+// visibilityState as the page's ("visible" for a 0x0 iframe of a visible
+// page, measured on 149) while still never firing animation callbacks in a
+// frame with no box. __obscuraFrameRendered answers the box state in frame
+// realms (null when unknown); the top document always has a box, so there
+// the page decision alone gates.
+function _rafFrameHidden() {
   try {
-    return globalThis.document ? String(globalThis.document.visibilityState) : 'visible';
-  } catch (_e) { return 'visible'; }
+    if (Deno.core.ops.op_page_hidden()) return true;
+    if (typeof globalThis.__obscuraFrameRendered === 'function') {
+      const rendered = globalThis.__obscuraFrameRendered();
+      if (rendered === false) return true;
+    }
+    return false;
+  } catch (_e) { return false; }
 }
 
 // A hidden document renders no frames, and Chrome never fires its animation
@@ -241,7 +253,7 @@ function _rafDocumentVisibility() {
 // 16ms pump answered them here. The callbacks stay pending; a
 // visibilitychange to visible re-arms the pump.
 function _onRafVisibilityChange() {
-  if (_rafDocumentVisibility() !== 'hidden') {
+  if (!_rafFrameHidden()) {
     document.removeEventListener('visibilitychange', _onRafVisibilityChange);
     _rafVisibilityWatch = false;
     _scheduleAnimationFrame();
@@ -251,7 +263,7 @@ let _rafVisibilityWatch = false;
 
 function _scheduleAnimationFrame() {
   if (_rafFrameScheduled || _rafRunningFrame || _rafPending.size === 0) return;
-  if (_rafDocumentVisibility() === 'hidden') {
+  if (_rafFrameHidden()) {
     if (!_rafVisibilityWatch && typeof document.addEventListener === 'function') {
       _rafVisibilityWatch = true;
       document.addEventListener('visibilitychange', _onRafVisibilityChange);

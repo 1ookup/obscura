@@ -548,30 +548,30 @@ globalThis.__obscura_init = function() {
           globalThis.innerWidth = zeroViewport ? 0 : parsed.clientWidth;
           globalThis.innerHeight = zeroViewport ? 0 : parsed.clientHeight;
         }
-        // The visibility slot rides the same layout answer: a frame with no
-        // rendering box is a hidden document, and hidden frames fire no
-        // animation callbacks (that rendering hold is the point of this
-        // per-frame reading -- the timer throttle does NOT read it; modern
-        // Chromium reports a nested document's visibilityState as the page's,
-        // so the surface question is deliberately separate from this slot).
-        // The snapshot is a FALLBACK only: at frame-realm init the main
-        // layout is not prepared yet, so op_layout_metrics answers
-        // rendered:false for every frame here -- freezing that reading kept a
-        // visible widget (a laid-out host box mounted after its script
-        // evaluated) hidden forever. The live reader below re-derives on
-        // every read (epoch-cached), so the widget flips visible as soon as
-        // its box exists while display:none frames stay hidden.
-        globalThis.__documentVisibilityState__ =
-          parsed.rendered === false ? 'hidden' : 'visible';
+        // Chromium 149 measured: a nested document's visibilityState is the
+        // PAGE's -- a 0x0 or display:none iframe of a visible page answers
+        // "visible" and hidden=false. The rendering-box question is a
+        // separate engine concern (which frames fire animation callbacks),
+        // exposed through __obscuraFrameRendered below; folding it into the
+        // visibility surface answered "hidden" for the challenge frame during
+        // its boot collection and the payload's value-grouped window
+        // fingerprint put d.visibilityState in the hidden bucket against the
+        // reference's visible.
+        globalThis.__documentVisibilityState__ = 'visible';
+        globalThis.__obscuraFrameRendered = function() {
+          try {
+            const m = readFrameMetrics();
+            if (m) return m.rendered !== false;
+          } catch (_e) {}
+          return null;
+        };
         globalThis.__obscuraDocumentVisibility = function() {
           try {
             // A hidden page hides every document in it, rendered or not
             // (Chrome reports all frames of a background tab as hidden).
             if (Deno.core.ops.op_page_hidden()) return 'hidden';
-            const m = readFrameMetrics();
-            if (m) return m.rendered === false ? 'hidden' : 'visible';
           } catch (_e) {}
-          return globalThis.__documentVisibilityState__ || 'visible';
+          return 'visible';
         };
         // The location surface's ancestorOrigins getter resolves its own
         // frame root through the lexical `globalThis`, which in a

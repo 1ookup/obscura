@@ -77,14 +77,27 @@ class Screen {
   get availLeft() { return _screenSlot(this, 'availLeft'); }
   get colorDepth() { return _screenColorDepth(); }
   get pixelDepth() { return _screenColorDepth(); }
+  // Chromium answers isExtended on a single display as false (the payload's
+  // value-grouped fingerprint puts s.isExtended in the false bucket), and the
+  // change-event handler slot answers null until a page assigns one.
+  get isExtended() { return false; }
+  get onchange() { return _screenOnChangeHandlers.get(this) || null; }
+  set onchange(value) {
+    if (value === null || typeof value !== 'function') {
+      _screenOnChangeHandlers.delete(this);
+      return;
+    }
+    _screenOnChangeHandlers.set(this, value);
+  }
   get orientation() { return _screenOrientationFor(this); }
   addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
   removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
   dispatchEvent(event) { return _eventTargetDispatch(this, event); }
   get [Symbol.toStringTag]() { return 'Screen'; }
 }
+const _screenOnChangeHandlers = new WeakMap();
 ['width','height','availWidth','availHeight','availTop','availLeft','colorDepth',
- 'pixelDepth','orientation'].forEach(function(k) {
+ 'pixelDepth','isExtended','onchange','orientation'].forEach(function(k) {
   var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
   if (d && d.get) _markNative(d.get);
   if (d && d.set) _markNative(d.set);
