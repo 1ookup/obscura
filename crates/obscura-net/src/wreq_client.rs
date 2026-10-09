@@ -815,6 +815,16 @@ impl StealthHttpClient {
         Err(ObscuraNetError::TooManyRedirects(url.to_string()))
     }
 
+    /// The failures Chrome's transport resends once: the connection was
+    /// established, no response byte arrived, and the failure is neither a
+    /// dial failure nor a timeout. wreq reports these as a send-phase
+    /// request error or a connection reset in the source chain.
+    fn is_pre_response_transport_failure(error: &wreq::Error) -> bool {
+        (error.is_request() || error.is_connection_reset())
+            && !error.is_connect()
+            && !error.is_timeout()
+    }
+
     /// One request with no redirect following, for scripted fetch()/XHR. The
     /// caller supplies the Fetch credentials decision for this redirect hop,
     /// while this method preserves the Chrome transport fingerprint.
@@ -969,22 +979,59 @@ impl StealthHttpClient {
             Some(host) => crate::resolver::start_family_gate(host)?,
             None => crate::resolver::FamilyGate::Settled,
         };
+        // Chrome's network stack resends a request once when its connection
+        // dies before any response byte arrives (HttpNetworkTransaction's
+        // retry-on-connection-error path), and a scripted fetch() never sees
+        // that failure. wreq surfaces it instead, and the caller's JS then
+        // re-submits at the application layer with different bytes. Replay
+        // the identical request once so the wire stays Chrome-shaped; the
+        // body is buffered, so the replay carries byte-identical headers
+        // and body.
+        let replay = req.try_clone();
         let mut send_fut = std::pin::pin!(req.send());
-        let resp = match &mut gate {
-            crate::resolver::FamilyGate::Settled => send_fut.await.map_err(|e| {
-                ObscuraNetError::Network(format!("{}: {}", url, e))
-            })?,
+        let first = match &mut gate {
+            crate::resolver::FamilyGate::Settled => send_fut.await,
             crate::resolver::FamilyGate::Watch(rx) => tokio::select! {
-                resp = &mut send_fut => resp.map_err(|e| {
-                    ObscuraNetError::Network(format!("{}: {}", url, e))
-                })?,
+                resp = &mut send_fut => resp,
                 outcome = rx => match outcome {
                     Ok(Err(deny)) => return Err(deny),
-                    _ => send_fut.await.map_err(|e| {
-                        ObscuraNetError::Network(format!("{}: {}", url, e))
-                    })?,
+                    _ => send_fut.await,
                 },
             },
+        };
+        let resp = match first {
+            Ok(resp) => resp,
+            Err(error) if Self::is_pre_response_transport_failure(&error) => {
+                let Some(retry) = replay else {
+                    return Err(ObscuraNetError::Network(format!("{}: {}", url, error)));
+                };
+                tracing::debug!(
+                    %url,
+                    "stealth transport: resending once after a pre-response \
+                     connection failure: {}",
+                    error
+                );
+                let mut retry_fut = std::pin::pin!(retry.send());
+                match &mut gate {
+                    crate::resolver::FamilyGate::Settled => retry_fut.await,
+                    crate::resolver::FamilyGate::Watch(rx) => tokio::select! {
+                        resp = &mut retry_fut => resp,
+                        outcome = rx => match outcome {
+                            Ok(Err(deny)) => return Err(deny),
+                            _ => retry_fut.await,
+                        },
+                    },
+                }
+                .map_err(|e2| {
+                    ObscuraNetError::Network(format!(
+                        "{}: {} (after one transparent resend; first failure: {})",
+                        url, e2, error
+                    ))
+                })?
+            }
+            Err(error) => {
+                return Err(ObscuraNetError::Network(format!("{}: {}", url, error)));
+            }
         };
         let response_start = fetch_started.elapsed();
 
@@ -1936,5 +1983,69 @@ mod tests {
             elapsed < std::time::Duration::from_secs(1),
             "connection death must reject in round-trip time, took {elapsed:?}"
         );
+    }
+
+    /// A connection that dies after it was established and before any
+    /// response byte is resent once, transparently, the way Chrome's network
+    /// stack does; the resend carries byte-identical bytes. Without this the
+    /// transport failure reached the scripted fetch(), whose JS re-submitted
+    /// with different bytes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stealth_send_single_resends_once_when_connection_closes_before_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests_tx, mut requests_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut accepted = 0usize;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                accepted += 1;
+                let attempt = accepted;
+                let tx = requests_tx.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 65536];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let _ = tx.send((
+                        attempt,
+                        String::from_utf8_lossy(&buf[..n]).into_owned(),
+                    ));
+                    if attempt == 1 {
+                        // Die with no response byte, like a pooled
+                        // connection whose peer went away.
+                        drop(stream);
+                        return;
+                    }
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let client = StealthHttpClient::with_full_options_and_fingerprint(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+            crate::fingerprint::BrowserFingerprint::from_user_agent(STEALTH_USER_AGENT),
+        );
+        let url = Url::parse(&format!("http://{address}/fo")).unwrap();
+
+        let response = client
+            .send_single("POST", &url, &HashMap::new(), "payload", false, false, true)
+            .await
+            .expect("the pre-response close must be resent, not surfaced");
+        assert_eq!(response.status, 200);
+
+        let (first_attempt, first_request) = requests_rx.recv().await.unwrap();
+        let (second_attempt, second_request) = requests_rx.recv().await.unwrap();
+        assert_eq!((first_attempt, second_attempt), (1, 2));
+        assert_eq!(
+            first_request, second_request,
+            "the resend must carry byte-identical bytes"
+        );
+        assert!(requests_rx.try_recv().is_err(), "exactly one resend");
     }
 }
