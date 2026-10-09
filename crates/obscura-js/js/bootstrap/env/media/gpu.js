@@ -7,6 +7,14 @@ globalThis.GPU = class GPU {
     // hardware profile.
     if (!globalThis.__obscura_webgl_enabled) return Promise.resolve(null);
     if (options && options.forceFallbackAdapter) return Promise.resolve(null);
+    // webgpu's Permissions-Policy default allowlist is 'self': a frame whose
+    // origin differs from its embedder's without an allow="webgpu"
+    // delegation reads a null adapter (the challenge's cross-origin widget
+    // chain then answers "unavailable" instead of running a device census).
+    if (typeof _permissionPolicyAllows === 'function'
+        && !_permissionPolicyAllows('webgpu')) {
+      return Promise.resolve(null);
+    }
     return Promise.resolve(Object.create(globalThis.GPUAdapter.prototype));
   }
   getPreferredCanvasFormat() { return 'bgra8unorm'; }
