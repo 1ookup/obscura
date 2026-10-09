@@ -1,17 +1,11 @@
 globalThis.GPUSupportedLimits = class GPUSupportedLimits {
   constructor() { throw new TypeError('Illegal constructor'); }
-  get [Symbol.toStringTag]() { return 'GPUSupportedLimits'; }
+  get [Symbol.toStringTag]() { return 'GPUSupportedLimits'; };
 };
-// Reflect the limit names on the prototype so a probe that enumerates them
-// sees the same list a browser does, whatever the instance carries.
-for (const name of Object.keys(_GPU_LIMITS)) {
-  Object.defineProperty(globalThis.GPUSupportedLimits.prototype, name, {
-    // The values live on the instance under `_gpuLimitValues`, so the getter
-    // answers the profile's number and stays enumerable the way Chrome's is.
-    get() {
-      const values = this[_gpuLimitValues];
-      return values ? values[name] : undefined;
-    },
-    enumerable: true, configurable: true,
-  });
-}
+// The limit members are NOT installed here: at bootstrap-snapshot time the
+// realm fingerprint is not seeded yet, so any profile query collapses to the
+// Intel reference table (38 members with immediate/subgroup slots) whatever
+// the eventual identity. webgpu-collections installs the active profile's
+// member set -- the live Chromium 149 on this machine walks 35 with neither
+// slot on the Apple profile -- at first limits-instance construction, when
+// the profile is known.

@@ -8,7 +8,32 @@
 // has no own members at all, every limit being a prototype getter.
 const _gpuLimitValues = Symbol('GPUSupportedLimits values');
 
+let _gpuLimitsMembersInstalled = false;
+function _webgpuInstallLimitsMembers(names) {
+  if (_gpuLimitsMembersInstalled) return;
+  _gpuLimitsMembersInstalled = true;
+  const proto = globalThis.GPUSupportedLimits.prototype;
+  for (const name of Object.getOwnPropertyNames(proto)) {
+    if (name !== 'constructor') delete proto[name];
+  }
+  for (const name of names) {
+    Object.defineProperty(proto, name, {
+      get() {
+        const vals = this[_gpuLimitValues];
+        return vals ? vals[name] : undefined;
+      },
+      enumerable: true, configurable: true,
+    });
+  }
+}
+
 function _webgpuMakeSupportedLimits(values) {
+  // The member SET follows the active adapter profile, installed at first
+  // instance construction: at bootstrap-snapshot time the realm fingerprint
+  // is not seeded yet and every profile would collapse to the reference
+  // table (38 members with immediate/subgroup slots; the live Chromium 149
+  // on this machine walks 35 with neither on the Apple profile).
+  _webgpuInstallLimitsMembers(Object.keys(values));
   const limits = Object.create(globalThis.GPUSupportedLimits.prototype);
   Object.defineProperty(limits, _gpuLimitValues, {
     value: values, enumerable: false, configurable: true,

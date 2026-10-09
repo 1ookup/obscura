@@ -120,8 +120,8 @@ const _GPU_APPLE = {
     maxComputeWorkgroupSizeY: 1024,
     maxComputeWorkgroupSizeZ: 64,
     maxComputeWorkgroupsPerDimension: 65535,
-    minSubgroupSize: null,
-    maxSubgroupSize: null,
+    // Chromium 149 on this machine walks no subgroup slots on the Apple
+    // profile: the members are absent from the prototype, not null-valued.
     maxStorageBuffersInFragmentStage: 10,
     maxStorageTexturesInFragmentStage: 8,
     maxStorageBuffersInVertexStage: 10,
