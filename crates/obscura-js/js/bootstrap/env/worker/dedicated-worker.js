@@ -504,6 +504,11 @@ globalThis.Worker = class Worker {
 // delivery paths above read.
 if (globalThis.EventTarget && globalThis.EventTarget.prototype) {
   Object.setPrototypeOf(Worker.prototype, globalThis.EventTarget.prototype);
+  // Chrome's Worker is `class Worker extends EventTarget`, so the constructor
+  // side chains too: getPrototypeOf(Worker) answers EventTarget there where a
+  // bare class leaves Function.prototype. The challenge's node loop reads
+  // exactly that slot (r9/r10 branch).
+  Object.setPrototypeOf(Worker, globalThis.EventTarget);
 }
 
 globalThis.__blobStore = globalThis.__blobStore || {};
