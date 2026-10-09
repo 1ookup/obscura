@@ -3763,44 +3763,76 @@ impl Page {
 
     /// The `interactive` step of a frame document's lifecycle, shared by the
     /// script-running path and the sandboxed-no-scripts path (a sandbox
-    /// suppresses scripts, not the document lifecycle).
+    /// suppresses scripts, not the document lifecycle). The lc.ev tracelog
+    /// rides the same execution.
     fn frame_ready_state_interactive(&mut self, frame_id: &str, generation: u64) {
+        let root = self.frame_content_root_raw(frame_id).unwrap_or(0);
+        let script = format!(
+            "globalThis.__documentReadyState__ = 'interactive';\n\
+             try {{ document.dispatchEvent(new Event('readystatechange', {{bubbles:false,cancelable:false}})); }} catch(e) {{}}\n\
+             try {{ window.external && window.external.tracelog && window.external.tracelog('lc.ev', \
+                 JSON.stringify({{f:{root},ev:'readystatechange',rs:'interactive'}})); }} catch(e) {{}}"
+        );
         if let Some(js) = self.js.as_mut() {
             let _ = js.execute_script_in_frame_realm(
                 frame_id,
                 generation,
                 "<frame-ready-state-interactive>",
-                "globalThis.__documentReadyState__ = 'interactive';\n\
-                 try { document.dispatchEvent(new Event('readystatechange', {bubbles:false,cancelable:false})); } catch(e) {}",
+                &script,
             );
         }
     }
 
     /// The DOMContentLoaded + `complete`/load tail of a frame document's
     /// lifecycle, shared by the script-running path and the
-    /// sandboxed-no-scripts path.
+    /// sandboxed-no-scripts path. The trailing lc.ev tracelog lines ride the
+    /// same script executions (zero extra realm round trips): the
+    /// lifecycle-notification census counts readystatechange/DOMContentLoaded
+    /// /load dispatches per frame against the reference's spread.
     fn frame_dom_content_loaded_and_load(&mut self, frame_id: &str, generation: u64) {
+        let root = self.frame_content_root_raw(frame_id).unwrap_or(0);
+        let dcl_script = format!(
+            "try {{ globalThis.__obscura_schedule_input_strategy?.(); }} catch(e) {{}}\n\
+             try {{ globalThis.__obscura_performance_lifecycle?.('dom-content-loaded', performance.now()); }} catch(e) {{}}\n\
+             try {{ document.dispatchEvent(new Event('DOMContentLoaded', {{bubbles:false,cancelable:false}})); }} catch(e) {{}}\n\
+             try {{ window.dispatchEvent(new Event('DOMContentLoaded', {{bubbles:false,cancelable:false}})); }} catch(e) {{}}\n\
+             try {{ window.external && window.external.tracelog && window.external.tracelog('lc.ev', \
+                 JSON.stringify({{f:{root},ev:'DOMContentLoaded',rs:globalThis.__documentReadyState__}})); }} catch(e) {{}}"
+        );
+        let load_script = format!(
+            "globalThis.__documentReadyState__ = 'complete';\n\
+             try {{ document.dispatchEvent(new Event('readystatechange', {{bubbles:false,cancelable:false}})); }} catch(e) {{}}\n\
+             try {{ window.external && window.external.tracelog && window.external.tracelog('lc.ev', \
+                 JSON.stringify({{f:{root},ev:'readystatechange',rs:'complete'}})); }} catch(e) {{}}\n\
+             if (typeof window.onload === 'function') {{ try {{ __obscuraTraceCallWith(__obscuraTraceHandlerFrom(window, 'onload'), window.onload, window, []); }} catch(e) {{}} }}\n\
+             try {{ window.dispatchEvent(new Event('load', {{bubbles:false,cancelable:false}})); }} catch(e) {{}}\n\
+             try {{ globalThis.__obscura_performance_lifecycle?.('load', performance.now()); }} catch(e) {{}}\n\
+             try {{ window.external && window.external.tracelog && window.external.tracelog('lc.ev', \
+                 JSON.stringify({{f:{root},ev:'load',rs:'complete'}})); }} catch(e) {{}}"
+        );
         if let Some(js) = self.js.as_mut() {
             let _ = js.execute_script_in_frame_realm(
                 frame_id,
                 generation,
                 "<frame-dom-content-loaded>",
-                "try { globalThis.__obscura_schedule_input_strategy?.(); } catch(e) {}\n\
-                 try { globalThis.__obscura_performance_lifecycle?.('dom-content-loaded', performance.now()); } catch(e) {}\n\
-                 try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
+                &dcl_script,
             );
             let _ = js.execute_script_in_frame_realm(
                 frame_id,
                 generation,
                 "<frame-load-event>",
-                "globalThis.__documentReadyState__ = 'complete';\n\
-                 try { document.dispatchEvent(new Event('readystatechange', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 if (typeof window.onload === 'function') { try { __obscuraTraceCallWith(__obscuraTraceHandlerFrom(window, 'onload'), window.onload, window, []); } catch(e) {} }\n\
-                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 try { globalThis.__obscura_performance_lifecycle?.('load', performance.now()); } catch(e) {}",
+                &load_script,
             );
         }
+    }
+
+    /// The content root nid of a frame's active document, for lifecycle
+    /// diagnostic labels.
+    fn frame_content_root_raw(&self, frame_id: &str) -> Option<u32> {
+        self.frames
+            .get(frame_id)
+            .and_then(|f| f.active_document_root)
+            .map(|r| r.raw())
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
@@ -6644,7 +6676,10 @@ impl Page {
         };
         let parent = frame.parent_frame_id.clone();
         let script = format!(
-            "(() => {{ const host = globalThis._wrapEl({}); if (host) host.dispatchEvent(new Event('load')); }})()",
+            "(() => {{ const host = globalThis._wrapEl({}); if (host) host.dispatchEvent(new Event('load')); }})();\n\
+             try {{ window.external && window.external.tracelog && window.external.tracelog('lc.ev', \
+                 JSON.stringify({{f:{},ev:'iframe-load',rs:'-'}})); }} catch(e) {{}}",
+            host.raw(),
             host.raw(),
         );
         let Some(parent_id) = parent else {
