@@ -2137,7 +2137,13 @@ impl ObscuraHttpClient {
                 .and_then(|value| value.to_str().ok())
                 .map(parse_client_hint_list)
                 .unwrap_or_default();
-            if let Some(hints) = accepted_hints {
+            // Chromium 149, measured in the embedded-challenge topology: a
+            // frame document's Accept-CH + Critical-CH is inert — no retry
+            // and no persistence, so the frame's later same-origin requests
+            // answer low-entropy. Persistence follows the same frame gate the
+            // retry uses; a top-level response keeps the observatory
+            // behavior.
+            if let Some(hints) = accepted_hints.filter(|_| !is_frame_document_request(&request)) {
                 self.accepted_client_hints
                     .write()
                     .await

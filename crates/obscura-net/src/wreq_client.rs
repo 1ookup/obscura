@@ -729,7 +729,13 @@ impl StealthHttpClient {
                 .and_then(|value| value.to_str().ok())
                 .map(parse_client_hint_list)
                 .unwrap_or_default();
-            if let Some(hints) = accepted_hints {
+            // Same frame gate as the retry below and as client.rs: Chromium
+            // 149 in the embedded-challenge topology leaves a frame document's
+            // Accept-CH inert (no retry, no persistence), so the frame's later
+            // same-origin requests answer low-entropy.
+            if let Some(hints) = accepted_hints.filter(|_| {
+                !crate::client::is_frame_document_request(&request)
+            }) {
                 self.accepted_client_hints
                     .write()
                     .await
