@@ -49,7 +49,7 @@ function _customElementUpgradeRoot(registry, root) {
   if (!root || typeof root.querySelectorAll !== 'function') return;
   for (const [name, cls] of state.registry.entries()) {
     if (root.localName === name) _customElementUpgrade(registry, root, cls);
-    for (const el of root.querySelectorAll(name)) _customElementUpgrade(registry, el, cls);
+    for (const el of _internalQuerySelectorAll(root, name)) _customElementUpgrade(registry, el, cls);
   }
 }
 function _customElementRegistryForNode(node) {

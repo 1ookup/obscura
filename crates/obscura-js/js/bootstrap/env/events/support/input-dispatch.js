@@ -89,6 +89,19 @@ globalThis.__obscura_pointer_release = function() {
   _pointerNeedsNewActivation = true;
 };
 
+// Selector access for the synthesized-input path. The CDP input scripts run
+// as page JS in the hit realm; a public querySelector call there is visible
+// to any query instrumentation the page installed (Cloudflare's selector log
+// recorded the label resolution until this went through the internal path).
+// Undefined only if a hostile page deleted the helper; resolution then
+// degrades to the raw hit target, never back to the public query.
+globalThis.__obscura_querySel = function (root, selector) {
+  return _internalQuerySelector(root, selector);
+};
+globalThis.__obscura_queryAll = function (root, selector) {
+  return _internalQuerySelectorAll(root, selector);
+};
+
 // Frameworks install per-instance value trackers on form controls. Writing
 // through the native prototype setter leaves those trackers stale, matching a
 // real user edit and allowing the next input/change event to be observed.

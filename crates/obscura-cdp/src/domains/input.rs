@@ -90,8 +90,8 @@ const LABEL_ACTIVATION_JS: &str = "\
             var scope = labelEl.getRootNode ? labelEl.getRootNode() : document;\
             if (scope && scope.getElementById) labeled = scope.getElementById(forId);\
             if (labeled && !(labeled.matches && labeled.matches(LABELABLE))) labeled = null;\
-        } else if (labelEl.querySelector) {\
-            labeled = labelEl.querySelector(LABELABLE);\
+        } else if (labelEl && globalThis.__obscura_querySel) {\
+            labeled = globalThis.__obscura_querySel(labelEl, LABELABLE);\
         }\
         if (labeled\
             && (!labeled.matches || !labeled.matches('input[type=hidden]'))\
@@ -115,7 +115,12 @@ fn input_target_js(target: &InputDispatchTarget, fallback: &str) -> String {
 // layer inside a label above the actual form control. CSS pointer-events:none
 // makes the control the hit target in Chromium; resolve the same relationship
 // for renderer hit-tests that cannot see computed pointer-events yet.
-const LABEL_CONTROL_TARGET_JS: &str = "if (target && target.getAttribute && target.getAttribute('aria-hidden') === 'true') { var label = target.closest ? target.closest('label') : null; var LABELABLE = 'input,button,select,textarea'; var control = label && label.querySelector ? label.querySelector(LABELABLE) : null; /* Closed-shadow trees can expose the composed parent as label while keeping the control in the sibling chain. */ if (!control) { var sibling = target; for (var si = 0; si < 8 && sibling; si++) { sibling = sibling.nextElementSibling || sibling.nextSibling || null; if (sibling && sibling.matches && sibling.matches(LABELABLE)) { control = sibling; break; } } } if (!control && label && label.parentElement && label.parentElement.querySelector) control = label.parentElement.querySelector(LABELABLE); if (control && !(control.matches && control.matches(':disabled'))) target = control; }";
+// The label/control resolution queries run as page JS in the hit realm, so
+// they must go through __obscura_querySel (internal selector path). A public
+// querySelector here shows up in any query instrumentation the page installed
+// -- Cloudflare's GOxN9 selector log recorded 'input,button,select,textarea'
+// once per click phase until this switched.
+const LABEL_CONTROL_TARGET_JS: &str = "if (target && target.getAttribute && target.getAttribute('aria-hidden') === 'true') { var label = target.closest ? target.closest('label') : null; var LABELABLE = 'input,button,select,textarea'; var control = (label && globalThis.__obscura_querySel) ? globalThis.__obscura_querySel(label, LABELABLE) : null; /* Closed-shadow trees can expose the composed parent as label while keeping the control in the sibling chain. */ if (!control) { var sibling = target; for (var si = 0; si < 8 && sibling; si++) { sibling = sibling.nextElementSibling || sibling.nextSibling || null; if (sibling && sibling.matches && sibling.matches(LABELABLE)) { control = sibling; break; } } } if (!control && label && label.parentElement && globalThis.__obscura_querySel) control = globalThis.__obscura_querySel(label.parentElement, LABELABLE); if (control && !(control.matches && control.matches(':disabled'))) target = control; }";
 
 fn mouse_hover_exit_js(x: f64, y: f64, sx: f64, sy: f64) -> String {
     format!(
@@ -406,7 +411,7 @@ pub async fn handle(
                                 var radioName = clickTarget.getAttribute('name') || '';\
                                 if (radioName) {{\
                                     var radioRoot = clickTarget.getRootNode();\
-                                    var candidates = radioRoot && radioRoot.querySelectorAll ? radioRoot.querySelectorAll('input') : [];\
+                                    var candidates = (radioRoot && globalThis.__obscura_queryAll) ? globalThis.__obscura_queryAll(radioRoot, 'input') : [];\
                                     radioStates = [];\
                                     for (var ri = 0; ri < candidates.length; ri++) {{\
                                         var radio = candidates[ri];\

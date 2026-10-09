@@ -594,7 +594,7 @@ var Element = _swappableInterface('Element', class extends Node {
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
       const picture = this.parentElement;
       const image = picture && picture.localName === "picture"
-        ? picture.querySelector("img")
+        ? _internalQuerySelector(picture, "img")
         : null;
       if (image && typeof image._imageSourceChanged === "function") {
         image._imageSourceChanged();
@@ -637,7 +637,7 @@ var Element = _swappableInterface('Element', class extends Node {
         && (n === "srcset" || n === "sizes" || n === "media" || n === "type")) {
       const picture = this.parentElement;
       const image = picture && picture.localName === "picture"
-        ? picture.querySelector("img")
+        ? _internalQuerySelector(picture, "img")
         : null;
       if (image && typeof image._imageSourceChanged === "function") {
         image._imageSourceChanged();
@@ -810,7 +810,7 @@ var Element = _swappableInterface('Element', class extends Node {
       const radioName = this.getAttribute('name') || '';
       if (radioName) {
         const root = this.getRootNode();
-        const candidates = root && root.querySelectorAll ? root.querySelectorAll('input') : [];
+        const candidates = _internalQuerySelectorAll(root, 'input');
         radioStates = [];
         for (let i = 0; i < candidates.length; i++) {
           const radio = candidates[i];
@@ -1184,7 +1184,7 @@ var Element = _swappableInterface('Element', class extends Node {
       const name = this.getAttribute('name') || '';
       if (name) {
         const root = this.getRootNode();
-        const candidates = root && root.querySelectorAll ? root.querySelectorAll('input') : [];
+        const candidates = _internalQuerySelectorAll(root, 'input');
         for (let i = 0; i < candidates.length; i++) {
           const radio = candidates[i];
           if (radio !== this
@@ -1459,7 +1459,7 @@ var Element = _swappableInterface('Element', class extends Node {
   }
   _navigateSubmit(submitter) {
     const pairs = [];
-    const fields = this.querySelectorAll('input, select, textarea');
+    const fields = _internalQuerySelectorAll(this, 'input, select, textarea');
     for (let i = 0; i < fields.length; i++) {
       const f = fields[i];
       const name = f.getAttribute('name');

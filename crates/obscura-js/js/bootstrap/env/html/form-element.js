@@ -2,7 +2,7 @@
 globalThis.HTMLButtonElement = Element;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
   get elements() {
-    return _htmlCollectionFrom(this.querySelectorAll(
+    return _htmlCollectionFrom(_internalQuerySelectorAll(this,
       'input, select, textarea, button, fieldset, output, object'));
   }
   get length() { return this.elements.length; }

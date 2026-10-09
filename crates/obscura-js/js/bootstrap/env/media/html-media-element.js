@@ -63,7 +63,7 @@ class HTMLMediaElement extends Element {
   get currentSrc() { return ""; }
   get textTracks() {
     return TextTrackList.from(
-      Array.from(this.querySelectorAll("track")).map((element) => element.track)
+      Array.from(_internalQuerySelectorAll(this, "track")).map((element) => element.track)
     );
   }
   addTextTrack(kind, label = "", language = "") {

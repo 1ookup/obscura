@@ -1005,7 +1005,7 @@ _markNative(Node.prototype.isDefaultNamespace);
 // getElementsByTagNameNS on Element and Document
 if (!Element.prototype.getElementsByTagNameNS) {
   Element.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
-    const all = this.querySelectorAll('*');
+    const all = _internalQuerySelectorAll(this, '*');
     const filtered = [];
     const nsMatch = namespaceURI === '*';
     const tagMatch = localName === '*';
@@ -1018,15 +1018,14 @@ if (!Element.prototype.getElementsByTagNameNS) {
       const tagOk = tagMatch || (elTag === localName);
       if (nsOk && tagOk) filtered.push(el);
     }
-    const result = new HTMLCollection(...filtered);
-    result.item = (i) => result[i] != null ? result[i] : null;
+    const result = _htmlCollectionFrom(filtered);
     return result;
   };
   _markNative(Element.prototype.getElementsByTagNameNS);
 }
 if (!Document.prototype.getElementsByTagNameNS) {
   Document.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
-    const all = this.querySelectorAll('*');
+    const all = _internalQuerySelectorAll(this, '*');
     const filtered = [];
     const nsMatch = namespaceURI === '*';
     const tagMatch = localName === '*';
@@ -1039,8 +1038,7 @@ if (!Document.prototype.getElementsByTagNameNS) {
       const tagOk = tagMatch || (elTag === localName);
       if (nsOk && tagOk) filtered.push(el);
     }
-    const result = new HTMLCollection(...filtered);
-    result.item = (i) => result[i] != null ? result[i] : null;
+    const result = _htmlCollectionFrom(filtered);
     return result;
   };
   _markNative(Document.prototype.getElementsByTagNameNS);

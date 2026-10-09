@@ -58,7 +58,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     var w = (typeof window !== 'undefined' && window.innerWidth) || 1280;
     var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
     if (x < 0 || y < 0 || x > w || y > h) return null;
-    var all = this.querySelectorAll('*');
+    var all = _internalQuerySelectorAll(this, '*');
     var best = null;
     var bestNid = -1;
     for (var i = 0; i < all.length; i++) {
