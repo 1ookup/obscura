@@ -25,6 +25,7 @@ Storage.prototype.getItem = function(k) {
 Storage.prototype.setItem = function(k, v) {
   _storageCall('set', this._kind, String(k), String(v));
 };
+
 Storage.prototype.removeItem = function(k) {
   _storageCall('remove', this._kind, String(k), '');
 };

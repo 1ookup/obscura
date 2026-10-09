@@ -116,29 +116,29 @@ if (!Element.prototype.replaceWith) {
   // _convertNodes turns any non-node argument (numbers, booleans, null, …) into
   // a Text node via String(n), matching the spec and append()/prepend(); the
   // old `typeof n === 'string'` check corrupted insert_before for other types.
-  Element.prototype.replaceWith = function(...nodes) {
+  Element.prototype.replaceWith = _obscuraMethodLiteral(function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
     for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
     parent.removeChild(this);
-  };
+  });
   _markNative(Element.prototype.replaceWith);
 }
 if (!Element.prototype.before) {
-  Element.prototype.before = function(...nodes) {
+  Element.prototype.before = _obscuraMethodLiteral(function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
     for (const n of _convertNodes(nodes)) parent.insertBefore(n, this);
-  };
+  });
   _markNative(Element.prototype.before);
 }
 if (!Element.prototype.after) {
-  Element.prototype.after = function(...nodes) {
+  Element.prototype.after = _obscuraMethodLiteral(function(...nodes) {
     const parent = this.parentNode;
     if (!parent) return;
     const ref = this.nextSibling;
     for (const n of _convertNodes(nodes)) parent.insertBefore(n, ref);
-  };
+  });
   _markNative(Element.prototype.after);
 }
 

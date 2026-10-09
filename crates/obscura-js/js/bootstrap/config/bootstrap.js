@@ -186,7 +186,7 @@ for (const name of [
     '__obscura_frame_realm_globals', '__obscura_realm_bridge',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_pointer_id',
   '__obscura_querySel', '__obscura_queryAll', '__obscuraFrameRendered',
-    '__obscura_install_wasm_surface', '__obscura_install_wasm_compile_pad',
+    '__obscura_install_wasm_surface', '__obscura_install_wasm_compile_pad', '__obscura_install_native_own_surface', '__obscura_native_own_surface_done',
     '__obscura_registerLinkedStylesheet', '__obscura_install_window_surface',
     '__obscura_install_platform_surfaces', '__obscura_install_tracelog',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
@@ -436,6 +436,23 @@ Function.prototype.toString = {
   return _origToString.call(this);
   }
 }.toString;
+// Wrap a function expression so its own surface matches a Chrome method on
+// the interface literal: [length, name] with no constructible prototype
+// ('prototype' in f answered true on every plain expression and hit the
+// challenge's native-detection family in r5/r6 pairs). The wrapper is a
+// computed-key method shorthand (methods own no prototype slot), length is
+// restored through its configurable descriptor, and the native mark carries
+// over. Used by the engine's own prototype definitions.
+var _obscuraMethodLiteral = function (fn) {
+  const holder = { [fn.name || 'fn'](...args) { return fn.apply(this, args); } };
+  const method = holder[fn.name || 'fn'];
+  try {
+    Object.defineProperty(method, 'length', {
+      value: fn.length, writable: false, enumerable: false, configurable: true,
+    });
+  } catch (_e) {}
+  return _markNative(method);
+};
 function _markNative(fn) {
   if (typeof fn === 'function') {
     _nativeFns.add(fn);

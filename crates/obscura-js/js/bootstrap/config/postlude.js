@@ -5,9 +5,9 @@ if (typeof URLPattern === 'undefined') {
 }
 
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
-  Document.prototype.importNode = function(node, deep) {
+  Document.prototype.importNode = _obscuraMethodLiteral(function(node, deep) {
     return _stampDetachedDocumentNode(this, node?.cloneNode(!!deep) || null);
-  };
+  });
 }
 
 // Document.adoptNode: standard DOM (HTML living spec). Frameworks that move
@@ -17,26 +17,26 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
 // descendants re-resolve lazily (same weak-consistency strategy as
 // insertion, see Node#ownerDocument).
 if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
-  Document.prototype.adoptNode = function(node) {
+  Document.prototype.adoptNode = _obscuraMethodLiteral(function(node) {
     if (node && node[_nidSym] !== undefined) {
       node[_ownerDocRootSym] = this[_scopeRootSym] !== undefined ? this[_scopeRootSym] : this[_nidSym];
     }
     return _stampDetachedDocumentNode(this, node || null);
-  };
+  });
 }
 
 // Element.toggleAttribute: standard DOM. Lit/Stencil and several ad SDKs call
 // it; the missing method throws. Spec semantics: no force arg toggles, force
 // true adds, force false removes; returns the new presence.
 if (typeof Element !== 'undefined' && !Element.prototype.toggleAttribute) {
-  Element.prototype.toggleAttribute = function(name, force) {
+  Element.prototype.toggleAttribute = _obscuraMethodLiteral(function(name, force) {
     const n = String(name);
     const present = this.hasAttribute(n);
     const want = arguments.length < 2 ? !present : !!force;
     if (want && !present) { this.setAttribute(n, ''); return true; }
     if (!want && present) { this.removeAttribute(n); return false; }
     return want;
-  };
+  });
 }
 
 // Document.elementFromPoint / elementsFromPoint — no layout engine, so this is a stub:
@@ -51,7 +51,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
   // containing (x,y) would never reach a deep <input> inside <label><p>.
   // Returns the deepest matching element (highest nid wins as a proxy for
   // tree depth) so descendants beat ancestors.
-  Document.prototype.elementFromPoint = function(x, y) {
+  Document.prototype.elementFromPoint = _obscuraMethodLiteral(function(x, y) {
     if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
       return null;
     }
@@ -108,11 +108,11 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
       }
     }
     return best || this.body || this.documentElement || null;
-  };
-  Document.prototype.elementsFromPoint = function(x, y) {
+  });
+  Document.prototype.elementsFromPoint = _obscuraMethodLiteral(function(x, y) {
     var el = this.elementFromPoint(x, y);
     return el ? [el] : [];
-  };
+  });
 }
 if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint) {
   ShadowRoot.prototype.elementFromPoint = function(x, y) {

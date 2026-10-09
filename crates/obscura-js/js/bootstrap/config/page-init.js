@@ -883,6 +883,12 @@ globalThis.__obscura_init = function() {
               try { globalThis.__obscura_install_wasm_compile_pad(); } catch (_e3) {}
             }
           }
+          // The method-literal own-surface normalization: snapshot templates
+          // skip it (no ops), so it installs per context here.
+          if (typeof globalThis.__obscura_install_native_own_surface
+              === 'function') {
+            try { globalThis.__obscura_install_native_own_surface(); } catch (_e4) {}
+          }
         }
       }
     } catch (_e) {}
@@ -1061,7 +1067,7 @@ _markNative(Node.prototype.isDefaultNamespace);
 // ---- getElementsByTagNameNS on Element and Document ----
 // getElementsByTagNameNS on Element and Document
 if (!Element.prototype.getElementsByTagNameNS) {
-  Element.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
+  Element.prototype.getElementsByTagNameNS = _obscuraMethodLiteral(function(namespaceURI, localName) {
     const all = _internalQuerySelectorAll(this, '*');
     const filtered = [];
     const nsMatch = namespaceURI === '*';
@@ -1077,7 +1083,7 @@ if (!Element.prototype.getElementsByTagNameNS) {
     }
     const result = _htmlCollectionFrom(filtered);
     return result;
-  };
+  });
   _markNative(Element.prototype.getElementsByTagNameNS);
 }
 if (!Document.prototype.getElementsByTagNameNS) {
@@ -1184,32 +1190,32 @@ if (!Document.prototype.createAttributeNS) {
 
 // Element.prototype.getAttributeNode: return an Attr node or null
 if (!Element.prototype.getAttributeNode) {
-  Element.prototype.getAttributeNode = function(name) {
+  Element.prototype.getAttributeNode = _obscuraMethodLiteral(function(name) {
     const val = this.getAttribute(name);
     if (val === null) return null;
     const attr = new Attr(name, val, null, null);
     attr.ownerElement = this;
     return attr;
-  };
+  });
   _markNative(Element.prototype.getAttributeNode);
 }
 
 // Element.prototype.getAttributeNodeNS: return a namespaced Attr node or null
 if (!Element.prototype.getAttributeNodeNS) {
-  Element.prototype.getAttributeNodeNS = function(namespaceURI, localName) {
+  Element.prototype.getAttributeNodeNS = _obscuraMethodLiteral(function(namespaceURI, localName) {
     const val = this.getAttributeNS(namespaceURI, localName);
     if (val === null) return null;
     const name = String(localName || '');
     const attr = new Attr(name, val, namespaceURI ? String(namespaceURI) : null, null);
     attr.ownerElement = this;
     return attr;
-  };
+  });
   _markNative(Element.prototype.getAttributeNodeNS);
 }
 
 // Element.prototype.setAttributeNode: set an Attr and return the previous one
 if (!Element.prototype.setAttributeNode) {
-  Element.prototype.setAttributeNode = function(attr) {
+  Element.prototype.setAttributeNode = _obscuraMethodLiteral(function(attr) {
     if (!attr || typeof attr.name !== 'string') return null;
     const prevVal = this.getAttribute(attr.name);
     const prevAttr = prevVal !== null ? new Attr(attr.name, prevVal, null, null) : null;
@@ -1217,13 +1223,13 @@ if (!Element.prototype.setAttributeNode) {
     this.setAttribute(attr.name, attr.value);
     attr.ownerElement = this;
     return prevAttr;
-  };
+  });
   _markNative(Element.prototype.setAttributeNode);
 }
 
 // Element.prototype.setAttributeNodeNS: set a namespaced Attr and return the previous one
 if (!Element.prototype.setAttributeNodeNS) {
-  Element.prototype.setAttributeNodeNS = function(attr) {
+  Element.prototype.setAttributeNodeNS = _obscuraMethodLiteral(function(attr) {
     if (!attr || typeof attr.name !== 'string') return null;
     const prevVal = this.getAttribute(attr.name);
     const prevAttr = prevVal !== null 
@@ -1233,20 +1239,20 @@ if (!Element.prototype.setAttributeNodeNS) {
     this.setAttributeNS(attr.namespaceURI || null, attr.name, attr.value);
     attr.ownerElement = this;
     return prevAttr;
-  };
+  });
   _markNative(Element.prototype.setAttributeNodeNS);
 }
 
 // Element.prototype.removeAttributeNode: remove and return an Attr
 if (!Element.prototype.removeAttributeNode) {
-  Element.prototype.removeAttributeNode = function(attr) {
+  Element.prototype.removeAttributeNode = _obscuraMethodLiteral(function(attr) {
     if (!attr || typeof attr.name !== 'string') return attr;
     const val = this.getAttribute(attr.name);
     if (val !== null) {
       this.removeAttribute(attr.name);
     }
     return attr;
-  };
+  });
   _markNative(Element.prototype.removeAttributeNode);
 }
 
@@ -1314,23 +1320,23 @@ if (!Element.prototype.validationMessage) {
 
 // Element.prototype.checkValidity - stub returns true
 if (!Element.prototype.checkValidity) {
-  Element.prototype.checkValidity = function checkValidity() {
+  Element.prototype.checkValidity = _obscuraMethodLiteral(function checkValidity() {
     return true;
-  };
+  });
   _markNative(Element.prototype.checkValidity);
 }
 
 // Element.prototype.reportValidity - stub returns true
 if (!Element.prototype.reportValidity) {
-  Element.prototype.reportValidity = function reportValidity() {
+  Element.prototype.reportValidity = _obscuraMethodLiteral(function reportValidity() {
     return true;
-  };
+  });
   _markNative(Element.prototype.reportValidity);
 }
 
 // Element.prototype.setCustomValidity - set custom validation message
 if (!Element.prototype.setCustomValidity) {
-  Element.prototype.setCustomValidity = function setCustomValidity(msg) {
+  Element.prototype.setCustomValidity = _obscuraMethodLiteral(function setCustomValidity(msg) {
     const validity = this.validity;
     if (msg && msg.length > 0) {
       _ns_customValidityMsg.set(this, msg);
@@ -1341,7 +1347,7 @@ if (!Element.prototype.setCustomValidity) {
       validity.customError = false;
       validity.valid = true;
     }
-  };
+  });
   _markNative(Element.prototype.setCustomValidity);
 }
 
@@ -1394,20 +1400,20 @@ if (!Element.prototype.selectionDirection) {
 
 // Element.prototype.setSelectionRange - set text selection range
 if (!Element.prototype.setSelectionRange) {
-  Element.prototype.setSelectionRange = function setSelectionRange(start, end, direction) {
+  Element.prototype.setSelectionRange = _obscuraMethodLiteral(function setSelectionRange(start, end, direction) {
     start = Math.max(0, parseInt(start, 10) || 0);
     end = Math.max(0, parseInt(end, 10) || 0);
     direction = direction === 'forward' || direction === 'backward' ? direction : 'none';
     _ns_selectionStart.set(this, start);
     _ns_selectionEnd.set(this, end);
     _ns_selectionDir.set(this, direction);
-  };
+  });
   _markNative(Element.prototype.setSelectionRange);
 }
 
 // Element.prototype.setRangeText - replace selection with text
 if (!Element.prototype.setRangeText) {
-  Element.prototype.setRangeText = function setRangeText(replacement, start, end, selectMode) {
+  Element.prototype.setRangeText = _obscuraMethodLiteral(function setRangeText(replacement, start, end, selectMode) {
     const val = this.value;
     if (!val) return;
     const strVal = String(val);
@@ -1431,20 +1437,20 @@ if (!Element.prototype.setRangeText) {
       _ns_selectionEnd.set(this, start + replLen);
       _ns_selectionDir.set(this, 'none');
     }
-  };
+  });
   _markNative(Element.prototype.setRangeText);
 }
 
 // Element.prototype.select - select all text in the element
 if (!Element.prototype.select) {
-  Element.prototype.select = function select() {
+  Element.prototype.select = _obscuraMethodLiteral(function select() {
     const val = this.value;
     if (val === undefined || val === null) return;
     const len = String(val).length;
     _ns_selectionStart.set(this, 0);
     _ns_selectionEnd.set(this, len);
     _ns_selectionDir.set(this, 'none');
-  };
+  });
   _markNative(Element.prototype.select);
 }
 

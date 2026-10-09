@@ -94,7 +94,7 @@ HTMLCanvasElement.prototype.getContext = ({ getContext(type, attrs) {
   }
   return null;
 } }).getContext;
-HTMLCanvasElement.prototype.toDataURL = function toDataURL(type) {
+HTMLCanvasElement.prototype.toDataURL = _obscuraMethodLiteral(function toDataURL(type) {
   const ctx = this._ctx || this.getContext('2d');
   if (_isCanvas2DContext(ctx) && _canvas2dPixels(ctx)) {
     const [width, height] = _canvas2dPixelSize(ctx);
@@ -102,7 +102,7 @@ HTMLCanvasElement.prototype.toDataURL = function toDataURL(type) {
     return _encodePNG(width, height, _canvas2dPixels(ctx));
   }
   return 'data:,';
-};
+});
 function _canvasPngBlob(ctx) {
   if (!_isCanvas2DContext(ctx) || !_canvas2dPixels(ctx)) return null;
   const [width, height] = _canvas2dPixelSize(ctx);
@@ -114,19 +114,19 @@ function _canvasPngBlob(ctx) {
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return new Blob([bytes], {type: 'image/png'});
 }
-HTMLCanvasElement.prototype.toBlob = function toBlob(callback, type, quality) {
+HTMLCanvasElement.prototype.toBlob = _obscuraMethodLiteral(function toBlob(callback, type, quality) {
   const blob = _canvasPngBlob(this._ctx || this.getContext('2d'));
   if (blob && type && String(type).toLowerCase() === 'image/png') {
     Object.defineProperty(blob, 'type', {value: 'image/png', configurable: true});
   }
   callback(blob);
-};
+});
 // Chrome moves the backing store into a fresh OffscreenCanvas and detaches
 // the element: a second transfer and any later getContext on the element
 // answer InvalidStateError. The OffscreenCanvas minted here carries the
 // element's current size; drawing continues on the offscreen half, which is
 // the flow every caller of this API actually drives.
-HTMLCanvasElement.prototype.transferControlToOffscreen = function transferControlToOffscreen() {
+HTMLCanvasElement.prototype.transferControlToOffscreen = _obscuraMethodLiteral(function transferControlToOffscreen() {
   if (this._transferred) {
     throw new DOMException(
       "Failed to execute 'transferControlToOffscreen' on 'HTMLCanvasElement': OffscreenCanvas has been transferred.",
@@ -134,7 +134,7 @@ HTMLCanvasElement.prototype.transferControlToOffscreen = function transferContro
   }
   _hset(this, "_transferred", true);
   return new OffscreenCanvas(this.width, this.height);
-};
+});
 
 
 _markNative(HTMLCanvasElement.prototype.toDataURL);

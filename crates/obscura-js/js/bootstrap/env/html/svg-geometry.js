@@ -337,7 +337,7 @@
   // breaks the cycle after one extra op.
   let _measuringFragment = false;
 
-  Element.prototype.getBoundingClientRect = function getBoundingClientRect() {
+  Element.prototype.getBoundingClientRect = _obscuraMethodLiteral(function getBoundingClientRect() {
     // No rendering box, no fragment rect (Chrome answers the zero rect for
     // detached/template-content/impl-document SVG subtrees).
     if (_svgUnrendered(this)) {
@@ -366,14 +366,14 @@
         return { x, y, width: mapped.width, height: mapped.height, top: y, right: x + mapped.width, bottom: y + mapped.height, left: x };
       },
     };
-  };
+  });
 
-  Element.prototype.getClientRects = function getClientRects() {
+  Element.prototype.getClientRects = _obscuraMethodLiteral(function getClientRects() {
     const root = _svgRootOf(this);
     if (!root || root === this) return _layoutGCRs.apply(this, arguments);
     const r = this.getBoundingClientRect();
     return OBSCURA_DOM_RECT_LIST([new DOMRect(r.x, r.y, r.width, r.height)]);
-  };
+  });
 
   // getBBox gains the container union and the x/y-attribute placement while
   // keeping the text measurement the previous implementation used.

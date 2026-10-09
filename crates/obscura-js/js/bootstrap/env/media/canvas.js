@@ -3034,8 +3034,8 @@ Object.defineProperty(Element.prototype, 'shadowRoot', {
 // like innerHTML (declarative shadow roots inside are not expanded yet, but the
 // call no longer throws so the rest of a test file can run); getHTML serializes
 // like innerHTML.
-Element.prototype.setHTMLUnsafe = function setHTMLUnsafe(html) { this.innerHTML = String(html == null ? "" : html); };
-Element.prototype.getHTML = function getHTML() { return this.innerHTML; };
+Element.prototype.setHTMLUnsafe = _obscuraMethodLiteral(function setHTMLUnsafe(html) { this.innerHTML = String(html == null ? "" : html); });
+Element.prototype.getHTML = _obscuraMethodLiteral(function getHTML() { return this.innerHTML; });
 _markNative(Element.prototype.setHTMLUnsafe);
 _markNative(Element.prototype.getHTML);
 // Document.parseHTMLUnsafe(html): static that parses into a new HTML document.
