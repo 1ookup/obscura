@@ -13,7 +13,7 @@ TAG="${1:?usage: run-obscura-round.sh <tag>}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="${CF_PARITY_ROOT:-/private/tmp/cf-parity-1007}"
 CF5S=/Users/l9h8/macOSShare/cf5s
-BIN=/Users/l9h8/obscura/target/release/obscura
+BIN="${OBSCURA_ROUND_BIN:-/Users/l9h8/obscura/target/release/obscura}"
 DRIVE="$SCRIPT_DIR/bridge-drive.py"
 PORT=9311
 TRACE="$ROOT/traces/obscura-$TAG.jsonl"
@@ -56,7 +56,13 @@ OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
     >"$ROOT/reports/obscura-$TAG.serve.log" 2>&1 &
 disown
 SERVE_PID=$!
-sleep 2
+# Readiness poll instead of a fixed sleep: the first exec of a freshly copied
+# binary (cp restore/snapshot) can take >2s to bind, and a fixed 2s window
+# turns that into a dead round (the b44 / obs-bfixxgen -startfail family).
+for _i in $(seq 1 60); do
+  curl -s -m 1 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1 && break
+  sleep 0.5
+done
 echo "[obscura-round] serve pid=$SERVE_PID"
 echo "[obscura-round] /json/version: $(curl -s "http://127.0.0.1:$PORT/json/version" | head -c 300)"
 echo "[obscura-round] serve lstart: $(ps -p "$SERVE_PID" -o lstart= 2>/dev/null)  | 二进制 mtime: $(stat -f '%Sm' "$BIN")"
