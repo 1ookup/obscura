@@ -17,11 +17,15 @@
 // Per-context installer: page-init invokes it once the realm's surface is
 // hydrated and the DOM ops are bound (the snapshot template context runs the
 // deferred half without ops, so normalizing there is both impossible and
-// useless -- the restored surface is the one this fixes). Idempotent.
-globalThis.__obscura_install_native_own_surface = function() {
-  try {
-    if (typeof Deno.core.ops.op_dom !== 'function') return;
-  } catch (_opsError) { return; }
+// useless -- the restored surface is the one this fixes). A worker realm
+// never runs page-init and binds no DOM ops, so the worker prep invokes it
+// with force=true before its native-presentation sweep. Idempotent.
+globalThis.__obscura_install_native_own_surface = function(force) {
+  if (!force) {
+    try {
+      if (typeof Deno.core.ops.op_dom !== 'function') return;
+    } catch (_opsError) { return; }
+  }
   const exempt = new Set(['constructor']);
 
   const methodize = function (name, fn) {
@@ -36,12 +40,13 @@ globalThis.__obscura_install_native_own_surface = function() {
   };
 
   const debug = { classes: 0, dirty: 0, cleaned: 0, defineFail: 0, sample: [] };
-  const surface = function (owner, ownerName) {
+  const surface = function (owner, ownerName, only) {
     debug.classes += 1;
     let names;
     try { names = Object.getOwnPropertyNames(owner); } catch (_error) { return; }
     for (const name of names) {
       if (exempt.has(name)) continue;
+      if (only && !only.has(name)) continue;
       // Everything below reads descriptors only. Reading `owner[name]`
       // would run an accessor's native getter on the prototype itself -- an
       // illegal receiver that throws -- and one throw aborted the whole
@@ -126,6 +131,11 @@ globalThis.__obscura_install_native_own_surface = function() {
     'HTMLStyleElement', 'HTMLTemplateElement', 'HTMLTableElement',
     'SpeechSynthesis', 'SpeechSynthesisUtterance',
     'EventTarget', 'URLSearchParams', 'Path2D',
+    // Worker realms (restored from the snapshot, no page-init): the scope
+    // interfaces and IndexedDB's factory carry expression-defined members
+    // there the same way the window realm's classes did.
+    'WorkerGlobalScope', 'DedicatedWorkerGlobalScope', 'SharedWorkerGlobalScope',
+    'WorkerNavigator', 'WorkerLocation', 'IDBFactory',
   ];
   for (const name of classes) {
     const ctor = globalThis[name];
@@ -144,6 +154,10 @@ globalThis.__obscura_install_native_own_surface = function() {
   try { Object.defineProperty(globalThis, '__obscura_own_surface_debug', {
     value: debug, writable: true, enumerable: false, configurable: true }); } catch (_e) {}
   for (const name of windowFns) {
+    // Own members only: a name resolved through the prototype chain must
+    // keep its inherited placement (a worker's queueMicrotask resolves
+    // through WorkerGlobalScope.prototype, and a define here would move it).
+    if (!Object.prototype.hasOwnProperty.call(globalThis, name)) continue;
     if (typeof globalThis[name] !== 'function') continue;
     let own;
     try {
@@ -158,6 +172,18 @@ globalThis.__obscura_install_native_own_surface = function() {
       });
       _markNative(method);
     } catch (_error) {}
+  }
+  // A worker global's own callable members (the worker prep installs
+  // postMessage/close and the animation family as own properties) and its
+  // event-handler accessors. The prep runs sloppy, so its functions also
+  // own the legacy caller/arguments slots no browser surface has; the
+  // forwarders drop every slot but length and name.
+  if (globalThis.__obscuraIsWorker === true) {
+    surface(globalThis, 'self', new Set([
+      'postMessage', 'close', 'cancelAnimationFrame', 'requestAnimationFrame',
+      'webkitRequestFileSystemSync', 'webkitResolveLocalFileSystemSyncURL',
+      'name', 'onmessage', 'onmessageerror', 'onrtctransform',
+    ]));
   }
 };
 // This module is last in the deferred half, so at its load every other

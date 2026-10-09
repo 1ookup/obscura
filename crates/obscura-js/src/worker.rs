@@ -2343,6 +2343,16 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
     }
   } catch (e) {}
 
+  // The WebAssembly memory-control shim (toFixedLengthBuffer /
+  // toResizableBuffer / Exception stack) is per-context for the same reason
+  // and is installed from page-init in the window realms only; run it here
+  // too. Idempotent.
+  try {
+    if (typeof G.__obscura_install_wasm_surface === 'function') {
+      G.__obscura_install_wasm_surface();
+    }
+  } catch (e) {}
+
   // ---------------------------------------------------------------------
   // 7. Native-presentation sweep. Last: it marks what the steps above
   // installed.
@@ -2575,6 +2585,56 @@ const WORKER_PREP_TEMPLATE: &str = r#"(function () {
         try { defineProperty(prototype, order[r], descriptors[order[r]]); } catch (e) {}
       }
     }
+  })();
+
+  // 10. Own-surface normalization. The window realms run it from page-init
+  // (no constructible prototype slot on methods, no caller/arguments slots,
+  // "get x" accessor names); a worker realm restores the snapshot's raw
+  // definitions, never runs page-init, and the sections above are the last
+  // writers of several members (importScripts arrives with the script loader
+  // and is re-settled onto the prototype last), so the installer runs here
+  // at the very end -- forced past its op-table guard, which a worker fails
+  // (no DOM ops) -- and then a marking pass covers the forwarders it just
+  // installed (the sweep in section 7 ran before them).
+  try {
+    if (typeof G.__obscura_install_native_own_surface === 'function') {
+      G.__obscura_install_native_own_surface(true);
+    }
+  } catch (e) {}
+  (function () {
+    var nativeRegistry = Deno[Symbol.for('obscura.nativeFunctionRegistry')];
+    if (!nativeRegistry) return;
+    var nativeFns = nativeRegistry.fns;
+    function markMembers(owner) {
+      var keys;
+      try { keys = Reflect.ownKeys(owner); } catch (e) { return; }
+      for (var i = 0; i < keys.length; i++) {
+        var d;
+        try { d = Object.getOwnPropertyDescriptor(owner, keys[i]); } catch (e) { continue; }
+        if (!d) continue;
+        if (typeof d.value === 'function') nativeFns.add(d.value);
+        if (typeof d.get === 'function') nativeFns.add(d.get);
+        if (typeof d.set === 'function') nativeFns.add(d.set);
+      }
+    }
+    markMembers(G);
+    var protos = ['WorkerGlobalScope', 'DedicatedWorkerGlobalScope',
+                  'SharedWorkerGlobalScope'];
+    for (var p = 0; p < protos.length; p++) {
+      var c = G[protos[p]];
+      if (typeof c === 'function' && c.prototype) {
+        nativeFns.add(c);
+        markMembers(c.prototype);
+      }
+    }
+    try {
+      if (G.WebAssembly && G.WebAssembly.Memory) {
+        markMembers(G.WebAssembly.Memory.prototype);
+      }
+      if (G.WebAssembly && G.WebAssembly.Exception) {
+        markMembers(G.WebAssembly.Exception.prototype);
+      }
+    } catch (e) {}
   })();
 })();
 "#;
