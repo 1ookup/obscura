@@ -66,7 +66,7 @@ grep -m1 -i 'fingerprint\|tracker\|stealth' "$ROOT/reports/obscura-$TAG.serve.lo
 cd /Users/l9h8/obscura
 DRIVE_LOG="$ROOT/reports/obscura-$TAG.drive.log"
 # 不能 disown：bash 对 disown 过的 pid wait 立即返回 rc=0（实测），会掐死整轮
-nohup python3 -u "$DRIVE" --port "$PORT" --url "$TARGET_URL" --deadline 45 --max-clicks 1 >"$DRIVE_LOG" 2>&1 &
+nohup python3 -u "$DRIVE" --port "$PORT" --url "$TARGET_URL" --deadline 75 --max-clicks 1 >"$DRIVE_LOG" 2>&1 &
 DRIVE_PID=$!
 sleep 8
 grep -m2 'harness:' "$DRIVE_LOG" || echo "[obscura-round] WARN: 8s 内未见 harness: 行（ws 未连上 9001？）"

@@ -45,6 +45,14 @@ STATUS = """JSON.stringify({
 
 TOKEN_RE = "callback token len="
 
+# Seconds to wait before the single interaction click. The reference's click
+# lands after the first two proof rounds (its fo1/fo2 CsJSj9 counters are all
+# zero and the third POST carries the click); clicking at the widget shell's
+# first render stamped those counts into fo2 instead and the deep program
+# answered with a re-prompt (b47-o6). 16s clears the measured fo2 checkpoint
+# (deep program captured ~t+13s) with margin against the 45s deadline.
+FIRST_CLICK_WAIT = 16.0
+
 
 class Cdp:
     def __init__(self, ws):
@@ -137,8 +145,15 @@ async def run(port, url, deadline, offset, max_clicks):
                 print("[drive] result: fail")
                 return 41
             if "renders: 0" not in renders:
-                # Render dispatched by the bridge; interact when the widget is up.
-                if clicks < max_clicks and waited >= 4.0:
+                # Render dispatched by the bridge; interact when the widget is
+                # up AND the first two proof rounds have completed. The
+                # reference's interaction record lands at the third POST: its
+                # fo1/fo2 payloads carry all-zero CsJSj9 counters and the click
+                # happens after the deep program prompts, not when the widget
+                # shell first renders. An early click stamped interaction
+                # counts into fo2, and the deep program answered with a
+                # re-prompt instead of a submission (b47-o6).
+                if clicks < max_clicks and waited >= FIRST_CLICK_WAIT:
                     box = await cc.widget_box(c, session)
                     if box:
                         x, y = box[0] + offset[0], box[1] + offset[1]
